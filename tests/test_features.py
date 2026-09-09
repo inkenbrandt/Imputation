@@ -6,9 +6,10 @@ Expected values are hand-calculated on small fixtures rather than compared
 against the implementation's own output, so a change in binning, quantile
 convention or column order fails here instead of being ratified.
 
-The full leakage tests 11-14 belong to the validation wiring of Step 6; what is
-pinned here is the transformer-level contract they rest on: masked-out target
-values cannot influence :func:`daily_flux_statistics`.
+The full leakage tests 11-14 live in ``tests/test_leakage.py``, which drives the
+Step 6 validation workflow; what is pinned here is the transformer-level contract
+they rest on: masked-out target values cannot influence
+:func:`daily_flux_statistics`, whichever thinly-observed-day strategy is in use.
 
 See ``docs/method_spec.md`` for the contract and
 ``docs/supplement_benchmarks.md`` for benchmark provenance.
@@ -379,6 +380,131 @@ def test_daily_statistics_need_a_target_name() -> None:
     unnamed = pd.Series([1.0, 2.0], index=half_hourly(2))
     with pytest.raises(ConfigError, match="target_name"):
         daily_flux_statistics(unnamed)
+
+
+# -- strategies for a thinly observed day (A4) -----------------------------
+
+
+def three_days(start: str = "2020-03-01") -> pd.Series:
+    """Three six-hourly days whose middle day holds a single observation.
+
+    Day 1 is 1, 2, 3, 4; day 2 is 10 and three missing values; day 3 is 5, 6, 7, 8.
+    With ``min_observations=2`` the middle day is below the minimum, which is what
+    the four strategies disagree about.
+    """
+    index = pd.date_range(start, periods=12, freq="6h")
+    values = [1.0, 2.0, 3.0, 4.0, 10.0, np.nan, np.nan, np.nan, 5.0, 6.0, 7.0, 8.0]
+    return pd.Series(values, index=index, name="LE")
+
+
+def middle_day(statistics: pd.DataFrame) -> pd.Series:
+    row: pd.Series = statistics.loc["2020-03-02"].iloc[0]
+    return row
+
+
+def test_missing_is_the_default_strategy() -> None:
+    assert FeatureConfig().statistic_strategy.value == "missing"
+    assert FeatureConfig().fallback_window is None
+
+
+def test_missing_leaves_a_thinly_observed_day_without_statistics() -> None:
+    statistics = daily_flux_statistics(three_days(), min_observations=2, strategy="missing")
+    assert middle_day(statistics).isna().all()
+    # The neighbouring days are unaffected: only the deficient day is suppressed.
+    assert statistics.loc["2020-03-01", "LE_daily_q2"].iloc[0] == pytest.approx(2.5)
+
+
+def test_within_day_available_uses_what_the_day_has_and_ignores_the_minimum() -> None:
+    statistics = daily_flux_statistics(
+        three_days(), min_observations=2, strategy="within_day_available"
+    )
+    row = middle_day(statistics)
+    assert row["LE_daily_q1"] == row["LE_daily_q2"] == row["LE_daily_q3"] == pytest.approx(10.0)
+    assert pd.isna(row["LE_daily_std"]), "the sample std of one value is still undefined"
+
+
+def test_neighbor_day_fallback_borrows_the_nearest_qualifying_day() -> None:
+    statistics = daily_flux_statistics(
+        three_days(),
+        min_observations=2,
+        strategy="neighbor_day_fallback",
+        fallback_window_days=1,
+    )
+    row = middle_day(statistics)
+    # Both neighbours are one day away, so the tie resolves to the earlier one:
+    # day 1 is 1, 2, 3, 4 with q1 1.75, median 2.5, q3 3.25 and sample std
+    # sqrt(5/3) = 1.29099...
+    assert row["LE_daily_q1"] == pytest.approx(1.75)
+    assert row["LE_daily_q2"] == pytest.approx(2.5)
+    assert row["LE_daily_q3"] == pytest.approx(3.25)
+    assert row["LE_daily_std"] == pytest.approx(np.sqrt(5.0 / 3.0))
+
+
+def test_neighbor_day_fallback_measures_distance_in_calendar_days() -> None:
+    # The qualifying days sit a fortnight away in time but are adjacent rows in
+    # the frame; a window of one day must not reach them.
+    index = pd.DatetimeIndex(
+        ["2020-03-01 00:00", "2020-03-01 06:00", "2020-03-15 00:00", "2020-03-29 00:00"]
+    )
+    series = pd.Series([1.0, 3.0, 50.0, 90.0], index=index, name="LE")
+    statistics = daily_flux_statistics(
+        series, min_observations=2, strategy="neighbor_day_fallback", fallback_window_days=1
+    )
+    assert statistics.loc["2020-03-15"].isna().all().all()
+    assert statistics.loc["2020-03-01", "LE_daily_q2"].iloc[0] == pytest.approx(2.0)
+
+
+def test_neighbor_day_fallback_gives_up_beyond_its_window() -> None:
+    days = three_days()
+    isolated = pd.Series([np.nan], index=pd.DatetimeIndex(["2020-03-20"]), name="LE")
+    statistics = daily_flux_statistics(
+        pd.concat([days, isolated]),
+        min_observations=2,
+        strategy="neighbor_day_fallback",
+        fallback_window_days=1,
+    )
+    assert middle_day(statistics).notna().all(), "one day away is within reach"
+    assert statistics.loc["2020-03-20"].isna().all().all(), "eighteen days away is not"
+
+
+def test_rolling_available_pools_the_surrounding_visible_observations() -> None:
+    statistics = daily_flux_statistics(
+        three_days(),
+        min_observations=2,
+        strategy="rolling_available",
+        fallback_window_days=1,
+    )
+    row = middle_day(statistics)
+    # Pool = 1, 2, 3, 4, 10, 5, 6, 7, 8 -> sorted 1..8 plus 10, so with linear
+    # interpolation over nine values q1 = 3, median = 5 and q3 = 7.
+    assert row["LE_daily_q1"] == pytest.approx(3.0)
+    assert row["LE_daily_q2"] == pytest.approx(5.0)
+    assert row["LE_daily_q3"] == pytest.approx(7.0)
+    assert row["LE_daily_std"] == pytest.approx(np.std([1.0, 2, 3, 4, 10, 5, 6, 7, 8], ddof=1))
+
+
+def test_rolling_available_still_respects_the_minimum() -> None:
+    index = pd.DatetimeIndex(["2020-03-01 00:00", "2020-03-10 00:00"])
+    series = pd.Series([1.0, 2.0], index=index, name="LE")
+    statistics = daily_flux_statistics(
+        series, min_observations=2, strategy="rolling_available", fallback_window_days=2
+    )
+    assert statistics.isna().all().all(), "a pool of one is not a statistic"
+
+
+def test_a_fallback_window_is_rejected_where_it_would_do_nothing() -> None:
+    with pytest.raises(ConfigError, match="meaningful only"):
+        daily_flux_statistics(three_days(), strategy="missing", fallback_window_days=3)
+
+
+def test_a_configured_strategy_and_an_explicit_one_are_not_both_accepted() -> None:
+    with pytest.raises(ConfigError, match="not both"):
+        daily_flux_statistics(three_days(), config=FeatureConfig(), strategy="within_day_available")
+
+
+def test_an_unknown_strategy_is_rejected_by_name() -> None:
+    with pytest.raises(ConfigError, match="daily_statistic_strategy"):
+        daily_flux_statistics(three_days(), strategy="borrow_from_next_year")
 
 
 # -- the leakage contract the Step 6 validation rests on --------------------

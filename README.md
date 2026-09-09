@@ -16,10 +16,10 @@ prevention of data leakage** — not maximising predictive scores.
 ## Status
 
 **Pre-alpha.** The scientific specification is frozen and the package installs
-and tests cleanly. Configuration, column mapping and the temporal layer are
-implemented and usable; the modelling modules are still placeholders, filled in
-step by step. Everything below the "Planned API" heading except `RFRConfig`,
-`ColumnMap` and `TimeAxis` is not built yet.
+and tests cleanly. Configuration, column mapping, the temporal layer, the
+receptive-limiter features, the leakage-safe validation feature workflow and the
+Random Forest itself are implemented and usable; the gap generator and the
+high-level fill/validate API are still placeholders, filled in step by step.
 
 | Component | State |
 |---|---|
@@ -27,9 +27,11 @@ step by step. Everything below the "Planned API" heading except `RFRConfig`,
 | Package scaffold, packaging, CI-ready tests | done |
 | Configuration and column-mapping layer | done |
 | Timestamp, cadence and elapsed-time utilities | done |
-| Receptive-limiter features | not started |
+| Receptive-limiter features, ORF pairing | done |
+| Leakage-safe validation features | done |
+| Random Forest fitting, tuning and persistence | done |
 | Artificial-gap generator | not started |
-| Model, filling, metrics, validation | not started |
+| Filling, metrics, validation workflow | not started |
 
 ## Specification first
 
@@ -118,6 +120,87 @@ options, and neither averages the duplicated rows. Missing rows are *not* an
 error — real flux series have them, which is exactly why durations are
 elapsed-time quantities.
 
+## Leakage-safe validation features
+
+The daily target statistics are built *from the target*, so an artificial-gap
+validation that computes them naively lets the hidden truth build its own
+predictors. `rfrgapfill.leakage` is the workflow that prevents it, and validation
+features should be built through it rather than by calling the transformers
+directly.
+
+```python
+from rfrgapfill import build_validation_features, holdout_mask_from_intervals
+
+holdout = holdout_mask_from_intervals(df.index, [("2020-06-06", "2020-06-13")])
+
+validation = build_validation_features(
+    df, config=config, target="LE", holdout=holdout, qc_column="LE_QC"
+)
+
+validation.training_features(), validation.training_target()  # what the model sees
+validation.holdout_features()                                 # what it predicts
+validation.scoring_truth()                                    # scoring only
+validation.to_dict()                                          # for the run manifest
+```
+
+The truth is a separate attribute from the features, and two independent
+protections keep it out of them: the held-out values are removed from the frame
+the features are read from, *and* the transformer is told which rows are visible.
+Either alone is sufficient, and both are checked:
+
+```python
+from rfrgapfill import detect_target_leakage, require_no_target_leakage
+
+detect_target_leakage(df, config=config, target="LE", holdout=holdout)   # () when safe
+require_no_target_leakage(df, config=config, target="LE", holdout=holdout)
+```
+
+The probe replaces the hidden truth with absurd values, rebuilds every feature —
+with and without the frame-level masking — and reports any column that moved. In
+`paper_safe` mode it must report nothing, for every daily-statistic strategy.
+
+One consequence worth knowing before a long-gap run: under the documented default
+`daily_statistic_strategy="missing"`, a gap covering a whole calendar day leaves
+every row of that day without daily statistics, so 7-day and 30-day gaps produce
+no complete feature rows at all. The paper does not say what it did here
+(ambiguity A4), so the alternatives are explicit — `within_day_available`,
+`neighbor_day_fallback`, `rolling_available` — all of them drawing only on visible
+observations, and `to_dict()` reports `holdout_rows_with_complete_features` so the
+choice cannot go unnoticed.
+
+## The Random Forest itself
+
+`RFRModel` is the low-level model layer: a `RandomForestRegressor` inside a
+`GridSearchCV` whose grid, folds, seed and `n_jobs` all come from the
+configuration. It takes a feature matrix and a target vector and nothing else, so
+the same class serves an RFR run, the ORF benchmark and an operational fill.
+
+```python
+from rfrgapfill import RFRModel, build_feature_matrix
+
+features = build_feature_matrix(df, config=config, target="LE")
+
+model = RFRModel(config, target="LE").fit(features, df["LE"])
+model.get_feature_names()      # the order the model was fitted on
+model.get_best_params()        # what GridSearchCV chose from the configured grid
+model.fit_report.to_dict()     # rows offered, fitted, and why the rest were not
+model.to_dict()                # grid, folds, seed, best params, versions
+
+predictions = model.predict(features)          # a float Series on df's index
+model.save("LE.joblib")
+RFRModel.load("LE.joblib")                     # config revalidated as it loads
+```
+
+The grid is **ours**, not the paper's: the article says `GridSearchCV` was used and
+never enumerates the search, so `hyperparameter_grid_is_paper_exact` is `False` in
+every manifest this package writes (ambiguity A1).
+
+A row missing any predictor is dropped at fit and left `NaN` at prediction —
+recent scikit-learn forests would accept `NaN` and quietly impute, which is not a
+rule the paper documents. `predict(..., on_incomplete="raise")` is the fail-loudly
+alternative, and `fit_report` says exactly how many rows went and which feature
+took them.
+
 ## Install
 
 Requires Python 3.10+.
@@ -137,9 +220,11 @@ Notebooks are not a core or development dependency; install the optional
 
 ## Planned API
 
-Not implemented yet — recorded here as the target the modules are built toward.
-It is repeated in the specification and will become the tested quick-start once
-the modelling steps land.
+Not implemented yet — recorded here as the target the remaining modules are built
+toward. It is repeated in the specification and will become the tested quick-start
+once the gap generator and the fill/validate workflow land; `RFRConfig`,
+`build_feature_matrix`, `build_validation_features` and `RFRModel` already do this
+work a layer down.
 
 ```python
 from rfrgapfill import RFRConfig, RFRGapFiller

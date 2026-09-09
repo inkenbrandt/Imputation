@@ -32,6 +32,7 @@ from rfrgapfill.schema import (
     ColumnMap,
     ColumnMapError,
     ConfigError,
+    FrozenRecord,
     GapClass,
     Hemisphere,
     Mode,
@@ -41,9 +42,11 @@ from rfrgapfill.time import iso_duration, to_timedelta
 
 __all__ = [
     "DEFAULT_DAYTIME_THRESHOLD",
+    "DEFAULT_FALLBACK_WINDOW_DAYS",
     "DEFAULT_GAP_DURATIONS",
     "DEFAULT_GAP_MIX",
     "DEFAULT_HYPERPARAMETER_GRID",
+    "DEFAULT_OBSERVED_QC_VALUES",
     "DEFAULT_RADIATION_THRESHOLDS",
     "AllocationBasis",
     "BoundaryConvention",
@@ -51,6 +54,7 @@ __all__ = [
     "ColumnMap",
     "ColumnMapError",
     "ConfigError",
+    "DailyStatisticStrategy",
     "FeatureConfig",
     "FeatureMode",
     "GapClass",
@@ -84,6 +88,45 @@ class FeatureMode(str, Enum):
     def coerce(cls, value: object) -> FeatureMode:
         """Return ``value`` as a :class:`FeatureMode`."""
         return coerce_enum(cls, value, field_name="feature_mode")
+
+
+class DailyStatisticStrategy(str, Enum):
+    """What a day does when too few of its target observations are visible (A4).
+
+    Every strategy draws exclusively on observations the model is allowed to see,
+    so none of them can leak held-out truth; they differ only in how far they
+    reach for a substitute when a day is thinly observed. "Too few" means fewer
+    than ``FeatureConfig.min_daily_observations`` visible values.
+    """
+
+    #: Statistics stay missing for a day below the minimum. The documented
+    #: default: nothing is imputed, nothing is borrowed, and the affected rows are
+    #: excluded from training and flagged at prediction time.
+    MISSING = "missing"
+    #: Use whatever the day itself has, ignoring the minimum. Quartiles are
+    #: defined from a single visible value; the sample standard deviation still
+    #: needs two. Never reaches outside the calendar day.
+    WITHIN_DAY_AVAILABLE = "within_day_available"
+    #: A day below the minimum borrows the statistics of the nearest day that
+    #: meets it, within ``fallback_window_days``; ties resolve to the earlier day.
+    NEIGHBOR_DAY_FALLBACK = "neighbor_day_fallback"
+    #: A day below the minimum is computed from the visible observations in a
+    #: window of +/- ``fallback_window_days`` calendar days centred on it, and
+    #: stays missing if that pool is still below the minimum.
+    ROLLING_AVAILABLE = "rolling_available"
+
+    @property
+    def uses_other_days(self) -> bool:
+        """Whether the strategy may reach outside the calendar day it describes."""
+        return self in (
+            DailyStatisticStrategy.NEIGHBOR_DAY_FALLBACK,
+            DailyStatisticStrategy.ROLLING_AVAILABLE,
+        )
+
+    @classmethod
+    def coerce(cls, value: object) -> DailyStatisticStrategy:
+        """Return ``value`` as a :class:`DailyStatisticStrategy`."""
+        return coerce_enum(cls, value, field_name="daily_statistic_strategy")
 
 
 class BoundaryConvention(str, Enum):
@@ -152,6 +195,12 @@ class MetricSubset(str, Enum):
 
 #: Radiation-category thresholds in W m-2 (paper: 10 and 100; boundaries are A2).
 DEFAULT_RADIATION_THRESHOLDS: Final[tuple[float, float]] = (10.0, 100.0)
+
+#: QC flag values counting as genuinely observed. FLUXNET2015 uses 0 for measured.
+DEFAULT_OBSERVED_QC_VALUES: Final[tuple[int, ...]] = (0,)
+
+#: Reach of the two fallback daily-statistic strategies, in calendar days (A4).
+DEFAULT_FALLBACK_WINDOW_DAYS: Final[int] = 7
 
 #: Daytime threshold on downward shortwave radiation, W m-2 (paper).
 DEFAULT_DAYTIME_THRESHOLD: Final[float] = 20.0
@@ -253,7 +302,7 @@ def _normalise_gap_class_mapping(
 
 
 @dataclass(frozen=True)
-class FeatureConfig:
+class FeatureConfig(FrozenRecord):
     """Receptive-limiter feature configuration (method_spec.md section 3).
 
     ``use_receptive_limiter=False`` yields the supplement's ORF benchmark: the same
@@ -270,8 +319,14 @@ class FeatureConfig:
     #: How values exactly on a radiation threshold are binned (A2).
     boundary_convention: BoundaryConvention | str = BoundaryConvention.MEDIUM_INCLUSIVE
     #: Minimum visible target observations for a day's statistics to be computed (A4).
-    #: Days below this leave the statistics missing; they are never imputed.
     min_daily_observations: int = 1
+    #: What a day below that minimum does (A4). The default leaves it missing.
+    daily_statistic_strategy: DailyStatisticStrategy | str = DailyStatisticStrategy.MISSING
+    #: Reach of ``neighbor_day_fallback`` and ``rolling_available`` in calendar
+    #: days. ``None`` takes :data:`DEFAULT_FALLBACK_WINDOW_DAYS` for those two
+    #: strategies and is rejected for the strategies that never leave the day, so
+    #: a window can never be set where it would silently do nothing.
+    fallback_window_days: int | None = None
     #: Delta degrees of freedom of the daily target standard deviation (A11). The
     #: paper names the statistic but not the convention; 1 is the sample standard
     #: deviation and the pandas default. 0 gives the population standard deviation.
@@ -313,6 +368,22 @@ class FeatureConfig:
             "min_daily_observations",
             _check_positive_int(self.min_daily_observations, field_name="min_daily_observations"),
         )
+
+        strategy = DailyStatisticStrategy.coerce(self.daily_statistic_strategy)
+        object.__setattr__(self, "daily_statistic_strategy", strategy)
+        window = self.fallback_window_days
+        if strategy.uses_other_days:
+            if window is None:
+                window = DEFAULT_FALLBACK_WINDOW_DAYS
+            window = _check_positive_int(window, field_name="fallback_window_days")
+        elif window is not None:
+            raise ConfigError(
+                f"fallback_window_days is meaningful only for the strategies that reach "
+                f"outside a calendar day ('neighbor_day_fallback', 'rolling_available'), "
+                f"but daily_statistic_strategy={strategy.value!r} never does. Leave it None "
+                f"rather than recording a window that had no effect."
+            )
+        object.__setattr__(self, "fallback_window_days", window)
         object.__setattr__(
             self,
             "daily_std_ddof",
@@ -332,6 +403,18 @@ class FeatureConfig:
         return self.boundary_convention
 
     @property
+    def statistic_strategy(self) -> DailyStatisticStrategy:
+        """The validated :class:`DailyStatisticStrategy` (narrowed from the input union)."""
+        assert isinstance(self.daily_statistic_strategy, DailyStatisticStrategy)
+        return self.daily_statistic_strategy
+
+    @property
+    def fallback_window(self) -> int | None:
+        """Fallback reach in days: an integer for the reaching strategies, else ``None``."""
+        assert self.fallback_window_days is None or isinstance(self.fallback_window_days, int)
+        return self.fallback_window_days
+
+    @property
     def requires_hemisphere(self) -> bool:
         """Whether a hemisphere is needed, i.e. whether the season feature is built."""
         return self.use_receptive_limiter
@@ -348,6 +431,8 @@ class FeatureConfig:
             "radiation_thresholds": list(self.radiation_thresholds),
             "boundary_convention": self.convention.value,
             "min_daily_observations": self.min_daily_observations,
+            "daily_statistic_strategy": self.statistic_strategy.value,
+            "fallback_window_days": self.fallback_window,
             "daily_std_ddof": self.daily_std_ddof,
         }
 
@@ -358,7 +443,7 @@ class FeatureConfig:
 
 
 @dataclass(frozen=True)
-class GapScenarioConfig:
+class GapScenarioConfig(FrozenRecord):
     """Artificial-gap scenario configuration (method_spec.md section 4).
 
     Defaults reproduce the paper's scenario: 25% of available observations withheld
@@ -497,7 +582,7 @@ class GapScenarioConfig:
 
 
 @dataclass(frozen=True)
-class ValidationConfig:
+class ValidationConfig(FrozenRecord):
     """Artificial-gap validation and metric reporting (method_spec.md sections 4, 6)."""
 
     #: The artificial-gap scenario the test set is drawn from.
@@ -573,7 +658,7 @@ class ValidationConfig:
 
 
 @dataclass(frozen=True)
-class RFRConfig:
+class RFRConfig(FrozenRecord):
     """Top-level run configuration for one site.
 
     Holds the driver mode, the site's time and location metadata, the estimator
@@ -606,7 +691,7 @@ class RFRConfig:
     cv_shuffle: bool = False
     #: QC flag values that count as genuinely observed target measurements. FLUXNET
     #: uses 0 for measured; anything else was already gap-filled before ingestion.
-    observed_qc_values: Sequence[int] = (0,)
+    observed_qc_values: Sequence[int] = DEFAULT_OBSERVED_QC_VALUES
     #: Receptive-limiter configuration.
     features: FeatureConfig = field(default_factory=FeatureConfig)
     #: Artificial-gap validation configuration.

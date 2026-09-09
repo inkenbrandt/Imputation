@@ -28,8 +28,9 @@ Two properties this module must keep, both of which are pinned by tests:
 * **Leakage safety.** :func:`daily_flux_statistics` derives features *from the
   target*, so it takes an ``available_mask`` naming the observations visible to
   the model. Held-out truth never reaches a feature used to predict it
-  (method_spec.md section 3.5). Passing the mask is the caller's job; the
-  validation orchestration in Step 6 wires it up.
+  (method_spec.md section 3.5). Passing the mask is the caller's job;
+  :mod:`rfrgapfill.leakage` is the workflow that wires it up for artificial-gap
+  validation, and the one place that should be building validation features.
 """
 
 from __future__ import annotations
@@ -41,7 +42,12 @@ from typing import Any, Final
 import numpy as np
 import pandas as pd
 
-from rfrgapfill.config import BoundaryConvention, FeatureConfig, RFRConfig
+from rfrgapfill.config import (
+    BoundaryConvention,
+    DailyStatisticStrategy,
+    FeatureConfig,
+    RFRConfig,
+)
 from rfrgapfill.schema import SHORTWAVE, ColumnMap, ConfigError, Hemisphere
 from rfrgapfill.time import TIME_DISTANCE_HOURS, as_datetime_index, elapsed_hours
 
@@ -426,6 +432,8 @@ def daily_flux_statistics(
     available_mask: object | None = None,
     target_name: str | None = None,
     min_observations: int | None = None,
+    strategy: DailyStatisticStrategy | str | None = None,
+    fallback_window_days: int | None = None,
     ddof: int | None = None,
     config: FeatureConfig | None = None,
 ) -> pd.DataFrame:
@@ -447,31 +455,67 @@ def daily_flux_statistics(
     missing values are genuinely absent) and wrong for artificial-gap validation
     (where the mask must be built first).
 
-    Days with fewer than ``min_observations`` visible values yield **missing**
-    statistics for all four features rather than an imputed or borrowed value
-    (ambiguity A4); the affected rows are then excluded from training and flagged
-    at prediction time by the model layer. Note that ``ddof=1`` additionally
-    leaves the standard deviation undefined for a day with a single visible
-    observation, while its quartiles are all defined and equal to that value.
+    A day with fewer than ``min_observations`` visible values is handled by the
+    chosen :class:`~rfrgapfill.config.DailyStatisticStrategy`, since the paper
+    does not say what it did with one (ambiguity A4):
 
+    ``missing`` (the documented default)
+        All four statistics are missing for that day. Nothing is imputed and
+        nothing is borrowed; the affected rows are excluded from training and
+        flagged at prediction time by the model layer.
+    ``within_day_available``
+        Whatever the day itself has is used, ignoring the minimum. Never looks
+        outside the calendar day.
+    ``neighbor_day_fallback``
+        The day takes the statistics of the nearest day that meets the minimum,
+        up to ``fallback_window_days`` away; ties resolve to the earlier day.
+    ``rolling_available``
+        The day is recomputed from the visible observations within
+        ``+/- fallback_window_days`` calendar days, and stays missing if that
+        pool is still below the minimum.
+
+    All four are leakage safe: each of them draws only on values ``available_mask``
+    admits, so the two that reach into neighbouring days reach into *visible*
+    neighbouring days. They differ in what the feature means, not in what it is
+    allowed to see, which is why the choice is recorded in the run manifest.
+
+    Note that ``ddof=1`` additionally leaves the standard deviation undefined for
+    a day with a single visible observation, while its quartiles are all defined
+    and equal to that value.
+
+    :param strategy: the below-minimum behaviour above. Defaults to the
+        configured ``daily_statistic_strategy`` (``missing``).
+    :param fallback_window_days: reach of the two fallback strategies, in
+        calendar days; rejected for the strategies that never leave the day.
     :param ddof: delta degrees of freedom for the standard deviation. Defaults to
         the configured ``daily_std_ddof`` (1, the sample standard deviation;
         ambiguity A11 - the paper does not state which convention it used).
     :returns: a frame indexed like ``target`` whose columns are
         :func:`daily_statistic_names`.
     """
-    if config is not None and (min_observations is not None or ddof is not None):
+    overrides = (min_observations, strategy, fallback_window_days, ddof)
+    if config is not None and any(override is not None for override in overrides):
         raise ConfigError(
-            "pass either config= or explicit min_observations/ddof, not both: "
-            "two sources of the same setting cannot be reconciled in the run manifest"
+            "pass either config= or explicit min_observations/strategy/"
+            "fallback_window_days/ddof, not both: two sources of the same setting "
+            "cannot be reconciled in the run manifest"
         )
-    defaults = FeatureConfig() if config is None else config
-    minimum = defaults.min_daily_observations if min_observations is None else min_observations
-    degrees = defaults.daily_std_ddof if ddof is None else ddof
-    if not isinstance(minimum, int) or isinstance(minimum, bool) or minimum < 1:
-        raise ConfigError(f"min_observations must be an integer >= 1, got {minimum!r}")
-    if not isinstance(degrees, int) or isinstance(degrees, bool) or degrees < 0:
-        raise ConfigError(f"ddof must be an integer >= 0, got {degrees!r}")
+    if config is None:
+        # Built rather than checked field by field, so an explicit call and a
+        # configured run are validated by exactly the same rules.
+        base = FeatureConfig()
+        config = FeatureConfig(
+            min_daily_observations=(
+                base.min_daily_observations if min_observations is None else min_observations
+            ),
+            daily_statistic_strategy=(base.statistic_strategy if strategy is None else strategy),
+            fallback_window_days=fallback_window_days,
+            daily_std_ddof=base.daily_std_ddof if ddof is None else ddof,
+        )
+    minimum = config.min_daily_observations
+    degrees = config.daily_std_ddof
+    chosen = config.statistic_strategy
+    window = config.fallback_window
 
     series = _as_float_series(target, field_name="target")
     index = _time_index(series, field_name="target")
@@ -500,13 +544,128 @@ def daily_flux_statistics(
             columns[3]: grouped.std(ddof=degrees),
         }
     )
-    too_sparse = grouped.count() < minimum
-    per_day.loc[too_sparse.to_numpy(), :] = np.nan
+    counts = grouped.count().to_numpy()
+
+    if chosen is not DailyStatisticStrategy.WITHIN_DAY_AVAILABLE:
+        # Every other strategy starts from "a day below the minimum has no
+        # statistics of its own"; the two reaching strategies then look further.
+        deficient = counts < minimum
+        per_day.loc[deficient, :] = np.nan
+        if chosen is DailyStatisticStrategy.NEIGHBOR_DAY_FALLBACK:
+            assert window is not None
+            _fill_from_nearest_day(per_day, deficient=deficient, window_days=window)
+        elif chosen is DailyStatisticStrategy.ROLLING_AVAILABLE:
+            assert window is not None
+            _fill_from_rolling_window(
+                per_day,
+                visible=visible,
+                deficient=deficient,
+                window_days=window,
+                minimum=minimum,
+                degrees=degrees,
+            )
 
     joined: pd.DataFrame = per_day.reindex(day)
     joined.index = index
     joined.index.name = series.index.name
     return joined
+
+
+def _fill_from_nearest_day(
+    per_day: pd.DataFrame,
+    *,
+    deficient: np.ndarray,
+    window_days: int,
+) -> None:
+    """Give each deficient day the statistics of the nearest day that qualifies.
+
+    In place. Distance is measured in calendar days between the day labels, not
+    in row positions, so a day on the far side of a missing month is correctly
+    seen as a month away. Ties resolve to the **earlier** day, an arbitrary but
+    fixed rule that keeps the result reproducible. A day with no qualifying day
+    within ``window_days`` keeps its missing statistics.
+    """
+    qualifying = np.flatnonzero(~deficient)
+    wanted = np.flatnonzero(deficient)
+    if qualifying.size == 0 or wanted.size == 0:
+        return
+
+    days = per_day.index.to_numpy(dtype="datetime64[ns]").astype("int64")
+    limit = int(pd.Timedelta(days=window_days).value)
+    donor_days = days[qualifying]
+
+    insert = np.searchsorted(donor_days, days[wanted])
+    left = np.clip(insert - 1, 0, donor_days.size - 1)
+    right = np.clip(insert, 0, donor_days.size - 1)
+    # `insert == 0` means there is no earlier donor and `insert == size` none
+    # later; the sentinel distance keeps those candidates from ever winning.
+    unreachable = np.iinfo(np.int64).max
+    distance_left = np.where(insert > 0, days[wanted] - donor_days[left], unreachable)
+    distance_right = np.where(
+        insert < donor_days.size, donor_days[right] - days[wanted], unreachable
+    )
+
+    take_left = distance_left <= distance_right
+    donor = np.where(take_left, qualifying[left], qualifying[right])
+    distance = np.minimum(distance_left, distance_right)
+
+    reachable = distance <= limit
+    if not reachable.any():
+        return
+    # Snapshot first: the rows being written are all deficient and the rows being
+    # read are all qualifying, but reading from an array that is not being
+    # mutated makes that independence explicit rather than incidental.
+    values = per_day.to_numpy(dtype=float, copy=True)
+    per_day.iloc[wanted[reachable], :] = values[donor[reachable]]
+
+
+def _fill_from_rolling_window(
+    per_day: pd.DataFrame,
+    *,
+    visible: pd.Series,
+    deficient: np.ndarray,
+    window_days: int,
+    minimum: int,
+    degrees: int,
+) -> None:
+    """Recompute each deficient day from a centred window of visible observations.
+
+    In place. The pool is every visible target observation whose calendar day
+    lies within ``window_days`` days of the deficient day, inclusive on both
+    sides and including the day itself. A pool that is still below ``minimum``
+    leaves the day missing rather than reporting a statistic of one or two
+    values borrowed from a week away.
+    """
+    wanted = np.flatnonzero(deficient)
+    if wanted.size == 0:
+        return
+
+    observed = visible.dropna()
+    if observed.empty:
+        return
+    observation_days = (
+        as_datetime_index(observed.index, field_name="target")
+        .normalize()
+        .to_numpy(dtype="datetime64[ns]")
+        .astype("int64")
+    )
+    order = np.argsort(observation_days, kind="stable")
+    observation_days = observation_days[order]
+    observation_values = observed.to_numpy(dtype=float)[order]
+
+    days = per_day.index.to_numpy(dtype="datetime64[ns]").astype("int64")
+    reach = int(pd.Timedelta(days=window_days).value)
+
+    for position in wanted:
+        centre = days[position]
+        start = np.searchsorted(observation_days, centre - reach, side="left")
+        stop = np.searchsorted(observation_days, centre + reach, side="right")
+        pool = observation_values[start:stop]
+        if pool.size < minimum:
+            continue
+        quantiles = np.quantile(pool, _DAILY_QUANTILES)
+        deviation = float(pool.std(ddof=degrees)) if pool.size > degrees else np.nan
+        per_day.iloc[position, :] = [*quantiles, deviation]
 
 
 # ---------------------------------------------------------------------------
@@ -716,6 +875,8 @@ def describe_features(
                 "hemisphere": config.resolve_hemisphere().value,
                 "hemisphere_source": config.hemisphere_source,
                 "min_daily_observations": features.min_daily_observations,
+                "daily_statistic_strategy": features.statistic_strategy.value,
+                "fallback_window_days": features.fallback_window,
                 "daily_std_ddof": features.daily_std_ddof,
                 "radiation_category_codes": {
                     name: code for code, name in enumerate(_RADIATION_CATEGORIES)

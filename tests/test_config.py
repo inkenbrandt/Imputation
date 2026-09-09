@@ -12,14 +12,17 @@ See ``docs/method_spec.md`` for the contract and
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
+import pickle
 from datetime import timedelta
 from typing import Any
 
 import pytest
 
 from rfrgapfill.config import (
+    DEFAULT_FALLBACK_WINDOW_DAYS,
     DEFAULT_HYPERPARAMETER_GRID,
     AllocationBasis,
     BoundaryConvention,
@@ -27,6 +30,7 @@ from rfrgapfill.config import (
     ColumnMapError,
     ConfigError,
     CVStrategy,
+    DailyStatisticStrategy,
     FeatureConfig,
     FeatureMode,
     GapClass,
@@ -211,6 +215,61 @@ def test_min_daily_observations_controls_the_empty_day_policy() -> None:
     assert FeatureConfig(min_daily_observations=4).min_daily_observations == 4
     with pytest.raises(ConfigError, match="min_daily_observations"):
         FeatureConfig(min_daily_observations=0)
+
+
+def test_the_thinly_observed_day_strategy_defaults_to_leaving_it_missing() -> None:
+    # A4: the paper does not say what it did with a day it could not summarise,
+    # so the default imputes nothing and borrows nothing.
+    settings = FeatureConfig()
+    assert settings.statistic_strategy is DailyStatisticStrategy.MISSING
+    assert settings.fallback_window is None
+    assert settings.to_dict()["daily_statistic_strategy"] == "missing"
+
+
+@pytest.mark.parametrize(
+    ("strategy", "reaches"),
+    [
+        ("missing", False),
+        ("within_day_available", False),
+        ("neighbor_day_fallback", True),
+        ("rolling_available", True),
+    ],
+)
+def test_only_the_reaching_strategies_take_a_fallback_window(strategy: str, reaches: bool) -> None:
+    window = 5 if reaches else None
+    settings = FeatureConfig(daily_statistic_strategy=strategy, fallback_window_days=window)
+    assert settings.statistic_strategy.uses_other_days is reaches
+    assert settings.fallback_window == window
+
+
+def test_a_reaching_strategy_fills_in_the_documented_default_window() -> None:
+    settings = FeatureConfig(daily_statistic_strategy="rolling_available")
+    assert settings.fallback_window == DEFAULT_FALLBACK_WINDOW_DAYS
+
+
+def test_a_window_that_could_not_apply_is_rejected_rather_than_ignored() -> None:
+    with pytest.raises(ConfigError, match="meaningful only"):
+        FeatureConfig(daily_statistic_strategy="within_day_available", fallback_window_days=3)
+
+
+def test_an_unknown_strategy_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="daily_statistic_strategy"):
+        FeatureConfig(daily_statistic_strategy="ask_a_neighbour")
+
+
+def test_a_non_positive_window_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="fallback_window_days"):
+        FeatureConfig(daily_statistic_strategy="rolling_available", fallback_window_days=0)
+
+
+def test_the_strategy_reaches_the_orf_pairing_check() -> None:
+    # Every feature setting is carried over to the benchmark arm unchanged, so a
+    # comparison that also changed the daily-statistic policy is refused.
+    rfr = RFRConfig(mode="RFR3", hemisphere="north")
+    diverged = rfr.as_orf().replace(
+        features=rfr.as_orf().features.replace(daily_statistic_strategy="within_day_available")
+    )
+    assert "features.daily_statistic_strategy" in orf_pairing_differences(rfr, diverged)
 
 
 def test_orf_benchmark_switch_drops_the_hemisphere_requirement() -> None:
@@ -646,3 +705,51 @@ def test_the_pairing_difference_report_names_nested_settings() -> None:
         features=rfr.features.replace(use_receptive_limiter=False, daily_std_ddof=0)
     )
     assert orf_pairing_differences(rfr, tampered) == ("features.daily_std_ddof",)
+
+
+# ---------------------------------------------------------------------------
+# Serialisation (method_spec.md section 5: the configuration travels with the model)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "configuration",
+    [
+        RFRConfig(mode="RFR3", hemisphere="north", column_map=RFR3_MAPPING),
+        RFRConfig(
+            mode="RFR10",
+            latitude=-33.5,
+            column_map=RFR10_MAPPING,
+            hyperparameter_grid={"n_estimators": [10, 20], "max_depth": [None, 8]},
+            cv_strategy=CVStrategy.TIME_SERIES_SPLIT,
+            features=FeatureConfig(daily_statistic_strategy="rolling_available"),
+            validation=ValidationConfig(gaps=GapScenarioConfig(missing_fraction=0.1)),
+        ),
+        GapScenarioConfig(),
+        FeatureConfig(),
+        ValidationConfig(),
+        ColumnMap(RFR10_MAPPING, timestamp="TIMESTAMP_START"),
+    ],
+)
+def test_a_configuration_survives_a_pickle_round_trip(configuration: Any) -> None:
+    """A joblib-saved model carries its configuration, which read-only mappings block."""
+    restored = pickle.loads(pickle.dumps(configuration))
+
+    assert restored == configuration
+    assert restored.to_dict() == configuration.to_dict()
+    assert copy.deepcopy(configuration) == configuration
+
+
+def test_a_restored_configuration_is_revalidated_rather_than_trusted() -> None:
+    """A tampered model file must fail on load, not predict under rejected settings."""
+    state = {**RFRConfig(mode="RFR3", hemisphere="north").__getstate__(), "random_state": -1}
+
+    with pytest.raises(ConfigError, match="random_state"):
+        object.__new__(RFRConfig).__setstate__(state)
+
+
+def test_a_restored_mapping_field_is_read_only_again() -> None:
+    restored = pickle.loads(pickle.dumps(RFRConfig(mode="RFR3", hemisphere="north")))
+
+    with pytest.raises(TypeError):
+        restored.hyperparameter_grid["n_estimators"] = (1,)  # type: ignore[index]

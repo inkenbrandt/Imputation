@@ -132,6 +132,32 @@ default). The standard deviation uses `daily_std_ddof = 1`, the sample standard
 deviation (ambiguity A11); a day with a single visible observation therefore has
 defined quartiles and an undefined standard deviation.
 
+A day with fewer than `min_daily_observations` visible target values is handled
+by `daily_statistic_strategy` (ambiguity A4). The paper does not say what it did
+with such a day, so the choice is explicit, and every option draws exclusively on
+observations visible to the model — the strategies differ in how far they reach,
+never in what they are allowed to see:
+
+| Strategy | Behaviour for a day below the minimum |
+|---|---|
+| `missing` (default) | All four statistics stay missing. Nothing is imputed, nothing is borrowed. |
+| `within_day_available` | Use whatever that calendar day has, ignoring the minimum. |
+| `neighbor_day_fallback` | Take the statistics of the nearest day meeting the minimum, up to `fallback_window_days` away; ties resolve to the earlier day. |
+| `rolling_available` | Recompute from the visible observations within ± `fallback_window_days` calendar days; still missing if that pool is below the minimum. |
+
+`fallback_window_days` defaults to 7 for the two reaching strategies and is
+rejected for the two that never leave the day, so a recorded window always had an
+effect.
+
+**Consequence of the default.** Under `missing`, an artificial gap that covers a
+whole calendar day leaves every row of that day without daily statistics, so the
+paper's 7-day and 30-day gap classes yield no complete feature rows and would
+receive no predictions at all. That is the honest reading of A4 rather than a
+defect, and it is reported rather than hidden:
+`ValidationFeatureSet.to_dict()` records `holdout_rows_with_complete_features`
+alongside `holdout_rows`. A long-gap validation run therefore has to select a
+reaching strategy deliberately and record it in the manifest.
+
 ### 3.5 Leakage rule (default `feature_mode="paper_safe"`)
 
 Daily target statistics are derived from the target, so they are the main leakage
@@ -144,6 +170,28 @@ Required default behaviour:
 3. never let held-out truth influence a feature used to predict that truth;
 4. days with no visible target observations yield missing daily statistics
    (see [Known ambiguities](#known-ambiguities), A4).
+
+`rfrgapfill.leakage` is the workflow that enforces this, and validation features
+must be built through it rather than by calling the transformers directly:
+
+- `holdout_mask_from_intervals()` turns gap intervals into the holdout mask
+  (step 1), before any target-derived feature exists;
+- `observed_target_mask()` / `available_target_mask()` derive what the model may
+  see: a genuine QC-passed measurement that is not withheld;
+- `hide_target()` removes the held-out values from the frame features are read
+  from (step 2);
+- `build_validation_features()` computes the daily statistics from the visible
+  observations only (step 3), assembles the feature matrix (step 4), and returns
+  a `ValidationFeatureSet` carrying the untouched truth as a separate attribute
+  used only for scoring (step 5).
+
+The two protections — hiding the values and passing `available_mask` — are
+independent, and each is sufficient on its own. `detect_target_leakage()` rebuilds
+the features with the hidden truth replaced by absurd values and reports any
+feature column that moved; `require_no_target_leakage()` raises `LeakageError`
+when one does. Both run with and without the frame-level hiding, so the mask is
+shown to suffice by itself. In `paper_safe` mode the probe must return nothing,
+for every daily-statistic strategy.
 
 `feature_mode="legacy_fluxlib"` is reserved for a compatibility mode to be added
 only if implementation evidence for a different derivation is found. The two modes
@@ -245,6 +293,35 @@ package therefore ships a documented default grid in configuration
 (`hyperparameter_grid`); any archived `fluxlib` grid may be added as a **named
 preset**, never as "paper exact" (ambiguity A1).
 
+`rfrgapfill.model.RFRModel` is that estimator plus the search around it, and
+nothing else: it is handed a feature matrix and a target vector, so the same class
+serves the RFR arm, the ORF arm and an operational fill, and knows nothing about
+artificial gaps. `fit(X, y)`, `predict(X)`, `get_feature_names()`,
+`get_best_params()`, `save()` and `load()` are the whole surface.
+
+Three points the paper leaves open are settled here explicitly and reported in the
+manifest:
+
+| Point | Behaviour |
+|---|---|
+| Rows with a missing or non-finite predictor | Dropped at fit; left missing at prediction. Recent scikit-learn forests accept `NaN` natively, which would silently impose an undocumented imputation rule instead of section 7's "fail clearly or leave predictions missing". `predict(..., on_incomplete="raise")` is the "fail clearly" half. |
+| Row accounting | `FitReport` records rows offered, rows fitted, rows dropped for a missing target, rows dropped for a missing predictor, and a per-feature count. It names the feature that cost the most rows, and points at A4 when that feature is a daily statistic. |
+| `n_jobs` | Applied to the forest, not to the grid search, so one configured setting cannot multiply into folds × candidates × trees workers. |
+
+The CV strategy of ambiguity A5 maps to `KFold(n_splits=cv_folds,
+shuffle=cv_shuffle)` for the default and `TimeSeriesSplit(n_splits=cv_folds)` for
+the labelled enhancement; scoring is scikit-learn's regressor default, R2. The
+expected feature order is derived from `feature_names(config, target=...)` whenever
+it can be — which needs the target, since the daily statistics are target-specific
+— so a matrix built for another target is rejected rather than fitted.
+
+A saved model is a `joblib` payload carrying the fitted search, the feature order,
+the fit report, the environment versions and the `RFRConfig` itself. The
+configuration is **revalidated as it is unpickled**, so an edited model file fails
+on load rather than predicting under settings the constructor would have rejected,
+and a scikit-learn version different from the one the model was fitted under is
+reported rather than silently accepted.
+
 ---
 
 ## 6. Required metrics
@@ -325,7 +402,7 @@ described as reproducing the paper exactly.
 | A1 | The complete `GridSearchCV` hyperparameter grid is not enumerated in the article. | Documented default grid shipped with the package; any archived `fluxlib` grid only as a named preset. | `hyperparameter_grid` |
 | A2 | Radiation-category boundary handling at exactly 10 and 100 W m-2 is not explicit in the prose. | Inclusive, exhaustive bins: `<10` weak, `10–100` medium, `>100` strong. | `radiation_thresholds`, `boundary_convention` |
 | A3 | The 20/30/50 gap mix may refer to the number of gap events or the number of withheld half-hours. | `missing_records`. | `allocation_basis` |
-| A4 | Handling of daily target statistics when a whole day or longer interval has no visible observations is unspecified. | Statistics left missing; affected rows excluded from training and flagged at prediction time rather than imputed. | `feature_mode`, driver-completeness policy |
+| A4 | Handling of daily target statistics when a whole day or longer interval has too few or no visible observations is unspecified. | `missing`: statistics left missing; affected rows excluded from training and flagged at prediction time rather than imputed. Three reaching alternatives (`within_day_available`, `neighbor_day_fallback`, `rolling_available`) are implemented and leakage safe; a long-gap run must choose one deliberately (section 3.4). | `daily_statistic_strategy`, `min_daily_observations`, `fallback_window_days` |
 | A5 | Cross-validation details inside `GridSearchCV` (fold count, shuffling, temporal blocking) are unspecified. | Conventional `GridSearchCV` folds on the training portion; blocked/time-aware CV offered as a labelled enhancement. | `cv_strategy` |
 | A6 | Whether the historical `fluxlib` implementation computed daily target statistics leakage-safely is unverified. | Leakage-safe `paper_safe` mode is the default; a `legacy_fluxlib` mode is added only on implementation evidence. | `feature_mode` |
 | A7 | The achieved artificial-missing fraction cannot always hit exactly 25% given real gaps and series boundaries. | Report achieved fraction and class allocation against a documented tolerance. | `missing_fraction`, tolerance |

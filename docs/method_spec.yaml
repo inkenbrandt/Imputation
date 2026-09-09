@@ -158,12 +158,39 @@ receptive_limiter:
     std_ddof:
       default: 1
       provenance: default      # A11
-    empty_or_sparse_day_yields: missing
+    sparse_day_strategy:
+      default: missing            # A4
+      alternatives:
+        - within_day_available
+        - neighbor_day_fallback
+        - rolling_available
+      minimum_visible_observations: 1
+      fallback_window_days:
+        default: 7
+        applies_to: [neighbor_day_fallback, rolling_available]
+      all_strategies_use_visible_observations_only: true
+      # Under the default, a gap covering a whole day leaves every row of that
+      # day without daily statistics, so 7 d and 30 d gaps yield no complete
+      # feature rows unless a reaching strategy is chosen deliberately.
+      default_leaves_multi_day_gaps_without_features: true
     provenance: paper
   feature_order_deterministic: true
 
 leakage_policy:
   default_feature_mode: paper_safe
+  module: rfrgapfill.leakage
+  workflow:
+    - build_holdout_mask                 # holdout_mask_from_intervals
+    - mask_held_out_target_values        # hide_target
+    - daily_statistics_from_visible_only # available_target_mask
+    - build_prediction_features          # build_validation_features
+    - retain_untouched_truth_for_scoring # ValidationFeatureSet.truth
+  independent_protections: [hide_target, available_mask]
+  probe:
+    detect: detect_target_leakage
+    require: require_no_target_leakage
+    error: LeakageError
+    checks_with_and_without_frame_masking: true
   modes:
     paper_safe:
       mask_before_feature_computation: true
@@ -218,6 +245,22 @@ model:
   report_rows_excluded_for_missing_predictors: true
   one_model_per_target: true
   serialization: joblib
+  implementation: rfrgapfill.model.RFRModel
+  scoring: r2                  # scikit-learn's regressor default
+  cv_splitters:
+    kfold: "sklearn.model_selection.KFold(n_splits=cv_folds, shuffle=cv_shuffle)"
+    time_series_split: "sklearn.model_selection.TimeSeriesSplit(n_splits=cv_folds)"
+  non_finite_predictor_rows:
+    at_fit: dropped
+    at_predict: "missing prediction, or raise when on_incomplete='raise'"
+    native_sklearn_nan_handling_used: false
+    provenance: default        # method_spec.md section 5
+  n_jobs_applied_to: estimator  # not the grid search: one level of parallelism
+  saved_payload:
+    format_version: 1
+    carries: [config, feature_names, search, fit_report, versions]
+    config_revalidated_on_load: true
+    warns_on_sklearn_version_drift: true
 
 metrics:
   required: [r2, slope, rmse, bias]
@@ -295,9 +338,10 @@ known_ambiguities:
     default: missing_records
     config: allocation_basis
   - id: A4
-    topic: "daily target statistics when a whole day or longer has no visible observations"
-    default: "leave missing; exclude from training, flag at prediction"
-    config: [feature_mode, driver_completeness_policy]
+    topic: "daily target statistics when a whole day or longer has too few visible observations"
+    default: "missing: leave missing; exclude from training, flag at prediction"
+    alternatives: [within_day_available, neighbor_day_fallback, rolling_available]
+    config: [daily_statistic_strategy, min_daily_observations, fallback_window_days]
   - id: A5
     topic: "cross-validation details inside GridSearchCV"
     default: "conventional GridSearchCV folds on training portion"
