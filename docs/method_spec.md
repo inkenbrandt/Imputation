@@ -127,6 +127,11 @@ Each daily value is joined back to every timestamp of that day. Stated purpose i
 the paper: reduce the effect of potential outliers. These features are
 target-specific — a separate feature matrix exists per target.
 
+Quantiles use linear interpolation between order statistics (the numpy/pandas
+default). The standard deviation uses `daily_std_ddof = 1`, the sample standard
+deviation (ambiguity A11); a day with a single visible observation therefore has
+defined quartiles and an undefined standard deviation.
+
 ### 3.5 Leakage rule (default `feature_mode="paper_safe"`)
 
 Daily target statistics are derived from the target, so they are the main leakage
@@ -309,3 +314,4 @@ described as reproducing the paper exactly.
 | A8 | The denominator of the supplement's normalized joint-uncertainty ratio is not reconstructed. | Bias-IQR by gap class supported now; normalized ratios remain explicitly experimental. | experimental module |
 | A9 | Hemisphere inference for sites at or very near the equator. | `latitude >= 0 -> north`; an explicit `hemisphere` always overrides. | `hemisphere`, `latitude` |
 | A10 | Units of Table S3 NEE RMSE/bias (`g C m-2 d-1`) differ from the half-hourly model units (`umol m-2 s-1`); the aggregation from half-hourly residuals to daily carbon units is not spelled out. | Report metrics in model units by default; benchmark comparison applies an explicit, documented unit conversion. | reproduction module |
+| A11 | The paper names the daily standard deviation but not its degrees-of-freedom convention, nor the quantile interpolation behind Q1/Q2/Q3. | Sample standard deviation (`ddof=1`, the pandas default) and linear quantile interpolation (the numpy/pandas default). | `daily_std_ddof` |

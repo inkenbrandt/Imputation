@@ -147,6 +147,11 @@ receptive_limiter:
     source: "quality-controlled observations of the target flux"
     joined_back_to_all_timestamps_of_day: true
     target_specific: true
+    quantile_interpolation: linear
+    std_ddof:
+      default: 1
+      provenance: default      # A11
+    empty_or_sparse_day_yields: missing
     provenance: paper
   feature_order_deterministic: true
 

@@ -270,6 +270,10 @@ class FeatureConfig:
     #: Minimum visible target observations for a day's statistics to be computed (A4).
     #: Days below this leave the statistics missing; they are never imputed.
     min_daily_observations: int = 1
+    #: Delta degrees of freedom of the daily target standard deviation (A11). The
+    #: paper names the statistic but not the convention; 1 is the sample standard
+    #: deviation and the pandas default. 0 gives the population standard deviation.
+    daily_std_ddof: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.use_receptive_limiter, bool):
@@ -307,6 +311,11 @@ class FeatureConfig:
             "min_daily_observations",
             _check_positive_int(self.min_daily_observations, field_name="min_daily_observations"),
         )
+        object.__setattr__(
+            self,
+            "daily_std_ddof",
+            _check_positive_int(self.daily_std_ddof, field_name="daily_std_ddof", minimum=0),
+        )
 
     @property
     def mode(self) -> FeatureMode:
@@ -337,6 +346,7 @@ class FeatureConfig:
             "radiation_thresholds": list(self.radiation_thresholds),
             "boundary_convention": self.convention.value,
             "min_daily_observations": self.min_daily_observations,
+            "daily_std_ddof": self.daily_std_ddof,
         }
 
 
