@@ -60,6 +60,7 @@ __all__ = [
     "describe_features",
     "feature_names",
     "radiation_tag",
+    "receptive_limiter_features",
     "season_tag",
     "time_distance_hours",
 ]
@@ -543,9 +544,30 @@ def feature_names(
                 "pass an RFRConfig to take them from its mode"
             )
         names = list(drivers)
+    return tuple(names) + receptive_limiter_features(features, target=target)
+
+
+def receptive_limiter_features(
+    config: RFRConfig | FeatureConfig,
+    *,
+    target: str | None = None,
+) -> tuple[str, ...]:
+    """Return the feature columns the receptive limiter contributes, in order.
+
+    Empty for an ORF configuration, which is the whole of the difference between
+    the two arms of the Supplementary Figure S1 comparison. :func:`feature_names`
+    is built from this, so the identity
+
+    ``feature_names(cfg, target=t) == cfg.drivers + receptive_limiter_features(cfg, target=t)``
+
+    holds by construction rather than by two lists being kept in step by hand.
+    The ORF benchmark tests assert exactly that ORF drops this tuple and keeps
+    everything else (method_spec.md 3.6).
+    """
+    features = config.features if isinstance(config, RFRConfig) else config
     if not features.use_receptive_limiter:
-        return tuple(names)
-    names += [RADIATION_CATEGORY, TIME_DISTANCE_HOURS, SEASON]
+        return ()
+    names = [RADIATION_CATEGORY, TIME_DISTANCE_HOURS, SEASON]
     if target is not None:
         names += list(daily_statistic_names(target))
     return tuple(names)

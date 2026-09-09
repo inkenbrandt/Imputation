@@ -35,6 +35,7 @@ from rfrgapfill.features import (
     describe_features,
     feature_names,
     radiation_tag,
+    receptive_limiter_features,
     season_tag,
     time_distance_hours,
 )
@@ -625,3 +626,65 @@ def test_the_orf_description_advertises_no_limiter_conventions() -> None:
     assert described["use_receptive_limiter"] is False
     assert described["feature_names"] == list(orf.drivers)
     assert "radiation_thresholds" not in described
+
+
+# ---------------------------------------------------------------------------
+# ORF benchmark: the receptive-limiter contribution (acceptance tests 7-9)
+# ---------------------------------------------------------------------------
+
+
+def test_the_limiter_contributes_exactly_the_features_orf_drops() -> None:
+    # Acceptance tests 8 and 9 as one identity: the two arms' feature sets differ
+    # by the limiter tuple and by nothing else.
+    rfr = rfr3_config()
+    orf = rfr.as_orf()
+
+    assert receptive_limiter_features(rfr, target="LE") == (
+        RADIATION_CATEGORY,
+        TIME_DISTANCE_HOURS,
+        SEASON,
+        "LE_daily_q1",
+        "LE_daily_q2",
+        "LE_daily_q3",
+        "LE_daily_std",
+    )
+    assert receptive_limiter_features(orf, target="LE") == ()
+    assert feature_names(rfr, target="LE") == feature_names(orf) + receptive_limiter_features(
+        rfr, target="LE"
+    )
+
+
+def test_both_arms_are_built_on_the_identical_driver_columns() -> None:
+    # Acceptance test 7 at the feature layer: same drivers, same values, same
+    # order; the ORF matrix is the RFR matrix with the limiter block removed.
+    rfr = rfr3_config()
+    orf = rfr.as_orf()
+    frame = driver_frame(half_hourly())
+
+    rfr_matrix = build_feature_matrix(frame, config=rfr, target="LE")
+    orf_matrix = build_feature_matrix(frame, config=orf)
+
+    assert tuple(orf_matrix.columns) == rfr.drivers
+    pd.testing.assert_frame_equal(rfr_matrix[list(rfr.drivers)], orf_matrix)
+
+
+def test_orf_needs_no_target_because_it_derives_nothing_from_one() -> None:
+    orf = rfr3_config().as_orf()
+    frame = driver_frame(half_hourly()).drop(columns=["LE"])
+    matrix = build_feature_matrix(frame, config=orf)
+    assert tuple(matrix.columns) == orf.drivers
+
+
+def test_orf_features_cannot_depend_on_the_target_at_all() -> None:
+    # The strongest statement of "omits the receptive-limiter-derived features":
+    # corrupting the target leaves the ORF matrix bit-identical, so no ORF
+    # feature can carry target information by any route.
+    orf = rfr3_config().as_orf()
+    frame = driver_frame(half_hourly())
+    corrupted = frame.copy()
+    corrupted["LE"] = 1e9
+
+    pd.testing.assert_frame_equal(
+        build_feature_matrix(frame, config=orf),
+        build_feature_matrix(corrupted, config=orf),
+    )

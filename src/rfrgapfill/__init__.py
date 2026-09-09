@@ -35,6 +35,8 @@ from rfrgapfill.config import (
     Mode,
     RFRConfig,
     ValidationConfig,
+    orf_pairing_differences,
+    require_orf_pairing,
 )
 from rfrgapfill.features import (
     RADIATION_CATEGORY,
@@ -46,6 +48,7 @@ from rfrgapfill.features import (
     daily_flux_statistics,
     feature_names,
     radiation_tag,
+    receptive_limiter_features,
     season_tag,
     time_distance_hours,
 )
@@ -98,8 +101,11 @@ __all__ = [
     "daily_flux_statistics",
     "elapsed_hours",
     "feature_names",
+    "orf_pairing_differences",
     "prepare_time_index",
     "radiation_tag",
+    "receptive_limiter_features",
+    "require_orf_pairing",
     "season_tag",
     "time_distance_hours",
 ]

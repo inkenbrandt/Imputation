@@ -60,6 +60,8 @@ __all__ = [
     "Mode",
     "RFRConfig",
     "ValidationConfig",
+    "orf_pairing_differences",
+    "require_orf_pairing",
 ]
 
 
@@ -748,6 +750,32 @@ class RFRConfig:
             and not self.cv_shuffle
         )
 
+    @property
+    def is_orf(self) -> bool:
+        """Whether this is the ORF benchmark rather than an RFR run (Fig. S1)."""
+        return not self.features.use_receptive_limiter
+
+    def as_orf(self) -> RFRConfig:
+        """Return this run's ORF benchmark counterpart (method_spec.md 3.6).
+
+        Switches the receptive limiter off and changes **nothing else**: the same
+        mode and driver set, seed, hyperparameter grid, CV policy, column mapping,
+        QC rules and hemisphere are all carried over. That is the entire
+        definition of ORF in Supplementary Figure S1 - the same Random Forest, on
+        the same rows, with the same drivers, minus the feature engineering - so
+        the paired comparison measures the receptive limiter and nothing else.
+
+        Deriving the benchmark this way rather than hand-building a second
+        configuration is what keeps that guarantee: see :func:`require_orf_pairing`,
+        which the validation workflow uses to reject a mismatched pair.
+
+        Idempotent - calling it on a configuration that is already ORF returns an
+        equal configuration.
+        """
+        if self.is_orf:
+            return self
+        return self.replace(features=self.features.replace(use_receptive_limiter=False))
+
     def resolve_hemisphere(self) -> Hemisphere:
         """Return the hemisphere, preferring an explicit value over ``latitude`` (A9)."""
         if self.hemisphere is not None:
@@ -828,6 +856,77 @@ class RFRConfig:
             "column_map": self.columns.to_dict(),
             "is_paper_faithful": self.is_paper_faithful,
         }
+
+
+# ---------------------------------------------------------------------------
+# ORF benchmark pairing (method_spec.md 3.6, Supplementary Figure S1)
+# ---------------------------------------------------------------------------
+
+#: Sentinel distinguishing "absent" from a legitimately ``None`` setting.
+_ABSENT: Final = object()
+
+
+def _flatten_settings(value: Any, prefix: str = "") -> dict[str, Any]:
+    """Return nested manifest settings as a flat ``dotted.key -> value`` mapping."""
+    if isinstance(value, Mapping):
+        flattened: dict[str, Any] = {}
+        for key, item in value.items():
+            flattened.update(_flatten_settings(item, f"{prefix}{key}."))
+        return flattened
+    return {prefix.rstrip("."): value}
+
+
+def orf_pairing_differences(rfr: RFRConfig, orf: RFRConfig) -> tuple[str, ...]:
+    """Return the settings that differ between an RFR run and its ORF benchmark.
+
+    The receptive limiter itself is excluded by construction: ``rfr`` is compared
+    through :meth:`RFRConfig.as_orf`, so both sides of the comparison have the
+    limiter off and only *other* divergences are reported, as dotted manifest
+    keys such as ``random_state`` or ``features.radiation_thresholds``.
+
+    An empty result means the pair is a valid ORF-versus-RFR comparison.
+    """
+    expected = _flatten_settings(rfr.as_orf().to_dict())
+    actual = _flatten_settings(orf.to_dict())
+    return tuple(
+        key
+        for key in sorted(set(expected) | set(actual))
+        if expected.get(key, _ABSENT) != actual.get(key, _ABSENT)
+    )
+
+
+def require_orf_pairing(rfr: RFRConfig, orf: RFRConfig) -> None:
+    """Raise unless ``orf`` differs from ``rfr`` only by the receptive limiter.
+
+    The supplement's ORF is defined *relative to* the RFR run it is compared
+    against: same estimator family, same driver set, same training rows, same
+    seed and hyperparameter-search policy, with sections 3.1-3.4 omitted. A
+    benchmark that also changed the grid or the seed would measure that instead,
+    which is why ``ORF is not redefined in any other way`` is a checked
+    precondition of the paired comparison rather than a comment.
+
+    Note that this checks the two *configurations*. Running them on the same
+    artificial gap mask is a property of the validation workflow that consumes
+    them, and is enforced there.
+    """
+    if rfr.is_orf:
+        raise ConfigError(
+            "the RFR arm of an ORF comparison must have the receptive limiter enabled; "
+            "got use_receptive_limiter=False for both arms, which compares ORF with itself"
+        )
+    if not orf.is_orf:
+        raise ConfigError(
+            "the ORF arm of the comparison must have use_receptive_limiter=False "
+            "(docs/method_spec.md 3.6); derive it with RFRConfig.as_orf()"
+        )
+    differences = orf_pairing_differences(rfr, orf)
+    if differences:
+        raise ConfigError(
+            "ORF must differ from the RFR run it is compared against only by the "
+            f"receptive limiter, but these settings also differ: {', '.join(differences)}. "
+            "Derive the benchmark with RFRConfig.as_orf() so the comparison measures the "
+            "feature engineering and nothing else (docs/method_spec.md 3.6)."
+        )
 
 
 def _validate_hyperparameter_grid(grid: object) -> Mapping[str, tuple[Any, ...]]:

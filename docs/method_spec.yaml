@@ -40,6 +40,13 @@ methods:
     use_receptive_limiter: false
     role: benchmark
     supported_by: "Supplementary Figure S1"
+    defined_relative_to: the_rfr_run_it_is_compared_against
+    must_match_compared_rfr:
+      [mode, drivers, random_state, hyperparameter_grid, cv_strategy, cv_folds,
+       cv_shuffle, column_map, observed_qc_values, artificial_gap_mask]
+    pairing_enforced_by: require_orf_pairing
+    paired_metrics: [r2, slope, rmse, bias]
+    per_site_improvement_required: false
     provenance: paper
   - name: MDS
     role: external_reference_only

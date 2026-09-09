@@ -155,6 +155,24 @@ must never be mixed silently.
 family, identical hyperparameter grid, identical training rows, identical driver
 set; sections 3.1–3.4 omitted. ORF is not redefined in any other way.
 
+ORF is defined *relative to* the RFR run it is compared against, so the pairing
+is a checked precondition rather than a convention:
+
+- `RFRConfig.as_orf()` derives the benchmark arm, flipping only the limiter flag
+  and carrying over mode, drivers, seed, grid, CV policy, column mapping, QC
+  rules and hemisphere unchanged;
+- `require_orf_pairing(rfr, orf)` rejects a pair that differs in anything else,
+  naming the offending settings;
+- `receptive_limiter_features(config, target=...)` is exactly what the two arms'
+  feature sets differ by, so `feature_names` cannot drift from it.
+
+Both arms must additionally be scored on the **same artificial gap mask**; that
+is a property of the validation workflow (section 4) rather than of the
+configuration pair. The paired comparison reports R2, slope, RMSE and bias for
+each arm and their difference. No individual metric is required to improve:
+Supplementary Figure S1 is evidence about the receptive limiter in aggregate,
+not a per-site guarantee.
+
 ---
 
 ## 4. Artificial-gap validation scenario
