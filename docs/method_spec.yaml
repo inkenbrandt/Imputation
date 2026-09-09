@@ -305,6 +305,31 @@ data_assumptions:
     - "<target>_fill_method"
     - "<target>_model_version"
 
+operational_fill:
+  module: rfrgapfill.fill
+  implementation: rfrgapfill.fill.RFRGapFiller
+  training_rows: "observed only: present, finite, and QC-accepted"
+  prefilled_target_values:
+    trained_on: false
+    used_for_daily_statistics: false
+    overwritten_by_default: false
+    opt_in: refill_pre_filled
+    fill_method_label: pre_filled
+  predicted_rows: "target gaps only; a present value is never replaced by default"
+  incomplete_predictor_rows:
+    default: "left unfilled, labelled unfilled_incomplete_features"
+    alternative: "raise, via on_incomplete='raise'"
+    imputed: false
+  input_frame_mutated: false
+  time_distance_origin: "fixed at fit; reused by fill so the feature keeps its meaning"
+  fill_method_values:
+    observed: "QC-accepted measurement carried through"
+    pre_filled: "value of another provenance, carried through"
+    unfilled_incomplete_features: "no value; predictors incomplete"
+    model: "the arm label: RFR3 | RFR10 | ORF3 | ORF10"
+  report: rfrgapfill.fill.FillReport
+  long_gap_consequence: "see A4; a whole-day gap has no daily statistics and cannot be filled"
+
 reproducibility:
   seeded_components: [artificial_gap_selection, random_forest, cross_validation]
   run_manifest_fields:

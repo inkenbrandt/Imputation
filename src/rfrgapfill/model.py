@@ -278,6 +278,15 @@ class RFRModel:
         return self._report
 
     @property
+    def fitted_at(self) -> str | None:
+        """When :meth:`fit` completed, as an ISO-8601 UTC stamp, or ``None`` if unfitted.
+
+        Part of the identity a filled value is stamped with, so a column of
+        predictions can be traced back to the run that produced it.
+        """
+        return self._fitted_at
+
+    @property
     def estimator(self) -> RandomForestRegressor:
         """The tuned ``RandomForestRegressor``, refitted on the whole training set."""
         if self._estimator is None:

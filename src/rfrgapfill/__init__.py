@@ -53,6 +53,16 @@ from rfrgapfill.features import (
     season_tag,
     time_distance_hours,
 )
+from rfrgapfill.fill import (
+    FILL_COLUMN_SUFFIXES,
+    FillError,
+    FillMethod,
+    FillReport,
+    FillResult,
+    RFRGapFiller,
+    fill_column_names,
+    method_label,
+)
 from rfrgapfill.leakage import (
     LeakageError,
     ValidationFeatureSet,
@@ -91,6 +101,7 @@ PAPER_DOI = "10.1016/j.agrformet.2021.108777"
 
 __all__ = [
     "DEFAULT_HYPERPARAMETER_GRID",
+    "FILL_COLUMN_SUFFIXES",
     "PAPER_DOI",
     "RADIATION_CATEGORY",
     "SEASON",
@@ -106,6 +117,10 @@ __all__ = [
     "FeatureConfig",
     "FeatureError",
     "FeatureMode",
+    "FillError",
+    "FillMethod",
+    "FillReport",
+    "FillResult",
     "FitReport",
     "GapClass",
     "GapScenarioConfig",
@@ -118,6 +133,7 @@ __all__ = [
     "ModelError",
     "NotFittedError",
     "RFRConfig",
+    "RFRGapFiller",
     "RFRModel",
     "RadiationClass",
     "Season",
@@ -133,8 +149,10 @@ __all__ = [
     "detect_target_leakage",
     "elapsed_hours",
     "feature_names",
+    "fill_column_names",
     "hide_target",
     "holdout_mask_from_intervals",
+    "method_label",
     "observed_target_mask",
     "orf_pairing_differences",
     "prepare_time_index",

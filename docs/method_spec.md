@@ -384,6 +384,39 @@ Computed over the same artificial-gap intervals using (a) measured H and LE and
   carries `<target>_original`, `<target>_filled`, `<target>_is_observed`,
   `<target>_is_filled`, `<target>_fill_method`, `<target>_model_version`.
 
+`rfrgapfill.fill.RFRGapFiller` is the operational workflow those rules describe:
+`fit(data, target=..., qc_column=...)` then `fill(data)`, one site and one target
+per instance. Leakage has nothing to prevent here — a genuinely missing value is
+already invisible to the daily statistics — so the entry point is this module and
+not `rfrgapfill.leakage`. What it does enforce:
+
+- **training rows are observed rows.** Present, finite and QC-accepted. A value
+  the QC flag marks as gap-filled before ingestion is neither trained on nor
+  admitted to the daily statistics, exactly as in validation.
+- **a present value is never replaced.** Only gaps are predicted. A pre-filled
+  value is carried through and labelled `pre_filled`; `refill_pre_filled=True`
+  is the explicit opt-in, and it is the way to run RFR over a FLUXNET target
+  column that already arrived complete.
+- **nothing is imputed for a row lacking a predictor.** It stays missing and is
+  labelled `unfilled_incomplete_features`, or `on_incomplete="raise"` fails
+  instead — the two behaviours this section allows, and no third.
+- **the caller's frame is not mutated.** Every stage works on a copy on a
+  validated time axis; the result carries the input's columns plus the six above.
+- **`time_distance_hours` keeps one origin.** Fixed at `fit` and reused by
+  `fill`, so a later slice of the same series does not silently restart the
+  clock; rows earlier than that origin are counted in the report.
+
+`<target>_fill_method` partitions the filled series by provenance: `observed`,
+`pre_filled`, `unfilled_incomplete_features`, or the arm's own label (`RFR3`,
+`RFR10`, `ORF3`, `ORF10`) for a value this package predicted.
+
+`FillReport` is the row accounting — observed, pre-filled and missing rows against
+the frame; filled and unfilled against the candidates; and the feature that
+blocked the most rows. That last field is where ambiguity A4 becomes visible
+operationally: under the default `daily_statistic_strategy="missing"` a gap
+covering a whole calendar day has no daily statistics, so **none of its rows can
+be filled**, and the fill warns rather than returning a quietly empty gap.
+
 Every stochastic component (gap sampling, Random Forest, CV) accepts a seed, and a
 run manifest records package/Python/scikit-learn versions, column mapping, target,
 RFR3/RFR10 mode, feature mode, hyperparameter grid, best parameters, seed, gap

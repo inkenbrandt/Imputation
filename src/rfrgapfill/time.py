@@ -274,7 +274,10 @@ def set_time_index(
         frame = data.drop(columns=[timestamp]) if drop else data.copy()
         frame.index = index
     if frame.index.name is None:
-        frame.index.name = TIMESTAMP_INDEX_NAME
+        # rename() rather than assigning to .name: a DatetimeIndex taken straight
+        # from the caller's frame is the same object as theirs, and naming it in
+        # place would reach back into a DataFrame this function promised to copy.
+        frame.index = frame.index.rename(TIMESTAMP_INDEX_NAME)
     return frame
 
 

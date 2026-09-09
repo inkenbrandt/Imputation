@@ -17,9 +17,10 @@ prevention of data leakage** — not maximising predictive scores.
 
 **Pre-alpha.** The scientific specification is frozen and the package installs
 and tests cleanly. Configuration, column mapping, the temporal layer, the
-receptive-limiter features, the leakage-safe validation feature workflow and the
-Random Forest itself are implemented and usable; the gap generator and the
-high-level fill/validate API are still placeholders, filled in step by step.
+receptive-limiter features, the leakage-safe validation feature workflow, the
+Random Forest and the operational fill API are implemented and usable; the
+artificial-gap generator, the metrics and the paper-validation workflow are still
+placeholders, filled in step by step.
 
 | Component | State |
 |---|---|
@@ -30,8 +31,9 @@ high-level fill/validate API are still placeholders, filled in step by step.
 | Receptive-limiter features, ORF pairing | done |
 | Leakage-safe validation features | done |
 | Random Forest fitting, tuning and persistence | done |
+| Operational fill API and provenance | done |
 | Artificial-gap generator | not started |
-| Filling, metrics, validation workflow | not started |
+| Metrics and paper-validation workflow | not started |
 
 ## Specification first
 
@@ -218,23 +220,76 @@ pip install -e ".[dev]"
 Notebooks are not a core or development dependency; install the optional
 `notebooks` extra if you want the example notebook environment.
 
-## Planned API
+## Filling real gaps
 
-Not implemented yet — recorded here as the target the remaining modules are built
-toward. It is repeated in the specification and will become the tested quick-start
-once the gap generator and the fill/validate workflow land; `RFRConfig`,
-`build_feature_matrix`, `build_validation_features` and `RFRModel` already do this
-work a layer down.
+`RFRGapFiller` is the operational interface: one site, one target, fit then fill.
 
 ```python
-from rfrgapfill import RFRConfig, RFRGapFiller
+from rfrgapfill import ColumnMap, RFRConfig, RFRGapFiller
 
-config = RFRConfig(mode="RFR10", frequency="30min", hemisphere="north", random_state=42)
-filler = RFRGapFiller(config)
+config = RFRConfig(
+    mode="RFR10",
+    frequency="30min",
+    hemisphere="north",
+    random_state=42,
+    column_map=ColumnMap.fluxnet2015("RFR10"),
+)
 
-filler.fit(df, target="LE", qc_col="LE_QC", column_map={...})
+filler = RFRGapFiller(config).fit(df, target="LE", qc_column="LE_QC")
 result = filler.fill(df)
 
+result.filled              # observed where observed, predicted in the gaps
+result.report.summary()    # "LE: filled 812 of 812 candidate row(s) with RFR10."
+filler.to_dict()           # the run manifest: config, columns, features, model
+```
+
+`result.frame` is a **new** frame — your DataFrame is never modified — carrying
+its own columns plus the six provenance columns of `docs/method_spec.md`
+section 7:
+
+| Column | Meaning |
+|---|---|
+| `LE_original` | the target exactly as it arrived |
+| `LE_filled` | the best available series |
+| `LE_is_observed` | a genuine, QC-accepted measurement |
+| `LE_is_filled` | this package predicted this value |
+| `LE_fill_method` | `observed`, `pre_filled`, `unfilled_incomplete_features`, or the arm (`RFR10`) |
+| `LE_model_version` | which fitted model produced a filled value |
+
+The rules the class enforces, none of them optional:
+
+- **only observed rows train.** A value the QC flag marks as gap-filled before
+  ingestion is neither trained on nor used to compute the daily statistics.
+- **a present value is never replaced.** Only gaps are predicted. Pre-filled
+  values are carried through and labelled; `fill(df, refill_pre_filled=True)` is
+  the explicit opt-in, and the way to run RFR over a FLUXNET target column that
+  already arrived complete.
+- **a row lacking a predictor is not filled.** It stays missing and is counted, or
+  `fill(df, on_incomplete="raise")` fails instead. Nothing is fabricated.
+- **`time_distance_hours` keeps the origin it was fitted with**, so filling a
+  later slice of the same series does not restart the clock.
+
+One trap worth knowing, and the report names it for you: under the default
+`daily_statistic_strategy="missing"` a gap covering a whole calendar day has no
+daily statistics, so **none of its rows can be filled** (ambiguity A4). The fill
+warns rather than handing back a quietly empty gap, and `report.worst_feature`
+points at the daily statistic responsible. Choose a reaching strategy for
+multi-day gaps:
+
+```python
+config = config.replace(
+    features=config.features.replace(
+        daily_statistic_strategy="rolling_available", fallback_window_days=7
+    )
+)
+```
+
+## Planned API
+
+Still to land: the artificial-gap generator, the metrics and the paper-validation
+workflow that ties them together.
+
+```python
 report = filler.validate(
     df,
     artificial_gaps=True,
@@ -242,10 +297,6 @@ report = filler.validate(
     gap_mix={"24h": 0.20, "7d": 0.30, "30d": 0.50},
 )
 ```
-
-Observed values are never overwritten in place: filling returns
-`<target>_original`, `<target>_filled`, `<target>_is_observed`,
-`<target>_is_filled`, `<target>_fill_method` and `<target>_model_version`.
 
 ## Development
 
