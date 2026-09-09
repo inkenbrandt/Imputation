@@ -204,6 +204,8 @@ leakage_policy:
   provenance: default          # A6
 
 gap_scenario:
+  module: rfrgapfill.gaps
+  implementation: rfrgapfill.gaps.GapScenarioGenerator
   missing_fraction: 0.25
   durations:
     short: "24h"
@@ -216,13 +218,31 @@ gap_scenario:
   allocation_basis:
     default: missing_records
     alternatives: [gap_events]
+    algorithm: rfrgapfill.gaps.allocate_gaps
+    missing_records: "events_c = round(share_c * target_records / records_per_event_c)"
+    gap_events: "n = round(target_records / mean_event_size); largest remainder by share"
+    rounding: "half up; largest remainder ties resolve in class order"
+    planned_from: "records a complete grid would hold, before any interval is placed"
     provenance: default        # A3
+  fraction_measured_against: "genuinely observed target values, not rows"
   min_observed_fraction: 0.50
+  observed_fraction_denominator: n_expected
   allow_overlap: false
+  placement_order: "longest class first"
   seeded: true
+  bounded_retries: max_attempts_per_gap
   shared_gaps_across_targets: true
-  manifest_fields: [start, end, duration, gap_class, affected_rows, observed_fraction]
+  joint_targets_available_where: "every target is observed"
+  manifest: rfrgapfill.gaps.GapManifest
+  manifest_fields: [gap_id, gap_class, start, end, duration, n_expected, n_rows,
+                    n_observed_before_masking, observed_fraction]
+  reports_achieved_mix_on_both_bases: true
+  tolerances:                  # A7
+    fraction: fraction_tolerance
+    mix: mix_tolerance
+    breach: warning            # rfrgapfill.gaps.GapScenarioWarning
   must_report_when_unsatisfiable: true
+  unsatisfiable_error: rfrgapfill.gaps.GapError
   provenance: paper
 
 train_test_design:
@@ -263,6 +283,7 @@ model:
     warns_on_sklearn_version_drift: true
 
 metrics:
+  module: rfrgapfill.metrics
   required: [r2, slope, rmse, bias]
   definitions:
     r2: "coefficient of determination"
@@ -272,6 +293,19 @@ metrics:
   regression_orientation:
     x: measured
     y: filled
+  r2_definition:
+    default: residual          # A12: 1 - SS_res/SS_tot
+    alternatives: [squared_correlation]
+    config: r2_definition
+    provenance: default
+  slope_fit_intercept:
+    default: true
+    provenance: default
+  pairing:
+    align_series_silently: false     # differing indexes are an error
+    drop_incomplete_pairs: true      # both sides at once
+    n_counts: "complete pairs, and is the bias denominator"
+  undefined_result: null             # never NaN, never zero
   subsets: [all, daytime, nighttime]
   daytime_threshold:
     variable: shortwave
@@ -285,6 +319,9 @@ metrics:
     evaluated_on: "same artificial-gap intervals"
     variants: [measured, filled]
     returns: [measured_ebr, filled_ebr, difference]
+    implementation: rfrgapfill.metrics.compare_energy_balance
+    row_rule: "a row is used only where every component is present; both ratios share one row set"
+    zero_denominator: null
   provenance: paper
 
 data_assumptions:
@@ -361,6 +398,9 @@ known_ambiguities:
   - id: A3
     topic: "20/30/50 mix = gap events or withheld half-hours"
     default: missing_records
+    alternatives: [gap_events]
+    both_implemented: rfrgapfill.gaps.allocate_gaps
+    achieved_mix_reported_on_both_bases: true
     config: allocation_basis
   - id: A4
     topic: "daily target statistics when a whole day or longer has too few visible observations"
@@ -391,3 +431,13 @@ known_ambiguities:
     topic: "unit conversion from half-hourly model units to Table S3 g C m-2 d-1"
     default: "report model units; explicit documented conversion for benchmarks"
     config: reproduction_module
+  - id: A11
+    topic: "degrees-of-freedom convention for the daily standard deviation, and quantile interpolation"
+    default: "sample standard deviation (ddof=1) and linear quantile interpolation"
+    config: daily_std_ddof
+  - id: A12
+    topic: "whether R2 is 1 - SS_res/SS_tot or the squared Pearson correlation"
+    default: residual
+    alternatives: [squared_correlation]
+    both_implemented: rfrgapfill.metrics.r2
+    config: r2_definition

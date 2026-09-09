@@ -18,9 +18,9 @@ prevention of data leakage** — not maximising predictive scores.
 **Pre-alpha.** The scientific specification is frozen and the package installs
 and tests cleanly. Configuration, column mapping, the temporal layer, the
 receptive-limiter features, the leakage-safe validation feature workflow, the
-Random Forest and the operational fill API are implemented and usable; the
-artificial-gap generator, the metrics and the paper-validation workflow are still
-placeholders, filled in step by step.
+Random Forest, the operational fill API and the artificial-gap generator are
+implemented and usable, as are the validation metrics; the paper-validation
+workflow that ties them together is still a placeholder, filled in step by step.
 
 | Component | State |
 |---|---|
@@ -32,8 +32,9 @@ placeholders, filled in step by step.
 | Leakage-safe validation features | done |
 | Random Forest fitting, tuning and persistence | done |
 | Operational fill API and provenance | done |
-| Artificial-gap generator | not started |
-| Metrics and paper-validation workflow | not started |
+| Artificial-gap generator and allocation bases | done |
+| Validation metrics and energy-balance ratio | done |
+| Paper-validation workflow | not started |
 
 ## Specification first
 
@@ -42,7 +43,7 @@ prose in the paper:
 
 - [`docs/method_spec.md`](docs/method_spec.md) — the contract: driver lists,
   receptive-limiter features, gap scenario, metrics, and a **Known ambiguities**
-  table (A1–A10) covering every point where the paper is silent.
+  table (A1–A12) covering every point where the paper is silent.
 - [`docs/method_spec.yaml`](docs/method_spec.yaml) — machine-readable companion.
   Each block is tagged `provenance: paper` or `provenance: default` so code and
   tests can tell a published fact from a documented choice of ours.
@@ -284,10 +285,124 @@ config = config.replace(
 )
 ```
 
+## Artificial gaps
+
+`GapScenarioGenerator` builds the paper's validation scenario: roughly 25% of the
+genuinely observed values withheld as 24-hour, 7-day and 30-day gaps mixed
+20/30/50, each interval needing at least 50% real measurement underneath it.
+
+```python
+from rfrgapfill import GapScenarioGenerator
+
+manifest = GapScenarioGenerator(config).generate(df, target="LE", qc_column="LE_QC")
+
+manifest.summary()      # exactly how the mixture was constructed
+manifest.to_frame()     # one row per gap: id, class, start, end, duration, coverage
+holdout = manifest.mask(df.index)   # step 1 of the leakage-safe workflow
+```
+
+Pass several targets to reproduce the paper's joint NEE/H/LE design — one set of
+gap locations, scored for all three:
+
+```python
+manifest = GapScenarioGenerator(config).generate(
+    df, target=["NEE", "H", "LE"], qc_column={"NEE": "NEE_QC", "H": "H_QC", "LE": "LE_QC"}
+)
+```
+
+### The 20/30/50 ambiguity is yours to choose (A3)
+
+The paper does not say whether those percentages count gap *events* or withheld
+*half-hours*, and the two readings give very different designs — a 20/30/50 mix
+of events puts over 80% of the withheld records in the 30-day class. Both are
+implemented, the default is `missing_records`, and every manifest reports the
+achieved mix on **both** bases next to what was requested:
+
+```python
+config = RFRConfig(
+    mode="RFR10",
+    hemisphere="north",
+    validation=ValidationConfig(gaps=GapScenarioConfig(allocation_basis="gap_events")),
+)
+```
+
+Nothing is quietly corrected to look exact. What a scenario really withholds is
+measured from the placed intervals, and an achieved fraction or mix outside the
+configured tolerance, a class the series is too short to hold, or a design that
+could not be placed at all is a `GapScenarioWarning` or a `GapError` — never a
+silently thinner set of gaps.
+
+## Scoring a fill
+
+`rfrgapfill.metrics` is the paper's evaluation quantities and nothing else — R2,
+the regression slope, RMSE, its bias definition, and the energy-balance ratio.
+Each is an independent function of the values it is handed, so the same call
+scores a whole run, one gap class or one daytime subset:
+
+```python
+from rfrgapfill import core_metrics, bias, compare_energy_balance
+
+scored = core_metrics(measured, predicted)
+scored.r2, scored.slope, scored.rmse, scored.bias
+scored.n, scored.n_offered          # pairs scored, rows offered
+scored.to_dict()                    # straight into the run manifest
+
+bias(measured, predicted)           # (sum(predicted) - sum(measured)) / n
+```
+
+Two rules apply before anything is computed. Series carrying different indexes
+are **refused**, not aligned — silent realignment is how a prediction gets scored
+against the wrong half hour. Incomplete pairs are dropped from both sides at
+once, so a row the model left unfilled for want of a predictor leaves the score
+entirely rather than poisoning it; `n` is what survived, and it is the `n` in the
+bias denominator.
+
+An undefined metric is `None`, never `NaN` or zero. An empty subset has no RMSE,
+constant measurements have no slope, and zero available energy has no EBR —
+`None` reaches a JSON manifest as `null` and cannot propagate silently through a
+later mean.
+
+### Which R2 (A12)
+
+The paper prints R2 next to a slope without saying which quantity it is. The
+default is `residual` — `1 - SS_res/SS_tot`, scikit-learn's `r2_score` — because
+the alternative, the squared Pearson correlation, is invariant to any affine
+rescaling of the predictions and so scores a systematically offset series as
+perfectly as an unbiased one. A package that reports bias in the next column
+should not report an R2 that cannot see it. Both are implemented, and the choice
+is recorded in every result:
+
+```python
+ValidationConfig(r2_definition="squared_correlation")
+```
+
+The two coincide when predictions are unbiased and shrunk toward the mean, which
+is where Supplementary Table S3 sits — its median R2 and median slope agree to
+about 0.01 in every RFR row — so neither reading is paper exact.
+
+### Energy balance
+
+```python
+comparison = compare_energy_balance(
+    measured_sensible_heat=h_measured,
+    measured_latent_heat=le_measured,
+    filled_sensible_heat=h_filled,
+    filled_latent_heat=le_filled,
+    net_radiation=df["NETRAD"],
+    soil_heat_flux=df["G"],
+)
+comparison.measured, comparison.filled, comparison.difference
+```
+
+`sum(H + LE) / sum(NETRAD - G)` over the artificial-gap rows, measured against
+filled. A row is used only where every component it needs is present, and both
+ratios share one row set — otherwise the difference would report the change in
+interval as much as the change in flux.
+
 ## Planned API
 
-Still to land: the artificial-gap generator, the metrics and the paper-validation
-workflow that ties them together.
+Still to land: the paper-validation workflow that ties the generator and the
+metrics above into one call.
 
 ```python
 report = filler.validate(

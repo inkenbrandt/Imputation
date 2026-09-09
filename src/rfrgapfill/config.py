@@ -2,7 +2,7 @@
 
 Implements :class:`RFRConfig`, :class:`FeatureConfig`, :class:`GapScenarioConfig`
 and :class:`ValidationConfig`. Every ambiguity recorded in ``docs/method_spec.md``
-(A1-A10) is reachable through a configuration field here, and incompatible options
+(A1-A12) is reachable through a configuration field here, and incompatible options
 are rejected at construction rather than in the middle of a fit.
 
 All configuration objects are frozen dataclasses. They validate and normalise in
@@ -62,6 +62,7 @@ __all__ = [
     "Hemisphere",
     "MetricSubset",
     "Mode",
+    "R2Definition",
     "RFRConfig",
     "ValidationConfig",
     "orf_pairing_differences",
@@ -174,6 +175,35 @@ class CVStrategy(str, Enum):
     def coerce(cls, value: object) -> CVStrategy:
         """Return ``value`` as a :class:`CVStrategy`."""
         return coerce_enum(cls, value, field_name="cv_strategy")
+
+
+class R2Definition(str, Enum):
+    """Which coefficient of determination ``R2`` names (method_spec.md 6.1, A12).
+
+    The article reports ``R2`` beside a regression slope but does not say which of
+    the two standard quantities it is, and they answer different questions.
+    """
+
+    #: ``1 - SS_res / SS_tot``: the share of the measured variance the predictions
+    #: actually account for, scikit-learn's ``r2_score``. The default, because it
+    #: is what "coefficient of determination" means unqualified and because it is
+    #: the only one of the two that a biased prediction cannot flatter.
+    RESIDUAL = "residual"
+    #: The squared Pearson correlation, equivalently the ``R2`` of the ordinary
+    #: least-squares fit the slope comes from. Invariant to any affine rescaling
+    #: of the predictions, so it scores a systematically offset series as
+    #: perfectly as an unbiased one.
+    SQUARED_CORRELATION = "squared_correlation"
+
+    @property
+    def is_bias_sensitive(self) -> bool:
+        """Whether a systematic offset in the predictions lowers this ``R2``."""
+        return self is R2Definition.RESIDUAL
+
+    @classmethod
+    def coerce(cls, value: object) -> R2Definition:
+        """Return ``value`` as a :class:`R2Definition`."""
+        return coerce_enum(cls, value, field_name="r2_definition")
 
 
 class MetricSubset(str, Enum):
@@ -596,6 +626,8 @@ class ValidationConfig(FrozenRecord):
         MetricSubset.DAYTIME,
         MetricSubset.NIGHTTIME,
     )
+    #: Which quantity ``R2`` names (A12). The default is bias sensitive.
+    r2_definition: R2Definition | str = R2Definition.RESIDUAL
     #: Whether core metrics are also reported per gap class.
     report_by_gap_class: bool = True
     #: Whether bias IQR is reported per gap class (method_spec.md 6.3).
@@ -621,6 +653,7 @@ class ValidationConfig(FrozenRecord):
             if subset not in seen:
                 seen.append(subset)
         object.__setattr__(self, "subsets", tuple(seen))
+        object.__setattr__(self, "r2_definition", R2Definition.coerce(self.r2_definition))
         for name in (
             "report_by_gap_class",
             "bias_iqr_by_gap_class",
@@ -636,6 +669,13 @@ class ValidationConfig(FrozenRecord):
         assert isinstance(subsets, tuple)
         return subsets
 
+    @property
+    def r2(self) -> R2Definition:
+        """The validated ``R2`` definition (narrowed from the input union)."""
+        definition = self.r2_definition
+        assert isinstance(definition, R2Definition)
+        return definition
+
     def replace(self, **changes: Any) -> ValidationConfig:
         """Return a revalidated copy with ``changes`` applied."""
         return replace(self, **changes)
@@ -646,6 +686,7 @@ class ValidationConfig(FrozenRecord):
             "gaps": self.gaps.to_dict(),
             "daytime_threshold": self.daytime_threshold,
             "subsets": [subset.value for subset in self.metric_subsets],
+            "r2_definition": self.r2.value,
             "report_by_gap_class": self.report_by_gap_class,
             "bias_iqr_by_gap_class": self.bias_iqr_by_gap_class,
             "compute_energy_balance_ratio": self.compute_energy_balance_ratio,

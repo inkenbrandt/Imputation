@@ -253,6 +253,37 @@ documented tolerance rather than asserted exactly.
 Interpretation is configurable — `allocation_basis="missing_records"` (default) or
 `"gap_events"` — and the choice used is recorded in every result (ambiguity A3).
 
+Both readings are implemented, side by side, in `rfrgapfill.gaps.allocate_gaps`,
+which is a pure function of the configuration and the size of the series so the
+design can be inspected without sampling anything. Write `S_c` for the configured
+share of class `c`, `E_c = duration_c / time_step` for the records one event of
+that class covers on a complete grid, `A` for the available observations and
+`T = round(missing_fraction * A)` for the records the scenario aims to withhold:
+
+| Basis | Algorithm |
+|---|---|
+| `missing_records` (default) | The shares apply to withheld records; each class independently gets `events_c = round(S_c * T / E_c)`. The counts sum to no particular total, because what is apportioned is `T`, not a number of gaps. |
+| `gap_events` | The shares apply to the gap count. With mean event size `M = sum(S_c * E_c)`, the design needs `N = round(T / M)` events, apportioned by largest remainder so the counts sum to exactly `N`. |
+
+Rounding is half-up, and largest-remainder ties resolve in class order, so an
+allocation never depends on floating-point parity. `missing_records` is the
+default because the paper frames the scenario as percentages of removed
+half-hours — an inference from the prose, not a statement in it, and neither
+basis may be called "paper exact".
+
+The two designs are not near each other: at half-hourly cadence a 20/30/50 mix of
+gap *events* puts over 80% of the withheld records in the 30-day class. That is
+the reason the ambiguity is exposed rather than buried.
+
+Both bases plan from `E_c`, the records a complete grid would hold, because the
+plan is made before any interval is placed. What a scenario actually withholds is
+smaller wherever a chosen interval overlaps real missing data, so the achieved
+fraction and the achieved mix are **measured from the placed intervals** and
+reported on *both* bases next to the request — never back-corrected to look
+exact. `GapManifest.summary()` and `to_dict()` state which basis was used, what
+was asked for and what was achieved, which is what makes a validation report
+self-describing.
+
 ### 4.4 Generator requirements
 
 - seeded and reproducible;
@@ -265,6 +296,32 @@ Interpretation is configurable — `allocation_basis="missing_records"` (default
 - joint NEE/H/LE validation uses **identical** gap locations for all three targets;
 - returns a manifest with start, end, duration, class, affected rows, and observed
   fraction per gap.
+
+`rfrgapfill.gaps.GapScenarioGenerator` is that generator, and
+`rfrgapfill.gaps.GapManifest` is what it returns:
+
+- the withheld fraction is measured against **genuinely observed** target values,
+  not against rows — withholding a value that was never measured withholds
+  nothing, so `n_available` comes from the QC-aware observed mask;
+- `observed_fraction` for a proposed interval divides by `n_expected`, the
+  records a complete grid would hold, not by the rows present: an interval laid
+  over a real gap holds few rows *and* few observations, which would otherwise
+  look like perfect coverage;
+- intervals are placed longest class first, because a 30-day interval is far
+  harder to fit than a 24-hour one;
+- joint NEE/H/LE validation passes several targets at once and a row counts as
+  available only where *every* target is observed, so the single set of
+  locations is a fair test set for all three;
+- `GapManifest.mask()` produces the holdout mask that is step 1 of the
+  leakage-safe workflow in section 3.5, built before any target-derived feature
+  exists;
+- a scenario that cannot be built raises `GapError` naming the classes that came
+  up short and what would let them fit; `on_shortfall="warn"` is the deliberate
+  opt-out that returns the partial design for inspection;
+- everything that did not go as requested — a class the series is too short to
+  hold, a class too small a share to earn a gap, an achieved fraction or mix
+  outside the tolerances of A7 — is recorded on the manifest and emitted as a
+  `GapScenarioWarning` rather than passing quietly.
 
 ### 4.5 Train/test design
 
@@ -340,7 +397,40 @@ gaps.
 
 Regression orientation is fixed: `x = measured`, `y = filled`. The bias definition
 is the paper's and is equivalent to mean prediction error for equal-weighted
-observations.
+observations. The regression carries an intercept by default (`fit_intercept`);
+a line forced through the origin is offered but is not the paper's stated setup.
+
+`rfrgapfill.metrics` is these four quantities and the ratio of section 6.4, and
+nothing else: each is an independent function of the values handed to it, so the
+same code scores a whole run, one gap class, one daytime subset or a hand-built
+fixture. Choosing the subsets belongs to the validation layer, not here.
+
+Two rules apply before any metric is computed, and `CoreMetrics` reports what
+they cost (`n` scored out of `n_offered`):
+
+- **alignment is checked, never performed.** Two series carrying different
+  indexes raise `MetricError` instead of being aligned into a union of missing
+  values, which is how a prediction ends up scored against the wrong half hour;
+- **incomplete pairs are dropped on both sides at once**, so a row the model left
+  unfilled for want of a predictor (section 5) leaves the score entirely — the
+  bias denominator `n` counts the pairs that survived.
+
+An undefined metric is `None`, never `NaN` or zero: an empty subset has no RMSE,
+constant measurements have no R2 and no slope, and zero available energy has no
+EBR. `None` reaches a JSON manifest as `null` and cannot propagate silently
+through a later mean the way `NaN` does.
+
+**Which R2 (A12).** The article reports R2 beside a slope without saying which
+quantity it is. `R2Definition.RESIDUAL` — `1 - SS_res / SS_tot`, scikit-learn's
+`r2_score` — is the default: it is the unqualified meaning of "coefficient of
+determination", and the alternative `SQUARED_CORRELATION` is invariant to any
+affine rescaling of the predictions, so it scores a systematically offset series
+as perfectly as an unbiased one. The two agree exactly when predictions are
+unbiased and their spread has shrunk to `r` times the measured spread, which is
+ordinary forest behaviour and close to where Table S3 sits — its median R2 and
+median slope agree to about 0.01 in every RFR row — so the published numbers do
+not settle it and neither reading is paper exact. The choice is
+`ValidationConfig.r2_definition` and is recorded in every result.
 
 ### 6.2 Day/night subsets
 
@@ -363,7 +453,16 @@ EBR = sum(H + LE) / sum(NETRAD - G)
 ```
 
 Computed over the same artificial-gap intervals using (a) measured H and LE and
-(b) RFR-filled H and LE. Both values and their difference are returned.
+(b) RFR-filled H and LE. Both values and their difference are returned, by
+`metrics.compare_energy_balance`.
+
+A row enters either ratio only where every component it needs is present, so
+numerator and denominator always cover exactly the same half hours — summing each
+over whatever it happened to have would divide the turbulent flux of one interval
+by the available energy of another. The measured and filled ratios share one row
+set for the same reason: otherwise their difference would report the change in
+interval as much as the change in flux. A zero denominator yields `None` rather
+than an arbitrarily large closure.
 
 ---
 
@@ -434,7 +533,7 @@ described as reproducing the paper exactly.
 |---|---|---|---|
 | A1 | The complete `GridSearchCV` hyperparameter grid is not enumerated in the article. | Documented default grid shipped with the package; any archived `fluxlib` grid only as a named preset. | `hyperparameter_grid` |
 | A2 | Radiation-category boundary handling at exactly 10 and 100 W m-2 is not explicit in the prose. | Inclusive, exhaustive bins: `<10` weak, `10–100` medium, `>100` strong. | `radiation_thresholds`, `boundary_convention` |
-| A3 | The 20/30/50 gap mix may refer to the number of gap events or the number of withheld half-hours. | `missing_records`. | `allocation_basis` |
+| A3 | The 20/30/50 gap mix may refer to the number of gap events or the number of withheld half-hours. | `missing_records`. Both readings are implemented in `rfrgapfill.gaps.allocate_gaps` (section 4.3); every manifest reports the achieved mix on both bases alongside the one requested. | `allocation_basis` |
 | A4 | Handling of daily target statistics when a whole day or longer interval has too few or no visible observations is unspecified. | `missing`: statistics left missing; affected rows excluded from training and flagged at prediction time rather than imputed. Three reaching alternatives (`within_day_available`, `neighbor_day_fallback`, `rolling_available`) are implemented and leakage safe; a long-gap run must choose one deliberately (section 3.4). | `daily_statistic_strategy`, `min_daily_observations`, `fallback_window_days` |
 | A5 | Cross-validation details inside `GridSearchCV` (fold count, shuffling, temporal blocking) are unspecified. | Conventional `GridSearchCV` folds on the training portion; blocked/time-aware CV offered as a labelled enhancement. | `cv_strategy` |
 | A6 | Whether the historical `fluxlib` implementation computed daily target statistics leakage-safely is unverified. | Leakage-safe `paper_safe` mode is the default; a `legacy_fluxlib` mode is added only on implementation evidence. | `feature_mode` |
@@ -443,3 +542,4 @@ described as reproducing the paper exactly.
 | A9 | Hemisphere inference for sites at or very near the equator. | `latitude >= 0 -> north`; an explicit `hemisphere` always overrides. | `hemisphere`, `latitude` |
 | A10 | Units of Table S3 NEE RMSE/bias (`g C m-2 d-1`) differ from the half-hourly model units (`umol m-2 s-1`); the aggregation from half-hourly residuals to daily carbon units is not spelled out. | Report metrics in model units by default; benchmark comparison applies an explicit, documented unit conversion. | reproduction module |
 | A11 | The paper names the daily standard deviation but not its degrees-of-freedom convention, nor the quantile interpolation behind Q1/Q2/Q3. | Sample standard deviation (`ddof=1`, the pandas default) and linear quantile interpolation (the numpy/pandas default). | `daily_std_ddof` |
+| A12 | `R2` is reported beside a regression slope without saying whether it is `1 - SS_res/SS_tot` or the squared Pearson correlation of that regression. | `residual` (`1 - SS_res/SS_tot`), the only one of the two a systematic offset can lower. Both are implemented; the two coincide in the regime Table S3 sits in, so neither is paper exact (section 6.1). | `r2_definition` |
