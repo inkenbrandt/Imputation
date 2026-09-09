@@ -1,0 +1,312 @@
+# Machine-readable companion to docs/method_spec.md.
+# Frozen scientific specification for the Zhu et al. (2022) RFR gap-filling
+# reproduction. Prose, rationale, and ambiguity discussion live in method_spec.md;
+# this file exists so tests and configuration defaults can be checked against a
+# single source of truth.
+#
+# provenance values:
+#   paper       - stated in the article or its supplements
+#   default     - our documented choice where the paper is silent (see ambiguities)
+
+spec_version: "1.0.0"
+frozen_on: "2026-09-08"
+
+source:
+  authors: "Zhu, S., Clement, R., McCalmont, J., Davies, C. A., & Hill, T."
+  year: 2022
+  title: >-
+    Stable gap-filling for longer eddy covariance data gaps: A globally validated
+    machine-learning approach for carbon dioxide, water, and energy fluxes
+  journal: "Agricultural and Forest Meteorology"
+  volume: 314
+  article: "108777"
+  doi: "10.1016/j.agrformet.2021.108777"
+  reference_implementation: "https://github.com/soonyenju/fluxlib"
+
+methods:
+  - name: RFR3
+    estimator: sklearn.ensemble.RandomForestRegressor
+    drivers: rfr3
+    use_receptive_limiter: true
+    provenance: paper
+  - name: RFR10
+    estimator: sklearn.ensemble.RandomForestRegressor
+    drivers: rfr10
+    use_receptive_limiter: true
+    provenance: paper
+  - name: ORF
+    estimator: sklearn.ensemble.RandomForestRegressor
+    drivers: same_as_compared_rfr
+    use_receptive_limiter: false
+    role: benchmark
+    supported_by: "Supplementary Figure S1"
+    provenance: paper
+  - name: MDS
+    role: external_reference_only
+    implemented: false
+    provenance: paper
+
+targets:
+  - name: NEE
+    long_name: "net ecosystem exchange of CO2"
+    model_units: "umol m-2 s-1"
+  - name: H
+    long_name: "sensible heat flux"
+    model_units: "W m-2"
+  - name: LE
+    long_name: "latent heat flux"
+    model_units: "W m-2"
+generic_targets_allowed: true
+
+training_scope:
+  per_site: true
+  per_target: true
+  pool_sites_in_paper_mode: false
+  provenance: paper
+
+drivers:
+  rfr3:
+    - canonical: shortwave
+      fluxnet2015: SW_IN_F
+      units: "W m-2"
+    - canonical: vpd
+      fluxnet2015: VPD_F_MDS
+      units: "hPa"
+    - canonical: air_temperature
+      fluxnet2015: TA_F_MDS
+      units: "degC"
+  rfr10_additional:
+    - canonical: net_radiation
+      fluxnet2015: NETRAD
+      units: "W m-2"
+    - canonical: wind_speed
+      fluxnet2015: WS
+      units: "m s-1"
+    - canonical: wind_direction
+      fluxnet2015: WD
+      units: "degrees"
+    - canonical: soil_heat_flux
+      fluxnet2015: G_F_MDS
+      units: "W m-2"
+    - canonical: soil_temperature
+      fluxnet2015: TS_F_MDS
+      units: "degC"
+    - canonical: relative_humidity
+      fluxnet2015: RH
+      units: "%"
+    - canonical: soil_water_content
+      fluxnet2015: SWC_F_MDS
+      units: "%"
+  hard_coded_column_names_allowed: false
+  extra_columns_required_for_ebr: [net_radiation, soil_heat_flux]
+
+receptive_limiter:
+  radiation_category:
+    source_variable: shortwave
+    thresholds: [10.0, 100.0]
+    units: "W m-2"
+    classes:
+      weak: "x < 10"
+      medium: "10 <= x <= 100"
+      strong: "x > 100"
+    boundary_convention: medium_inclusive
+    missing_input_yields: missing_category
+    provenance: default        # thresholds paper; boundary convention A2
+  time_distance:
+    feature: time_distance_hours
+    definition: "(timestamp - first_timestamp) in hours"
+    computed_from: elapsed_time
+    row_position_allowed: false
+    provenance: paper
+  season:
+    hemisphere_aware: true
+    required_input: "hemisphere or latitude"
+    latitude_inference_rule: "latitude >= 0 -> north"
+    north:
+      winter: [12, 1, 2]
+      spring: [3, 4, 5]
+      summer: [6, 7, 8]
+      autumn: [9, 10, 11]
+    south:
+      summer: [12, 1, 2]
+      autumn: [3, 4, 5]
+      winter: [6, 7, 8]
+      spring: [9, 10, 11]
+    provenance: paper          # equator tie-break is A9
+  daily_target_statistics:
+    features:
+      - suffix: _daily_q1
+        statistic: "quantile 0.25"
+      - suffix: _daily_q2
+        statistic: "quantile 0.50"
+      - suffix: _daily_q3
+        statistic: "quantile 0.75"
+      - suffix: _daily_std
+        statistic: "standard deviation"
+    grouping: calendar_day
+    source: "quality-controlled observations of the target flux"
+    joined_back_to_all_timestamps_of_day: true
+    target_specific: true
+    provenance: paper
+  feature_order_deterministic: true
+
+leakage_policy:
+  default_feature_mode: paper_safe
+  modes:
+    paper_safe:
+      mask_before_feature_computation: true
+      daily_statistics_use_visible_observations_only: true
+      held_out_truth_in_features: forbidden
+      empty_day_statistics: missing
+    legacy_fluxlib:
+      status: reserved
+      enable_only_with_implementation_evidence: true
+  silent_mixing_allowed: false
+  provenance: default          # A6
+
+gap_scenario:
+  missing_fraction: 0.25
+  durations:
+    short: "24h"
+    long: "7d"
+    very_long: "30d"
+  mix:
+    short: 0.20
+    long: 0.30
+    very_long: 0.50
+  allocation_basis:
+    default: missing_records
+    alternatives: [gap_events]
+    provenance: default        # A3
+  min_observed_fraction: 0.50
+  allow_overlap: false
+  seeded: true
+  shared_gaps_across_targets: true
+  manifest_fields: [start, end, duration, gap_class, affected_rows, observed_fraction]
+  must_report_when_unsatisfiable: true
+  provenance: paper
+
+train_test_design:
+  test_set: "artificially withheld observations (~25%)"
+  train_set: "remaining eligible observations (~75%)"
+  naive_random_row_split_allowed: false
+  tune_on_training_portion_only: true
+  supported_by: "Figure 2"
+  provenance: paper
+
+model:
+  estimator: sklearn.ensemble.RandomForestRegressor
+  deterministic_random_state: true
+  configurable_n_jobs: true
+  hyperparameter_search: GridSearchCV
+  hyperparameter_grid_enumerated_in_paper: false
+  grid_provenance: default     # A1
+  cv_strategy_provenance: default  # A5
+  train_rows: "valid target and valid required features"
+  report_rows_excluded_for_missing_predictors: true
+  one_model_per_target: true
+  serialization: joblib
+
+metrics:
+  required: [r2, slope, rmse, bias]
+  definitions:
+    r2: "coefficient of determination"
+    slope: "linear regression slope of filled (y) on measured (x)"
+    rmse: "root mean squared error"
+    bias: "(sum(filled) - sum(measured)) / n"
+  regression_orientation:
+    x: measured
+    y: filled
+  subsets: [all, daytime, nighttime]
+  daytime_threshold:
+    variable: shortwave
+    rule: "> 20"
+    units: "W m-2"
+  report_by_gap_class: true
+  bias_iqr_by_gap_class: true
+  energy_balance_ratio:
+    applies_to: [H, LE]
+    formula: "sum(H + LE) / sum(NETRAD - G)"
+    evaluated_on: "same artificial-gap intervals"
+    variants: [measured, filled]
+    returns: [measured_ebr, filled_ebr, difference]
+  provenance: paper
+
+data_assumptions:
+  reference_resolution: "30min"
+  other_regular_resolutions_supported: true
+  timestamps: "DatetimeIndex or explicit timestamp column"
+  require_monotonic_unique_timestamps: true
+  gap_length_basis: elapsed_time
+  distinguish_observed_from_prefilled_target: true
+  drivers_may_be_prefilled: true
+  fabricate_missing_drivers: false
+  overwrite_observed_values_by_default: false
+  output_fields:
+    - "<target>_original"
+    - "<target>_filled"
+    - "<target>_is_observed"
+    - "<target>_is_filled"
+    - "<target>_fill_method"
+    - "<target>_model_version"
+
+reproducibility:
+  seeded_components: [artificial_gap_selection, random_forest, cross_validation]
+  run_manifest_fields:
+    - package_version
+    - python_version
+    - sklearn_version
+    - column_map
+    - target
+    - mode
+    - feature_mode
+    - hyperparameter_grid
+    - best_params
+    - random_seed
+    - gap_manifest
+    - time_resolution
+    - hemisphere_or_latitude
+    - qc_rules
+  manifest_format: [json, yaml]
+
+known_ambiguities:
+  - id: A1
+    topic: "GridSearchCV hyperparameter grid not enumerated"
+    default: "documented package grid; fluxlib grid only as named preset"
+    config: hyperparameter_grid
+  - id: A2
+    topic: "radiation category boundaries at exactly 10 and 100 W m-2"
+    default: "inclusive exhaustive bins, medium_inclusive"
+    config: [radiation_thresholds, boundary_convention]
+  - id: A3
+    topic: "20/30/50 mix = gap events or withheld half-hours"
+    default: missing_records
+    config: allocation_basis
+  - id: A4
+    topic: "daily target statistics when a whole day or longer has no visible observations"
+    default: "leave missing; exclude from training, flag at prediction"
+    config: [feature_mode, driver_completeness_policy]
+  - id: A5
+    topic: "cross-validation details inside GridSearchCV"
+    default: "conventional GridSearchCV folds on training portion"
+    config: cv_strategy
+  - id: A6
+    topic: "whether legacy fluxlib daily statistics were leakage-safe"
+    default: paper_safe
+    config: feature_mode
+  - id: A7
+    topic: "exact 25% withheld fraction not always achievable"
+    default: "report achieved fraction against documented tolerance"
+    config: [missing_fraction, tolerance]
+  - id: A8
+    topic: "denominator of normalized joint-uncertainty ratio not reconstructed"
+    default: "bias IQR only; normalized ratios experimental"
+    config: experimental_module
+  - id: A9
+    topic: "hemisphere inference at the equator"
+    default: "latitude >= 0 -> north; explicit hemisphere overrides"
+    config: [hemisphere, latitude]
+  - id: A10
+    topic: "unit conversion from half-hourly model units to Table S3 g C m-2 d-1"
+    default: "report model units; explicit documented conversion for benchmarks"
+    config: reproduction_module

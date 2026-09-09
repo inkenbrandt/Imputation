@@ -1,0 +1,44 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite both this implementation and the paper
+  whose method it reproduces (see references below).
+title: rfr-gapfill
+abstract: >-
+  An independent, leakage-safe Python implementation of the Random Forest Robust
+  (RFR) eddy-covariance gap-filling method of Zhu et al. (2022), with explicit
+  documentation of every point where the published description is ambiguous.
+type: software
+version: 0.1.0.dev0
+license: MIT
+authors:
+  - family-names: Inkenbrandt
+    given-names: Paul
+    email: paulinkenbrandt@gmail.com
+keywords:
+  - eddy covariance
+  - gap filling
+  - random forest
+  - FLUXNET
+  - carbon flux
+references:
+  - type: article
+    title: >-
+      Stable gap-filling for longer eddy covariance data gaps: A globally
+      validated machine-learning approach for carbon dioxide, water, and energy
+      fluxes
+    authors:
+      - family-names: Zhu
+        given-names: Songyan
+      - family-names: Clement
+        given-names: Robert
+      - family-names: McCalmont
+        given-names: Jon
+      - family-names: Davies
+        given-names: Christian A.
+      - family-names: Hill
+        given-names: Timothy
+    journal: Agricultural and Forest Meteorology
+    volume: 314
+    year: 2022
+    start: 108777
+    doi: 10.1016/j.agrformet.2021.108777

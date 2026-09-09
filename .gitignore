@@ -1,0 +1,25 @@
+# Journal PDF and supplementary files (redistributable only by the publisher)
+/1-s2.0-S0168192321004639-main.pdf
+/1-s2.0-S0168192321004639-mmc*.docx
+/1-s2.0-S0168192321004639-mmc*.xlsx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Data never belongs in the repository
+data/
+*.csv
+!tests/fixtures/*.csv
