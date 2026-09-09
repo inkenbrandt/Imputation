@@ -18,6 +18,25 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 
+from rfrgapfill.config import (
+    DEFAULT_HYPERPARAMETER_GRID,
+    AllocationBasis,
+    BoundaryConvention,
+    ColumnMap,
+    ColumnMapError,
+    ConfigError,
+    CVStrategy,
+    FeatureConfig,
+    FeatureMode,
+    GapClass,
+    GapScenarioConfig,
+    Hemisphere,
+    MetricSubset,
+    Mode,
+    RFRConfig,
+    ValidationConfig,
+)
+
 try:  # pragma: no cover - trivial packaging fallback
     __version__ = _version("rfr-gapfill")
 except PackageNotFoundError:  # pragma: no cover - source tree without install
@@ -26,4 +45,23 @@ except PackageNotFoundError:  # pragma: no cover - source tree without install
 #: Path-independent identifier recorded in run manifests and fill provenance.
 PAPER_DOI = "10.1016/j.agrformet.2021.108777"
 
-__all__ = ["PAPER_DOI", "__version__"]
+__all__ = [
+    "DEFAULT_HYPERPARAMETER_GRID",
+    "PAPER_DOI",
+    "AllocationBasis",
+    "BoundaryConvention",
+    "CVStrategy",
+    "ColumnMap",
+    "ColumnMapError",
+    "ConfigError",
+    "FeatureConfig",
+    "FeatureMode",
+    "GapClass",
+    "GapScenarioConfig",
+    "Hemisphere",
+    "MetricSubset",
+    "Mode",
+    "RFRConfig",
+    "ValidationConfig",
+    "__version__",
+]

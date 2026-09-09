@@ -97,6 +97,14 @@ warn_unreachable = true
 module = ["sklearn.*", "scipy.*", "joblib.*"]
 ignore_missing_imports = true
 
+# numpy's bundled stubs use `type` statements, which mypy cannot parse while
+# python_version targets 3.10. Skip them rather than lower the checked language
+# level and stop catching syntax this package's floor does not support.
+[[tool.mypy.overrides]]
+module = ["numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
 [tool.coverage.run]
 source = ["rfrgapfill"]
 branch = true

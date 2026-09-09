@@ -15,15 +15,17 @@ prevention of data leakage** — not maximising predictive scores.
 
 ## Status
 
-**Pre-alpha scaffold.** The scientific specification is frozen and the package
-installs and tests cleanly; the modelling modules are placeholders that are filled
-in step by step. Nothing below the "Planned API" heading works yet.
+**Pre-alpha.** The scientific specification is frozen and the package installs
+and tests cleanly. Configuration and column mapping are implemented and usable;
+the modelling modules are still placeholders, filled in step by step. Everything
+below the "Planned API" heading except `RFRConfig` and `ColumnMap` is not built
+yet.
 
 | Component | State |
 |---|---|
 | Frozen specification (`docs/`) | done |
 | Package scaffold, packaging, CI-ready tests | done |
-| Configuration and column-mapping layer | not started |
+| Configuration and column-mapping layer | done |
 | Receptive-limiter features | not started |
 | Artificial-gap generator | not started |
 | Model, filling, metrics, validation | not started |
@@ -68,7 +70,28 @@ mask *before* computing features and derives daily statistics only from
 observations visible to the model.
 
 Canonical variable names are internal. FLUXNET2015 column names are a default
-mapping, never a hard requirement — bring your own names through a column map.
+mapping, never a hard requirement — bring your own names through a column map:
+
+```python
+from rfrgapfill import ColumnMap, RFRConfig
+
+config = RFRConfig(
+    mode="RFR3",
+    frequency="30min",
+    latitude=51.5,                     # or hemisphere="north"; one is required
+    random_state=42,
+    column_map=ColumnMap({"shortwave": "SW_IN", "vpd": "VPD", "air_temperature": "TA"}),
+)
+config.to_dict()                       # goes straight into the run manifest
+```
+
+`ColumnMap.fluxnet2015("RFR10")` fills in the reference FLUXNET names. Every
+scientific choice — radiation thresholds and their boundary convention, the gap
+mix and its allocation basis, the daytime threshold, the hyperparameter grid, the
+CV strategy, the leakage-safe feature mode — is a configuration field, validated at
+construction. Enhancements and the ORF benchmark switch off
+`RFRConfig.is_paper_faithful`, so a run can never quietly claim to reproduce the
+paper while deviating from it.
 
 ## Install
 
