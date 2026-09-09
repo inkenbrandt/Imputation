@@ -36,6 +36,14 @@ from rfrgapfill.config import (
     RFRConfig,
     ValidationConfig,
 )
+from rfrgapfill.time import (
+    TIME_DISTANCE_HOURS,
+    DuplicatePolicy,
+    TimeAxis,
+    TimestampError,
+    elapsed_hours,
+    prepare_time_index,
+)
 
 try:  # pragma: no cover - trivial packaging fallback
     __version__ = _version("rfr-gapfill")
@@ -48,12 +56,14 @@ PAPER_DOI = "10.1016/j.agrformet.2021.108777"
 __all__ = [
     "DEFAULT_HYPERPARAMETER_GRID",
     "PAPER_DOI",
+    "TIME_DISTANCE_HOURS",
     "AllocationBasis",
     "BoundaryConvention",
     "CVStrategy",
     "ColumnMap",
     "ColumnMapError",
     "ConfigError",
+    "DuplicatePolicy",
     "FeatureConfig",
     "FeatureMode",
     "GapClass",
@@ -62,6 +72,10 @@ __all__ = [
     "MetricSubset",
     "Mode",
     "RFRConfig",
+    "TimeAxis",
+    "TimestampError",
     "ValidationConfig",
     "__version__",
+    "elapsed_hours",
+    "prepare_time_index",
 ]

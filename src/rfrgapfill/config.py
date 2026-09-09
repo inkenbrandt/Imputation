@@ -19,15 +19,12 @@ documented choice, cross-referenced to the ambiguity table in
 from __future__ import annotations
 
 import math
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Final, cast
-
-import pandas as pd
 
 from rfrgapfill.schema import (
     CANONICAL_VARIABLES,
@@ -40,6 +37,7 @@ from rfrgapfill.schema import (
     Mode,
     coerce_enum,
 )
+from rfrgapfill.time import iso_duration, to_timedelta
 
 __all__ = [
     "DEFAULT_DAYTIME_THRESHOLD",
@@ -188,9 +186,6 @@ DEFAULT_HYPERPARAMETER_GRID: Final[Mapping[str, tuple[Any, ...]]] = MappingProxy
 #: Estimator parameters the package controls itself; they may not appear in a grid.
 _RESERVED_GRID_KEYS: Final[frozenset[str]] = frozenset({"random_state", "n_jobs", "verbose"})
 
-#: A bare ``d`` day unit, which pandas >= 3 deprecates in favour of ``D``.
-_DAY_UNIT_RE: Final[re.Pattern[str]] = re.compile(r"(?<=[0-9 ])d(?![a-zA-Z])")
-
 #: numpy's seed range; ``random_state`` must fit in it to stay portable.
 _MAX_SEED: Final[int] = 2**32 - 1
 
@@ -228,46 +223,6 @@ def _check_positive_int(value: object, *, field_name: str, minimum: int = 1) -> 
     if value < minimum:
         raise ConfigError(f"{field_name} must be >= {minimum}, got {value}")
     return value
-
-
-def _to_timedelta(value: object, *, field_name: str) -> timedelta:
-    """Return ``value`` as a positive :class:`datetime.timedelta`.
-
-    Accepts anything ``pandas.Timedelta`` understands (``"30min"``, ``"7d"``,
-    ``timedelta(hours=24)``), so durations and cadences can be written the way users
-    already write them for pandas.
-    """
-    if isinstance(value, (bool, int, float)):
-        raise ConfigError(
-            f"{field_name} must be a duration string or timedelta (e.g. '30min'), "
-            f"not a bare number: {value!r}"
-        )
-    if isinstance(value, str):
-        # pandas >= 3 deprecates the lowercase day unit, but '7d'/'30d' is how the
-        # paper's gap classes are written; canonicalise rather than warn the user.
-        candidate: str | timedelta = _DAY_UNIT_RE.sub("D", value)
-    elif isinstance(value, timedelta):
-        candidate = value
-    else:
-        raise ConfigError(
-            f"{field_name} must be a duration string or timedelta (e.g. '30min'), "
-            f"got {type(value).__name__}"
-        )
-    try:
-        delta = pd.Timedelta(candidate)
-    except (ValueError, TypeError) as exc:
-        raise ConfigError(f"{field_name}={value!r} is not a valid duration: {exc}") from exc
-    if delta != delta:  # NaT
-        raise ConfigError(f"{field_name}={value!r} is not a valid duration")
-    if delta <= pd.Timedelta(0):
-        raise ConfigError(f"{field_name} must be a positive duration, got {value!r}")
-    result: timedelta = delta.to_pytimedelta()
-    return result
-
-
-def _iso(delta: timedelta) -> str:
-    """Return an ISO-8601 duration string for manifests."""
-    return str(pd.Timedelta(delta).isoformat())
 
 
 def _normalise_gap_class_mapping(
@@ -476,7 +431,7 @@ class GapScenarioConfig:
             self.durations, field_name="durations", default=DEFAULT_GAP_DURATIONS
         )
         durations = {
-            gap_class: _to_timedelta(value, field_name=f"durations[{gap_class.value!r}]")
+            gap_class: to_timedelta(value, field_name=f"durations[{gap_class.value!r}]")
             for gap_class, value in duration_input.items()
         }
         object.__setattr__(self, "durations", MappingProxyType(durations))
@@ -513,7 +468,7 @@ class GapScenarioConfig:
         return {
             "missing_fraction": self.missing_fraction,
             "gap_mix": {gap.value: self.share(gap) for gap in GapClass},
-            "durations": {gap.value: _iso(self.duration(gap)) for gap in GapClass},
+            "durations": {gap.value: iso_duration(self.duration(gap)) for gap in GapClass},
             "allocation_basis": self.basis.value,
             "min_observed_fraction": self.min_observed_fraction,
             "allow_overlap": self.allow_overlap,
@@ -652,7 +607,7 @@ class RFRConfig:
 
         if self.frequency is not None:
             object.__setattr__(
-                self, "frequency", _to_timedelta(self.frequency, field_name="frequency")
+                self, "frequency", to_timedelta(self.frequency, field_name="frequency")
             )
 
         if self.hemisphere is not None:
@@ -841,7 +796,7 @@ class RFRConfig:
         hemisphere = self.hemisphere
         return {
             "mode": self.rfr_mode.value,
-            "frequency": None if self.time_step is None else _iso(self.time_step),
+            "frequency": None if self.time_step is None else iso_duration(self.time_step),
             "hemisphere": None if hemisphere is None else Hemisphere.coerce(hemisphere).value,
             "latitude": self.latitude,
             "resolved_hemisphere": (

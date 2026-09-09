@@ -16,16 +16,17 @@ prevention of data leakage** — not maximising predictive scores.
 ## Status
 
 **Pre-alpha.** The scientific specification is frozen and the package installs
-and tests cleanly. Configuration and column mapping are implemented and usable;
-the modelling modules are still placeholders, filled in step by step. Everything
-below the "Planned API" heading except `RFRConfig` and `ColumnMap` is not built
-yet.
+and tests cleanly. Configuration, column mapping and the temporal layer are
+implemented and usable; the modelling modules are still placeholders, filled in
+step by step. Everything below the "Planned API" heading except `RFRConfig`,
+`ColumnMap` and `TimeAxis` is not built yet.
 
 | Component | State |
 |---|---|
 | Frozen specification (`docs/`) | done |
 | Package scaffold, packaging, CI-ready tests | done |
 | Configuration and column-mapping layer | done |
+| Timestamp, cadence and elapsed-time utilities | done |
 | Receptive-limiter features | not started |
 | Artificial-gap generator | not started |
 | Model, filling, metrics, validation | not started |
@@ -92,6 +93,30 @@ CV strategy, the leakage-safe feature mode — is a configuration field, validat
 construction. Enhancements and the ORF benchmark switch off
 `RFRConfig.is_paper_faithful`, so a run can never quietly claim to reproduce the
 paper while deviating from it.
+
+## Time is elapsed time, never row position
+
+Gap lengths, the `time_distance_hours` feature and every interval selection are
+computed from timestamps: one day is 48 rows only at 30-minute cadence with no
+missing rows. `rfrgapfill.time` owns that rule.
+
+```python
+from rfrgapfill import prepare_time_index
+
+df, axis = prepare_time_index(df, timestamp="TIMESTAMP_START")   # or a DatetimeIndex
+
+axis.time_step        # inferred from real differences, or declared via frequency=
+axis.is_regular       # missing grid points and off-grid stamps reported separately
+axis.periods("7d")    # rows a 7-day gap spans at this cadence
+axis.elapsed_hours()  # the receptive limiter's time_distance_hours feature
+axis.to_dict()        # cadence, coverage and timezone for the run manifest
+```
+
+Timestamps must be sorted and unique. Duplicates raise by default;
+`on_duplicates="keep_first"|"keep_last"` are the documented preprocessing
+options, and neither averages the duplicated rows. Missing rows are *not* an
+error — real flux series have them, which is exactly why durations are
+elapsed-time quantities.
 
 ## Install
 
