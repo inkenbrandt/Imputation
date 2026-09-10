@@ -376,6 +376,15 @@ def test_validation_reports_all_daytime_and_nighttime_by_default() -> None:
     assert ValidationConfig().bias_iqr_by_gap_class is True
 
 
+def test_metric_subsets_accept_the_short_day_and_night_spellings() -> None:
+    assert MetricSubset.coerce("day") is MetricSubset.DAYTIME
+    assert MetricSubset.coerce("night") is MetricSubset.NIGHTTIME
+    assert ValidationConfig(subsets=["day", "night"]).metric_subsets == (
+        MetricSubset.DAYTIME,
+        MetricSubset.NIGHTTIME,
+    )
+
+
 def test_validation_subsets_are_deduplicated_and_validated() -> None:
     assert ValidationConfig(subsets=["all", "all", "daytime"]).metric_subsets == (
         MetricSubset.ALL,

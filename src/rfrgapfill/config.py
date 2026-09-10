@@ -135,13 +135,25 @@ class MetricSubset(str, Enum):
     """Observation subsets metrics are reported over (method_spec.md 6.2)."""
 
     ALL = "all"
+    #: ``shortwave > daytime_threshold``.
     DAYTIME = "daytime"
+    #: ``shortwave <= daytime_threshold``.
     NIGHTTIME = "nighttime"
 
     @classmethod
     def coerce(cls, value: object) -> MetricSubset:
-        """Return ``value`` as a :class:`MetricSubset`."""
-        return coerce_enum(cls, value, field_name="metric_subset")
+        """Return ``value`` as a :class:`MetricSubset`.
+
+        ``"day"`` and ``"night"`` are accepted spellings of the two radiation
+        subsets, since that is how the paper's prose names them.
+        """
+        return coerce_enum(cls, value, field_name="metric_subset", aliases=_METRIC_SUBSET_ALIASES)
+
+
+#: Short spellings accepted for :class:`MetricSubset`.
+_METRIC_SUBSET_ALIASES: Final[Mapping[str, MetricSubset]] = MappingProxyType(
+    {"day": MetricSubset.DAYTIME, "night": MetricSubset.NIGHTTIME}
+)
 
 
 # ---------------------------------------------------------------------------

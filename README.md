@@ -17,7 +17,8 @@ prevention of data leakage** — not maximising predictive scores.
 
 **Pre-alpha.** The scientific specification is frozen and the package installs
 and tests cleanly. Configuration, column mapping and the temporal layer are
-implemented and usable; the modelling modules are still placeholders, filled in
+implemented and usable, as is the metric layer that scores a filled series
+against measurements; the modelling modules are still placeholders, filled in
 step by step. Everything below the "Planned API" heading except `RFRConfig`,
 `ColumnMap` and `TimeAxis` is not built yet.
 
@@ -27,9 +28,10 @@ step by step. Everything below the "Planned API" heading except `RFRConfig`,
 | Package scaffold, packaging, CI-ready tests | done |
 | Configuration and column-mapping layer | done |
 | Timestamp, cadence and elapsed-time utilities | done |
+| Metrics, including the all/daytime/nighttime split | done |
 | Receptive-limiter features | not started |
 | Artificial-gap generator | not started |
-| Model, filling, metrics, validation | not started |
+| Model, filling, validation orchestration | not started |
 
 ## Specification first
 
