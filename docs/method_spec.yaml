@@ -353,6 +353,47 @@ metrics:
     zero_denominator: null
   provenance: paper
 
+reporting:
+  module: rfrgapfill.sensitivity
+  computes_metrics: false            # every value comes from a validation run
+  tidy_table:
+    implementation: rfrgapfill.sensitivity.gap_length_table
+    columns: [site, target, method, mode, gap_class, subset, units, n, n_offered, r2, slope, rmse, bias]
+    gap_class_order: [all, short, long, very_long]   # duration order, never alphabetical
+    accepts: [ValidationReport, TargetValidation, tidy DataFrame]
+    metric_dtype: float               # an all-undefined column is missing, not object
+  across_sites:
+    implementation: rfrgapfill.sensitivity.median_across_sites
+    statistic: median
+    quantile_interpolation: linear    # A11
+    skips_undefined_sites: true
+    rejects_repeated_cells: true      # one site must not be weighted twice
+  readable_view:
+    implementation: rfrgapfill.sensitivity.gap_length_pivot
+    duplicate_cells: error            # `pivot`, never `pivot_table`
+  benchmarks:
+    module: rfrgapfill.benchmarks
+    values: rfrgapfill.benchmarks.PUBLISHED_BENCHMARKS
+    source_document: docs/supplement_benchmarks.md
+    source_table: "Supplementary Table S3 (mmc4.docx)"
+    site_population: "94-site complete-analysis subset"
+    blocks: [diel medians, very-long-gap medians, nighttime medians]
+    n_values: 24
+    comparison: rfrgapfill.benchmarks.compare_to_benchmarks
+    asserts_thresholds: false         # reproduction benchmarks, not pass/fail
+    units:
+      nee_model: "umol m-2 s-1"
+      nee_published: "g C m-2 d-1"
+      conversion: rfrgapfill.benchmarks.convert_nee_to_carbon_units
+      conversion_kind: "rate conversion, not an aggregation of half hours into days"
+      mismatched_units: "comparable=false; never differenced"   # A10
+  plotting:
+    module: rfrgapfill.plotting
+    derived_from: reporting tables only
+    dependency: matplotlib
+    dependency_required: false        # optional extra, imported when drawing
+  provenance: default
+
 data_assumptions:
   reference_resolution: "30min"
   other_regular_resolutions_supported: true
@@ -470,7 +511,8 @@ known_ambiguities:
   - id: A10
     topic: "unit conversion from half-hourly model units to Table S3 g C m-2 d-1"
     default: "report model units; explicit documented conversion for benchmarks"
-    config: reproduction_module
+    config: "rfrgapfill.benchmarks.convert_nee_to_carbon_units; units= on gap_length_table"
+    mismatched_units_are_not_compared: true
   - id: A11
     topic: "degrees-of-freedom convention for the daily standard deviation, and quantile interpolation"
     default: "sample standard deviation (ddof=1) and linear quantile interpolation"

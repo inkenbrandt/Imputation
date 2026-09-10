@@ -21,9 +21,11 @@ receptive-limiter features, the leakage-safe validation feature workflow, the
 Random Forest, the operational fill API and the artificial-gap generator are
 implemented and usable, as are the validation metrics, the run manifest, the
 synthetic site the tests run against and the artificial-gap validation workflow
-that ties them together into one call. What remains is the reporting and
-reproduction layer above it: gap-length sensitivity tables across sites, the
-FLUXNET2015 adapter, the supplementary uncertainty diagnostics and the CLI.
+that ties them together into one call. The reporting layer above it is in too:
+gap-length sensitivity tables across arms and sites, the published Table S3
+medians as data with an explicit comparison against them, and figures drawn from
+those tables. What remains is the FLUXNET2015 adapter, the supplementary
+uncertainty diagnostics and the CLI.
 
 | Component | State |
 |---|---|
@@ -40,7 +42,8 @@ FLUXNET2015 adapter, the supplementary uncertainty diagnostics and the CLI.
 | Run manifests and JSON provenance export | done |
 | Synthetic site generator and known gaps | done |
 | Paper-validation workflow (`validate_rfr`) | done |
-| FLUXNET2015 adapter, multi-site reports, CLI | not started |
+| Gap-length sensitivity tables, published benchmarks, plots | done |
+| FLUXNET2015 adapter, supplementary uncertainty diagnostics, CLI | not started |
 
 ## Specification first
 
@@ -578,6 +581,85 @@ config = config.replace(
 configurations over NEE, H and LE on one synthetic year, printing the metric
 tables, the gap manifest and the energy balance, and checking that no observed
 value changed.
+
+## Comparing by gap length
+
+Scoring one run is `validate_rfr`; comparing runs is `gap_length_table`. It takes
+results - or tidy tables read back from disk, which is what a multi-site
+reproduction actually has - and lines them up:
+
+```python
+from rfrgapfill import gap_length_table, gap_length_pivot, median_across_sites
+
+table = gap_length_table({"US-Ha1": [rfr3, rfr10], "FI-Hyy": [rfr3_hyy, rfr10_hyy]})
+# site | target | method | mode | gap_class | subset | units | n | n_offered | r2 | slope | rmse | bias
+
+medians = median_across_sites(table)
+gap_length_pivot(medians, metric="r2", gap_class="very_long")
+#         RFR3  RFR10
+# NEE     0.74   0.74
+# H       0.76   0.89
+# LE      0.74   0.83
+```
+
+Gap classes come back in **duration order** - `short`, `long`, `very_long`, with
+the row pooling all of them labelled `all` - because alphabetical order would put
+`long` before `short` and make every sensitivity plot read backwards. Nothing in
+this layer computes a metric: every number came out of `rfrgapfill.metrics`
+inside a validation run, so a table can be wrong about labelling but never about
+values. Two rows landing in one cell is an error rather than a silent average,
+and a site that contributed the same cell twice is refused rather than counted
+twice in a median.
+
+### The published medians
+
+Supplementary Table S3 is carried as data, every value traceable to
+[`docs/supplement_benchmarks.md`](docs/supplement_benchmarks.md) — the test suite
+re-reads that document and checks the constants against it, so the two cannot
+drift apart:
+
+```python
+from rfrgapfill import benchmark_table, compare_to_benchmarks, convert_nee_to_carbon_units
+
+gap_length_pivot(benchmark_table(), metric="r2", gap_class="all")
+#         MDS   RFR3  RFR10
+# NEE    0.72   0.78   0.84
+# H      0.67   0.78   0.90
+# LE     0.63   0.75   0.85
+
+compare_to_benchmarks(medians)   # run | published | difference | comparable | note
+```
+
+These are **reproduction benchmarks** for a run over matching FLUXNET inputs with
+matching preprocessing — medians across the paper's 94-site subset, not pass/fail
+thresholds for any station. Nothing in that module asserts anything, and every
+comparison row says which population the published value came from.
+
+**Units are refused, not guessed (A10).** Table S3 reports NEE `RMSE` and `bias`
+in `g C m-2 d-1`; this package models NEE in `umol m-2 s-1`, and the paper does
+not say how it aggregated half-hourly residuals into daily carbon. So those two
+cells come back `comparable=False` with a note, until you convert explicitly:
+
+```python
+compare_to_benchmarks(convert_nee_to_carbon_units(medians))
+```
+
+`R2` and `slope` are dimensionless and compare from the start. The conversion is
+a rate conversion — `12.011e-6 × 86400` — and is documented as exactly that, not
+as a reconstruction of the paper's aggregation.
+
+### Figures
+
+`rfrgapfill.plotting` draws those tables and nothing else, so a figure cannot
+disagree with the table printed beside it:
+
+```python
+from rfrgapfill import plot_gap_length_grid
+plot_gap_length_grid(medians, metric="r2")     # one panel per flux, shared y axis
+```
+
+`matplotlib` is an optional dependency (`pip install "rfr-gapfill[notebooks]"`),
+imported only when a figure is drawn and named in the error when it is missing.
 
 ## Development
 

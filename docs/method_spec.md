@@ -488,6 +488,44 @@ set for the same reason: otherwise their difference would report the change in
 interval as much as the change in flux. A zero denominator yields `None` rather
 than an arbitrarily large closure.
 
+### 6.5 Reporting across runs and sites
+
+Sections 6.1-6.4 score one arm of one run. The comparison the paper is *about* -
+does skill hold up as the gap grows, and how do RFR3, RFR10 and MDS compare -
+needs those scores lined up across arms and across sites, and that is
+`rfrgapfill.sensitivity`. It computes no metric: every number in its tables came
+out of `rfrgapfill.metrics` inside a validation run, so a table can be wrong
+about labelling but never about values.
+
+- `gap_length_table()` is the tidy table - site, target, method, mode, gap class,
+  day/night subset, units, row counts and the four metrics. It accepts live
+  results and equally tidy frames read back from disk, because a 94-site
+  reproduction does not hold 94 fitted forests in memory;
+- gap classes come back in **duration order**, never alphabetical, and the row
+  pooling every class is labelled `all`;
+- metric columns are always float, so a subset every run left undefined arrives
+  as missing rather than as an object column a later median cannot aggregate;
+- `median_across_sites()` is the aggregation Table S3 reports, and it refuses a
+  table where one site contributed a cell twice rather than weighting that site
+  twice;
+- `gap_length_pivot()` is the readable target-by-method view, built on `pivot`
+  rather than `pivot_table` so two rows in one cell raise instead of being
+  silently averaged.
+
+Units travel with the numbers, because ambiguity A10 makes them load-bearing:
+`rmse` and `bias` are in the units of the flux, and Table S3's NEE units are not
+this package's. `rfrgapfill.benchmarks` holds the published medians as data -
+every value traceable to `supplement_benchmarks.md`, checked by a test that
+re-reads that document - and `compare_to_benchmarks()` puts a run beside them
+metric by metric, marking a cell `comparable=False` rather than differencing two
+numbers in different units. `convert_nee_to_carbon_units()` is the explicit
+conversion; it converts a rate, and it is not a claim about how the paper
+aggregated half hours into days.
+
+Plotting is `rfrgapfill.plotting`, after the tables and derived only from them.
+`matplotlib` is an optional dependency, imported when a figure is drawn and
+reported by name when it is missing.
+
 ---
 
 ## 7. Data and provenance requirements
@@ -596,6 +634,6 @@ described as reproducing the paper exactly.
 | A7 | The achieved artificial-missing fraction cannot always hit exactly 25% given real gaps and series boundaries. | Report achieved fraction and class allocation against a documented tolerance. | `missing_fraction`, tolerance |
 | A8 | The denominator of the supplement's normalized joint-uncertainty ratio is not reconstructed. | Bias-IQR by gap class supported now; normalized ratios remain explicitly experimental. | experimental module |
 | A9 | Hemisphere inference for sites at or very near the equator. | `latitude >= 0 -> north`; an explicit `hemisphere` always overrides. | `hemisphere`, `latitude` |
-| A10 | Units of Table S3 NEE RMSE/bias (`g C m-2 d-1`) differ from the half-hourly model units (`umol m-2 s-1`); the aggregation from half-hourly residuals to daily carbon units is not spelled out. | Report metrics in model units by default; benchmark comparison applies an explicit, documented unit conversion. | reproduction module |
+| A10 | Units of Table S3 NEE RMSE/bias (`g C m-2 d-1`) differ from the half-hourly model units (`umol m-2 s-1`); the aggregation from half-hourly residuals to daily carbon units is not spelled out. | Report metrics in model units by default; `compare_to_benchmarks` refuses a cell whose units differ, and `convert_nee_to_carbon_units` applies the rate conversion explicitly (section 6.5). | `rfrgapfill.benchmarks`, `units=` on `gap_length_table` |
 | A11 | The paper names the daily standard deviation but not its degrees-of-freedom convention, nor the quantile interpolation behind Q1/Q2/Q3. | Sample standard deviation (`ddof=1`, the pandas default) and linear quantile interpolation (the numpy/pandas default). | `daily_std_ddof` |
 | A12 | `R2` is reported beside a regression slope without saying whether it is `1 - SS_res/SS_tot` or the squared Pearson correlation of that regression. | `residual` (`1 - SS_res/SS_tot`), the only one of the two a systematic offset can lower. Both are implemented; the two coincide in the regime Table S3 sits in, so neither is paper exact (section 6.1). | `r2_definition` |

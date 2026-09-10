@@ -9,7 +9,9 @@ and LE on exactly the same withheld intervals, reporting for each:
 * the same four over daytime and nighttime rows (6.2);
 * the same four per gap class, with the spread of bias across gaps (6.3);
 * the energy-balance ratio, measured against filled (6.4);
-* the gap manifest the scenario placed (4.4).
+* the gap manifest the scenario placed (4.4);
+* both arms lined up against gap duration, with the published Table S3
+  medians printed beside them for reference (6.5).
 
 and checks the property the whole design rests on: **no observed value changed**.
 
@@ -29,6 +31,7 @@ Nothing is downloaded: the site is generated from a seed (Step 16).
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from pathlib import Path
 
 import pandas as pd
@@ -38,6 +41,9 @@ from rfrgapfill import (
     FeatureConfig,
     SyntheticSite,
     ValidationReport,
+    benchmark_table,
+    gap_length_pivot,
+    gap_length_table,
     synthetic_site,
     validate_rfr,
 )
@@ -116,6 +122,28 @@ def show_metrics(report: ValidationReport) -> None:
         )
 
 
+def show_gap_length_comparison(reports: Mapping[str, ValidationReport]) -> None:
+    """Print both arms against gap duration, and the published medians beside them."""
+    table = gap_length_table(list(reports.values()), site="synthetic")
+    print("\n== Skill by gap length: the arms side by side (Step 18) ==")
+    for metric in ("r2", "rmse"):
+        print(f"\n{metric}, all observations:")
+        print(gap_length_pivot(table, metric=metric).round(3).to_string())
+
+    print("\n== The published medians, for reference only ==")
+    print(gap_length_pivot(benchmark_table(), metric="r2", gap_class="all").round(2).to_string())
+    print(
+        "\nThose are medians across the paper's 94 FLUXNET sites "
+        "(docs/supplement_benchmarks.md), not a target this synthetic\n"
+        "site is expected to reach, and no comparison against them is made or "
+        "implied here. A real reproduction run over matching\n"
+        "FLUXNET inputs would aggregate its sites with median_across_sites() and "
+        "call compare_to_benchmarks(), which refuses to\n"
+        "difference NEE RMSE or bias until the units are converted explicitly "
+        "(ambiguity A10)."
+    )
+
+
 def check_observations_untouched(
     site: SyntheticSite, before: pd.DataFrame, report: ValidationReport
 ) -> None:
@@ -188,6 +216,8 @@ def main() -> int:
         if args.manifests is not None:
             print(f"\n== {mode}: run manifests ==")
             write_manifests(report, args.manifests)
+
+    show_gap_length_comparison(reports)
 
     print(
         "\nBoth configurations completed. No metric is asserted to favour either arm: "

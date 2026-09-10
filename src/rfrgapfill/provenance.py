@@ -414,7 +414,11 @@ def ambiguity_choices(config: RFRConfig) -> dict[str, Any]:
         },
         "A10": {
             "topic": "Table S3 NEE units (g C m-2 d-1) differ from the model's units",
-            "settings": {"reported_in": "model units; benchmark conversion is explicit"},
+            "settings": {
+                "reported_in": "model units; benchmark conversion is explicit",
+                "conversion": "rfrgapfill.benchmarks.convert_nee_to_carbon_units",
+                "rule": "a rate conversion, not an aggregation of half hours into days",
+            },
         },
         "A11": {
             "topic": "degrees of freedom of the daily standard deviation, quantile method",

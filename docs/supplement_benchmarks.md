@@ -17,6 +17,25 @@ benchmark number ever appears in code or tests without a traceable source.
 
 ---
 
+## 0. Where these numbers live in the code
+
+Sections 2-4 below are also carried as data in
+`rfrgapfill.benchmarks.PUBLISHED_BENCHMARKS`, one `PublishedBenchmark` record per
+value, each naming its source table and the site population it is a median over.
+
+`tests/test_benchmarks.py` re-reads **this document** and checks every constant
+against the table it was transcribed from, so the two cannot drift apart: editing
+a number here without editing the code, or the reverse, fails the test suite.
+That is what makes the project rule - no benchmark number in code without a
+traceable source - enforceable rather than aspirational.
+
+`compare_to_benchmarks()` puts a reproduction run beside these medians metric by
+metric. It asserts nothing: a cell whose units differ from the published units is
+marked not comparable rather than differenced (ambiguity A10), and no function in
+that module turns a benchmark into a pass/fail threshold.
+
+---
+
 ## 1. Source map
 
 Supplementary files as supplied with the article.

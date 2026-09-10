@@ -94,7 +94,7 @@ strict = true
 warn_unreachable = true
 
 [[tool.mypy.overrides]]
-module = ["sklearn.*", "scipy.*", "joblib.*"]
+module = ["sklearn.*", "scipy.*", "joblib.*", "matplotlib.*"]
 ignore_missing_imports = true
 
 # numpy's bundled stubs use `type` statements, which mypy cannot parse while
