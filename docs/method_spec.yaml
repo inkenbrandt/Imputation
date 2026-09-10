@@ -253,6 +253,35 @@ train_test_design:
   supported_by: "Figure 2"
   provenance: paper
 
+validation_workflow:
+  module: rfrgapfill.validation
+  implementation: rfrgapfill.validation.validate_rfr
+  stages:
+    - place_artificial_gaps          # GapScenarioGenerator, or a handed-in manifest
+    - holdout_mask_from_manifest     # GapManifest.mask
+    - leakage_safe_features          # build_validation_features
+    - fit_on_remaining_observations  # RFRModel.fit
+    - predict_withheld_rows          # RFRModel.predict
+    - score_by_subset_and_gap_class  # core_metrics
+    - energy_balance_for_h_and_le    # compare_energy_balance
+  shared_gap_locations_across_targets: true
+  reuse_manifest_for_paired_arms: gaps=
+  predictions_outside_gaps: missing
+  observed_values_modified: false
+  input_frame_mutated: false
+  incomplete_predictor_rows: "not predicted and not scored; counted in n_offered"
+  result: rfrgapfill.validation.ValidationReport
+  per_target_result: rfrgapfill.validation.TargetValidation
+  tidy_table_columns: [target, method, mode, gap_class, subset, n, n_offered,
+                       r2, slope, rmse, bias]
+  bias_spread_by_gap_class:
+    record: rfrgapfill.validation.BiasSpread
+    unit: "one bias per placed interval, not per row"
+    single_site_analogue_of: "Table S8 cross-site IQR"
+  nothing_scored_warning: rfrgapfill.validation.ValidationWarning   # ambiguity A4
+  manifest: RunManifest.from_validation, one per target
+  provenance: paper
+
 model:
   estimator: sklearn.ensemble.RandomForestRegressor
   deterministic_random_state: true

@@ -331,6 +331,30 @@ No naive row-wise random split, which would destroy the intended temporal gap
 structure. Hyperparameters are tuned on the training portion only. Blocked or
 time-aware CV is an enhancement, never the paper-faithful default.
 
+`rfrgapfill.validation.validate_rfr` is the workflow that performs the whole
+experiment, and it is the only supported entry point to it: the order of its
+stages is the leakage protection of section 3.5, so a caller who assembles the
+same pieces by hand can get that order wrong and this one cannot. One call places
+the intervals, derives the holdout mask from them, hides the truth, builds the
+features through `rfrgapfill.leakage`, fits on what remains, predicts the withheld
+rows and scores them.
+
+- one `GapManifest` serves every target of a run, which is section 4.4's shared
+  locations; `gaps=` reuses it for a second arm or for the ORF benchmark, so a
+  paired comparison is scored on identical rows by construction;
+- predictions exist **only** inside the artificial gaps. Every other row of the
+  returned series is missing, so "no observed value was changed" is a checkable
+  property of the output rather than an intention;
+- a withheld row whose predictors are incomplete is neither predicted nor scored,
+  and `CoreMetrics.n` against `n_offered` says how many that was;
+- `ValidationReport.to_frame()` is the tidy table - target, method, mode, gap
+  class, subset, the four metrics and the row counts - and
+  `ValidationReport.manifest(target)` hands the run to
+  `rfrgapfill.provenance.RunManifest`;
+- a run that withheld rows and scored none of them raises `ValidationWarning`
+  naming ambiguity A4, because that is the default's documented consequence
+  (section 3.4) and an empty gap class otherwise reads as a defect.
+
 ---
 
 ## 5. Model

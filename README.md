@@ -19,9 +19,11 @@ prevention of data leakage** — not maximising predictive scores.
 and tests cleanly. Configuration, column mapping, the temporal layer, the
 receptive-limiter features, the leakage-safe validation feature workflow, the
 Random Forest, the operational fill API and the artificial-gap generator are
-implemented and usable, as are the validation metrics and the run manifest; the
-paper-validation workflow that ties them together is still a placeholder, filled
-in step by step.
+implemented and usable, as are the validation metrics, the run manifest, the
+synthetic site the tests run against and the artificial-gap validation workflow
+that ties them together into one call. What remains is the reporting and
+reproduction layer above it: gap-length sensitivity tables across sites, the
+FLUXNET2015 adapter, the supplementary uncertainty diagnostics and the CLI.
 
 | Component | State |
 |---|---|
@@ -36,7 +38,9 @@ in step by step.
 | Artificial-gap generator and allocation bases | done |
 | Validation metrics and energy-balance ratio | done |
 | Run manifests and JSON provenance export | done |
-| Paper-validation workflow | not started |
+| Synthetic site generator and known gaps | done |
+| Paper-validation workflow (`validate_rfr`) | done |
+| FLUXNET2015 adapter, multi-site reports, CLI | not started |
 
 ## Specification first
 
@@ -334,6 +338,61 @@ configured tolerance, a class the series is too short to hold, or a design that
 could not be placed at all is a `GapScenarioWarning` or a `GapError` — never a
 silently thinner set of gaps.
 
+## A site to try it on
+
+Nothing in this package's tests downloads anything. `synthetic_site()` builds a
+deterministic year of half-hourly data with structure you can predict: a
+clear-sky diurnal radiation cycle from the solar declination, a seasonal
+temperature swing with an afternoon thermal lag, VPD derived from temperature and
+humidity, a soil temperature damped and delayed behind the air, and NEE, H and LE
+that are real functions of all of it.
+
+```python
+from rfrgapfill import synthetic_site
+
+site = synthetic_site()             # 17520 rows, 2018, 45 deg N, FLUXNET column names
+site.frame                          # ten drivers, NEE/H/LE and their QC flags
+site.truth                          # the same fluxes before measurement noise
+config = site.config("RFR10")       # cadence, latitude, column map and seed filled in
+```
+
+The drivers are complete, as the paper's pre-filled meteorology is; only the
+fluxes carry gaps. Roughly 5% of rows are bursty instrument outages shared by all
+three targets and 10% are flagged as gap-filled before ingestion — NEE's flagged
+blocks start at night, the way friction-velocity filtering removes calm nights.
+`noise_scale=0.0`, `real_gap_fraction=0.0` and `pre_filled_fraction=0.0` strip
+each of those away when a test needs an exact relationship instead.
+
+Two things about it are exact rather than approximate. Sensible heat is the
+residual of available energy after latent heat, so
+
+```python
+(site.truth.H + site.truth.LE).sum() / (site.frame.NETRAD - site.frame.G_F_MDS).sum()
+# 0.85 == site.energy_balance_closure
+```
+
+and a negative `latitude` flips the seasons, the phenology and the temperature
+cycle together, because all three are read off the same solar geometry rather
+than off the calendar month.
+
+### Known gaps
+
+`site.known_gaps()` returns an ordinary `GapManifest` for a fixed plan — one
+30-day gap, two 7-day gaps and three 24-hour gaps at documented offsets — so a
+test can state its row counts in advance:
+
+```python
+manifest = site.known_gaps()        # shared across NEE, H and LE
+manifest.to_frame()                 # 6 rows, durations of exactly 1, 7 and 30 days
+holdout = manifest.mask(site.frame.index)
+```
+
+That is a hand-checkable fixture, not the paper's scenario: for 25% withheld at
+20/30/50, run `GapScenarioGenerator` against `site.frame` like any other input.
+Doing so is also the quickest way to see ambiguity A7 at work — with real outages
+underneath, a 25% request lands nearer 18%, and the manifest says so rather than
+adjusting itself.
+
 ## Scoring a fill
 
 `rfrgapfill.metrics` is the paper's evaluation quantities and nothing else — R2,
@@ -457,19 +516,68 @@ treating it as a validated one. `to_dict()` is a plain mapping, so
 `yaml.safe_dump(manifest.to_dict())` works with any YAML library you already
 have; the package takes no dependency on one.
 
-## Planned API
+## Artificial-gap validation
 
-Still to land: the paper-validation workflow that ties the generator and the
-metrics above into one call.
+`validate_rfr` is the paper's experiment in one call: place the gaps, hide the
+truth, build leakage-safe features, fit on what remains, predict the withheld
+intervals and score them.
 
 ```python
-report = filler.validate(
+from rfrgapfill import RFRConfig, validate_rfr
+
+report = validate_rfr(
     df,
-    artificial_gaps=True,
-    missing_fraction=0.25,
-    gap_mix={"24h": 0.20, "7d": 0.30, "30d": 0.50},
+    config=RFRConfig(mode="RFR10", frequency="30min", latitude=45.0, column_map=columns),
+    targets=["NEE", "H", "LE"],
+    qc_columns={"NEE": "NEE_QC", "H": "H_QC", "LE": "LE_QC"},
+)
+
+report.to_frame()              # target x gap class x subset: R2, slope, RMSE, bias, n
+report["LE"].overall.r2        # one number
+report["LE"].metric(subset="nighttime", gap_class="very_long")
+report.gaps.summary()          # what the scenario asked for and what it achieved
+report.energy_balance          # measured vs filled EBR, over the same rows
+report.manifest("LE").save("LE_validation.json")
+```
+
+The withheld observations **are** the test set (~25%) and the remaining eligible
+observations are the training set — Figure 2 of the paper. There is no random
+row-wise split anywhere in the workflow, because that would destroy the temporal
+gap structure the method is about.
+
+Every target of a run shares **one** set of gap locations, which is the paper's
+joint NEE/H/LE rule and what makes the arms comparable; pass `gaps=` to score a
+second arm, or an ORF benchmark, on exactly the same intervals:
+
+```python
+rfr = validate_rfr(df, config=config, targets=targets, qc_columns=qc)
+orf = validate_rfr(df, config=config.as_orf(), targets=targets, qc_columns=qc, gaps=rfr.gaps)
+```
+
+Metrics come back for `all`, `daytime` and `nighttime` (`SW_IN > 20 W m-2`) and
+again per gap class, together with the spread of bias across the individual gaps
+of each class. A row whose radiation is missing belongs to neither day nor night:
+the split is defined by a measurement, and putting an unknown row on one side of
+it would silently invent that measurement.
+
+**Long gaps need a deliberate choice (A4).** Under the documented default
+`daily_statistic_strategy="missing"`, a gap covering a whole calendar day has no
+daily target statistics, so no row of it has a complete feature vector and none
+is predicted or scored. That is the honest reading of the paper's silence, not a
+defect — and it does not pass quietly: the run raises a `ValidationWarning` and
+the row accounting shows `holdout_rows_with_complete_features = 0`. A 7-day or
+30-day run therefore selects a reaching strategy and records it:
+
+```python
+config = config.replace(
+    features=config.features.replace(daily_statistic_strategy="rolling_available")
 )
 ```
+
+`examples/synthetic_example.py` is the whole thing end to end: both published
+configurations over NEE, H and LE on one synthetic year, printing the metric
+tables, the gap manifest and the energy balance, and checking that no observed
+value changed.
 
 ## Development
 
