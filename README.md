@@ -19,8 +19,9 @@ prevention of data leakage** — not maximising predictive scores.
 and tests cleanly. Configuration, column mapping, the temporal layer, the
 receptive-limiter features, the leakage-safe validation feature workflow, the
 Random Forest, the operational fill API and the artificial-gap generator are
-implemented and usable, as are the validation metrics; the paper-validation
-workflow that ties them together is still a placeholder, filled in step by step.
+implemented and usable, as are the validation metrics and the run manifest; the
+paper-validation workflow that ties them together is still a placeholder, filled
+in step by step.
 
 | Component | State |
 |---|---|
@@ -34,6 +35,7 @@ workflow that ties them together is still a placeholder, filled in step by step.
 | Operational fill API and provenance | done |
 | Artificial-gap generator and allocation bases | done |
 | Validation metrics and energy-balance ratio | done |
+| Run manifests and JSON provenance export | done |
 | Paper-validation workflow | not started |
 
 ## Specification first
@@ -398,6 +400,62 @@ comparison.measured, comparison.filled, comparison.difference
 filled. A row is used only where every component it needs is present, and both
 ratios share one row set — otherwise the difference would report the change in
 interval as much as the change in flux.
+
+## Run manifests
+
+A filled column is only as trustworthy as the record of what produced it.
+`RunManifest` assembles the description every stage already writes — the
+configuration, the column mapping, the QC rule, the grid and the parameters it
+chose, the time axis, the row accounting — into one JSON document:
+
+```python
+from rfrgapfill import RunManifest
+
+manifest = RunManifest.from_fill(filler, result)
+manifest.save("LE_run.json")        # checks completeness, then writes
+manifest.settings_digest            # sha256 of the settings, and only the settings
+```
+
+and, for an artificial-gap run, the placed scenario alongside them:
+
+```python
+manifest = RunManifest.from_validation(
+    config=config, model=model, gaps=gap_manifest, features=feature_set
+)
+```
+
+Three things make it more than a dictionary dump.
+
+**The required list is checked.** `REQUIRED_FIELDS` maps every item the
+specification asks a run to record onto its path in the document, and
+`require_complete()` names any the manifest cannot supply. A gap manifest is
+required of a validation run and not of a fill, which places no intervals; a
+hemisphere only where the season feature is built, since the ORF benchmark builds
+none. `save()` runs the check before writing — the file is what outlives the
+session that could have explained it.
+
+**The resolved ambiguities travel with the result.** A1–A12 are not merely
+exposed in configuration; the choice this run made for each is written into every
+manifest, under a note stating plainly that none of them reproduces the paper
+exactly:
+
+```python
+manifest.to_dict()["ambiguities"]["choices"]["A3"]["settings"]
+# {'allocation_basis': 'missing_records'}
+```
+
+**The digest covers the design, not the run.** `settings_digest` is a SHA-256
+over the environment versions, the target and the whole validated configuration —
+and over nothing that varies between two runs of the same design, so the
+timestamp, the row counts, the placed intervals and the scores are all excluded.
+Two manifests sharing a digest were configured identically.
+
+Reading one back is `load_manifest(path)`, which returns the document as data
+rather than a live configuration: an archived manifest records a run that already
+happened, and rebuilding a configuration from a hand-editable file would invite
+treating it as a validated one. `to_dict()` is a plain mapping, so
+`yaml.safe_dump(manifest.to_dict())` works with any YAML library you already
+have; the package takes no dependency on one.
 
 ## Planned API
 

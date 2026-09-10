@@ -521,6 +521,38 @@ run manifest records package/Python/scikit-learn versions, column mapping, targe
 RFR3/RFR10 mode, feature mode, hyperparameter grid, best parameters, seed, gap
 manifest, time resolution, hemisphere/latitude, and QC rules.
 
+`rfrgapfill.provenance.RunManifest` is that manifest. Every stage already
+describes itself - `RFRConfig.to_dict`, `RFRModel.to_dict`, `GapManifest.to_dict`,
+`FillReport.to_dict` - and this is the one place they are assembled, checked, and
+exported as JSON:
+
+- `RunManifest.from_fill(filler, result)` and `RunManifest.from_validation(...)`
+  take the sections from the objects that own them, so a manifest cannot describe
+  a configuration the run did not use; a result paired with another run's filler,
+  or a target the model and the features disagree about, is rejected;
+- the required list above is a checked construct rather than a hope.
+  `REQUIRED_FIELDS` maps each item onto its path in the exported document, and
+  `require_complete()` names any the manifest cannot supply. A gap manifest is
+  required of an artificial-gap run and not of an operational fill, which places
+  no intervals; a hemisphere is required only where the season feature is built.
+  `save()` runs the check before writing, because the file is what outlives the
+  session that could have explained it;
+- **the resolved ambiguities travel with the result.** The preamble to
+  [Known ambiguities](#known-ambiguities) requires every choice to be reported in
+  run output, not merely exposed in configuration, so `ambiguity_choices()`
+  writes this run's answer to A1-A12 into every manifest, under a note stating
+  that none of them reproduces the paper exactly;
+- `settings_digest` is a SHA-256 over the environment versions, the target and
+  the whole validated configuration, and over nothing that varies between two
+  runs of the same design - not the timestamp, the row counts, the placed
+  intervals or the scores. Two manifests sharing a digest were configured
+  identically.
+
+Undefined values reach the document as `null` rather than `NaN`, matching section
+6.1, and every section is rendered to plain containers when the manifest is
+built, so a manifest that could not be serialised fails there rather than when
+someone tries to write the audit file.
+
 ---
 
 ## Known ambiguities

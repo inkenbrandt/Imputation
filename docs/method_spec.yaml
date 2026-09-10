@@ -385,6 +385,17 @@ reproducibility:
     - hemisphere_or_latitude
     - qc_rules
   manifest_format: [json, yaml]
+  module: rfrgapfill.provenance
+  implementation: rfrgapfill.provenance.RunManifest
+  constructors: [RunManifest.from_fill, RunManifest.from_validation]
+  required_fields_checked: rfrgapfill.provenance.REQUIRED_FIELDS
+  required_fields_gate: RunManifest.require_complete
+  gap_manifest_required_for: [validation]
+  hemisphere_required_when: "the season feature is built (not for ORF)"
+  ambiguities_reported: rfrgapfill.provenance.ambiguity_choices
+  settings_digest: "sha256 over versions + target + validated configuration only"
+  undefined_values: "null, never NaN"
+  export: "RunManifest.to_json / save; to_dict is a plain mapping, so any YAML library serialises it"
 
 known_ambiguities:
   - id: A1

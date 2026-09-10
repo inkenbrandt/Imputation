@@ -814,20 +814,16 @@ def _serialisable_params(estimator: RandomForestRegressor) -> dict[str, Any]:
 
 
 def _environment_versions() -> dict[str, str]:
-    """Return the versions a reproduction of this fit would have to match."""
-    import platform
+    """Return the versions a reproduction of this fit would have to match.
 
-    import sklearn
+    Delegates to :func:`rfrgapfill.provenance.environment_versions` so a saved
+    model and the run manifest that describes it cannot disagree about what the
+    environment was. Imported here rather than at module scope because
+    :mod:`rfrgapfill.provenance` reads this module.
+    """
+    from rfrgapfill.provenance import environment_versions
 
-    from rfrgapfill import __version__
-
-    return {
-        "rfr_gapfill": __version__,
-        "python": platform.python_version(),
-        "scikit_learn": sklearn.__version__,
-        "numpy": np.__version__,
-        "pandas": pd.__version__,
-    }
+    return environment_versions()
 
 
 def _warn_on_version_drift(source: Path, *, stored: Mapping[str, str]) -> None:

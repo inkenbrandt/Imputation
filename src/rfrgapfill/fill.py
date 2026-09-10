@@ -416,6 +416,19 @@ class RFRGapFiller:
         return method_label(self._config)
 
     @property
+    def column_map(self) -> ColumnMap:
+        """The mapping :meth:`fit` resolved, which :meth:`fill` must read again."""
+        self._require_fitted("read the column mapping of")
+        assert self._columns is not None
+        return self._columns
+
+    @property
+    def qc_column(self) -> str | None:
+        """The QC/provenance column :meth:`fit` used, or ``None`` when none was given."""
+        self._require_fitted("read the QC column of")
+        return self._qc_column
+
+    @property
     def origin(self) -> pd.Timestamp:
         """The timestamp ``time_distance_hours`` is measured from, fixed at :meth:`fit`."""
         self._require_fitted("read the time origin of")
