@@ -16,11 +16,10 @@ prevention of data leakage** — not maximising predictive scores.
 ## Status
 
 **Pre-alpha.** The scientific specification is frozen and the package installs
-and tests cleanly. Configuration, column mapping and the temporal layer are
-implemented and usable, as is the metric layer that scores a filled series
-against measurements; the modelling modules are still placeholders, filled in
-step by step. Everything below the "Planned API" heading except `RFRConfig`,
-`ColumnMap` and `TimeAxis` is not built yet.
+and tests cleanly. The whole path from a raw file to a scored validation run is
+implemented: configuration, column mapping, the temporal layer, the
+receptive-limiter features, the artificial-gap generator, the model, filling,
+metrics, and the validation orchestration, plus an optional FLUXNET2015 adapter.
 
 | Component | State |
 |---|---|
@@ -29,9 +28,10 @@ step by step. Everything below the "Planned API" heading except `RFRConfig`,
 | Configuration and column-mapping layer | done |
 | Timestamp, cadence and elapsed-time utilities | done |
 | Metrics, including the all/daytime/nighttime split | done |
-| Receptive-limiter features | not started |
-| Artificial-gap generator | not started |
-| Model, filling, validation orchestration | not started |
+| Receptive-limiter features | done |
+| Artificial-gap generator | done |
+| Model, filling, validation orchestration | done |
+| FLUXNET2015 adapter | done |
 
 ## Specification first
 
@@ -46,6 +46,9 @@ prose in the paper:
   tests can tell a published fact from a documented choice of ours.
 - [`docs/supplement_benchmarks.md`](docs/supplement_benchmarks.md) — which
   supplementary table or figure supports each numerical reproduction target.
+- [`docs/fluxnet_adapter.md`](docs/fluxnet_adapter.md) — what the optional
+  FLUXNET2015 adapter assumes about that data product, what its QC flags mean,
+  and the four naming choices (`F1`–`F4`) it makes on your behalf.
 
 Rule for contributors: **nothing may be labelled "paper exact" unless the article
 or its supplements state it.** Where the paper is silent, pick a defensible
@@ -214,6 +217,52 @@ visible to the model, so it cannot leak, and every substituted day is counted in
 the run report. The strict reading is available as `"within_day"`, and what it
 costs is measurable — `report[target].coverage` drops to zero for long gaps.
 This is ambiguity A4/A4a in [`docs/method_spec.md`](docs/method_spec.md).
+
+## Reading FLUXNET2015 files
+
+The paper ran on FLUXNET2015 FULLSET half-hourly files, so an optional adapter
+maps that product onto the generic API. It is the only module that knows FLUXNET
+column names; nothing else in the package does.
+
+```python
+from rfrgapfill import validate_rfr
+from rfrgapfill.fluxnet import inspect_fluxnet, read_fluxnet_csv
+
+frame = read_fluxnet_csv("FLX_XX-Site_FLUXNET2015_FULLSET_HH_2004-2014_1-4.csv")
+info = inspect_fluxnet(frame)
+
+info.best_mode                       # RFR10, RFR3, or None if not even RFR3
+info.missing_drivers                 # canonical name -> the column that is absent
+info.summary()                       # human-readable
+
+report = validate_rfr(
+    frame,
+    targets=list(info.target_columns()),
+    mode=info.best_mode,
+    scenario="zhu2022",
+    column_map=info.column_map(),     # built from the columns really present
+    qc_columns=info.qc_columns(),
+    energy_balance_targets=info.heat_targets(),
+    latitude=51.5,
+)
+```
+
+`read_fluxnet_csv` reads a **local** file — the package downloads nothing and
+holds no credentials — and fixes the two things that fail silently otherwise:
+`YYYYMMDDHHMM` timestamps, and the `-9999` sentinel, which is a
+plausible-looking number that would otherwise be trained on.
+
+`inspect_fluxnet` reports availability *before* a fit, because RFR10 is not
+available everywhere: the paper's full RFR3/RFR10 comparison used 94 of 194
+sites. A site that can only run RFR3 is a result to report, not a problem to
+work around by substituting drivers.
+
+On the QC flags, only `0` is a measurement; `1`/`2`/`3` are MDS gap fills of
+descending quality. `qc_summary(frame, "LE_F_MDS_QC", target="LE_F_MDS")` shows
+what that rule costs at your site before you pay it. The flag semantics, the
+depth-indexed soil columns (`SWC_F_MDS_1`), the `TIMESTAMP_START` convention and
+the daily-product caveat are all in
+[`docs/fluxnet_adapter.md`](docs/fluxnet_adapter.md).
 
 ## Development
 
