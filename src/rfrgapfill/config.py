@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import timedelta
 from enum import Enum
 from types import MappingProxyType
@@ -51,6 +51,7 @@ __all__ = [
     "ColumnMap",
     "ColumnMapError",
     "ConfigError",
+    "DailyStatisticStrategy",
     "FeatureConfig",
     "FeatureMode",
     "GapClass",
@@ -96,6 +97,49 @@ class BoundaryConvention(str, Enum):
     def coerce(cls, value: object) -> BoundaryConvention:
         """Return ``value`` as a :class:`BoundaryConvention`."""
         return coerce_enum(cls, value, field_name="boundary_convention")
+
+
+class DailyStatisticStrategy(str, Enum):
+    """How a day with too few visible target observations gets its statistics (A4).
+
+    The daily target statistics of method_spec.md 3.4 are derived from the target
+    itself, so inside an artificial gap - or a real one - the day's own
+    observations are invisible to the model by construction. A 30-day gap contains
+    no visible target value at all, which is precisely the case the paper's method
+    is built to fill.
+
+    Both strategies read **only** observations visible to the model, so neither can
+    leak held-out truth. They differ in what happens when a day has nothing
+    visible.
+    """
+
+    #: The day's statistics stay missing. The literal reading of ambiguity A4:
+    #: affected rows are dropped from training and left unfilled at prediction
+    #: time. Long gaps are then unfillable, so this is offered for strict A4
+    #: reproduction rather than as the working default.
+    WITHIN_DAY = "within_day"
+    #: Fall back to the nearest calendar day that does have enough visible
+    #: observations, ties broken towards the earlier day. Leakage-safe, keeps
+    #: multi-day gaps fillable, and every substituted row is counted in the run
+    #: report. The default.
+    NEAREST_VISIBLE_DAY = "nearest_visible_day"
+
+    @classmethod
+    def coerce(cls, value: object) -> DailyStatisticStrategy:
+        """Return ``value`` as a :class:`DailyStatisticStrategy`.
+
+        ``"missing"`` and ``"within_day_available"`` name :attr:`WITHIN_DAY`, and
+        ``"neighbor_day_fallback"`` (either spelling) names
+        :attr:`NEAREST_VISIBLE_DAY`, since those are the names the implementation
+        plan uses.
+        """
+        aliases = {
+            "missing": cls.WITHIN_DAY,
+            "within_day_available": cls.WITHIN_DAY,
+            "neighbor_day_fallback": cls.NEAREST_VISIBLE_DAY,
+            "neighbour_day_fallback": cls.NEAREST_VISIBLE_DAY,
+        }
+        return coerce_enum(cls, value, field_name="daily_statistics_strategy", aliases=aliases)
 
 
 class AllocationBasis(str, Enum):
@@ -207,6 +251,21 @@ _MAX_SEED: Final[int] = 2**32 - 1
 # ---------------------------------------------------------------------------
 
 
+def _picklable_fields(config: object) -> dict[str, Any]:
+    """Return ``config``'s fields with read-only mappings converted to plain dicts.
+
+    Configuration objects hold their mappings in :class:`~types.MappingProxyType`,
+    which pickle cannot serialise; :meth:`__reduce__` uses this to rebuild through
+    the constructor instead, so an unpickled object has been validated exactly as
+    a freshly constructed one was.
+    """
+    values: dict[str, Any] = {}
+    for entry in fields(config):  # type: ignore[arg-type]
+        value = getattr(config, entry.name)
+        values[entry.name] = dict(value) if isinstance(value, Mapping) else value
+    return values
+
+
 def _check_finite(value: object, *, field_name: str) -> float:
     """Return ``value`` as a finite float or raise :class:`ConfigError`."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -280,8 +339,13 @@ class FeatureConfig:
     #: How values exactly on a radiation threshold are binned (A2).
     boundary_convention: BoundaryConvention | str = BoundaryConvention.MEDIUM_INCLUSIVE
     #: Minimum visible target observations for a day's statistics to be computed (A4).
-    #: Days below this leave the statistics missing; they are never imputed.
-    min_daily_observations: int = 1
+    #: A day below this threshold has no statistics of its own; what happens next is
+    #: ``daily_statistics_strategy``. Values are never imputed from the target.
+    min_daily_observations: int = 2
+    #: What a day with too few visible target observations does instead (A4).
+    daily_statistics_strategy: DailyStatisticStrategy | str = (
+        DailyStatisticStrategy.NEAREST_VISIBLE_DAY
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.use_receptive_limiter, bool):
@@ -319,6 +383,11 @@ class FeatureConfig:
             "min_daily_observations",
             _check_positive_int(self.min_daily_observations, field_name="min_daily_observations"),
         )
+        object.__setattr__(
+            self,
+            "daily_statistics_strategy",
+            DailyStatisticStrategy.coerce(self.daily_statistics_strategy),
+        )
 
     @property
     def mode(self) -> FeatureMode:
@@ -333,9 +402,22 @@ class FeatureConfig:
         return self.boundary_convention
 
     @property
+    def daily_strategy(self) -> DailyStatisticStrategy:
+        """The validated :class:`DailyStatisticStrategy` (narrowed from the input union)."""
+        assert isinstance(self.daily_statistics_strategy, DailyStatisticStrategy)
+        return self.daily_statistics_strategy
+
+    @property
     def requires_hemisphere(self) -> bool:
         """Whether a hemisphere is needed, i.e. whether the season feature is built."""
         return self.use_receptive_limiter
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Rebuild through the constructor so pickling revalidates.
+
+        See :func:`_picklable_fields`.
+        """
+        return (_rebuild_config, (type(self), _picklable_fields(self)))
 
     def replace(self, **changes: Any) -> FeatureConfig:
         """Return a revalidated copy with ``changes`` applied."""
@@ -349,6 +431,7 @@ class FeatureConfig:
             "radiation_thresholds": list(self.radiation_thresholds),
             "boundary_convention": self.convention.value,
             "min_daily_observations": self.min_daily_observations,
+            "daily_statistics_strategy": self.daily_strategy.value,
         }
 
 
@@ -471,6 +554,13 @@ class GapScenarioConfig:
         assert isinstance(value, timedelta)
         return value
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Rebuild through the constructor so pickling revalidates.
+
+        See :func:`_picklable_fields`.
+        """
+        return (_rebuild_config, (type(self), _picklable_fields(self)))
+
     def replace(self, **changes: Any) -> GapScenarioConfig:
         """Return a revalidated copy with ``changes`` applied."""
         return replace(self, **changes)
@@ -550,6 +640,13 @@ class ValidationConfig:
         subsets = self.subsets
         assert isinstance(subsets, tuple)
         return subsets
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Rebuild through the constructor so pickling revalidates.
+
+        See :func:`_picklable_fields`.
+        """
+        return (_rebuild_config, (type(self), _picklable_fields(self)))
 
     def replace(self, **changes: Any) -> ValidationConfig:
         """Return a revalidated copy with ``changes`` applied."""
@@ -799,6 +896,13 @@ class RFRConfig:
         )
         return resolved
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Rebuild through the constructor so pickling revalidates.
+
+        See :func:`_picklable_fields`.
+        """
+        return (_rebuild_config, (type(self), _picklable_fields(self)))
+
     def replace(self, **changes: Any) -> RFRConfig:
         """Return a revalidated copy with ``changes`` applied."""
         return replace(self, **changes)
@@ -886,3 +990,8 @@ def _estimator_parameters() -> frozenset[str]:
     except ImportError:  # pragma: no cover - scikit-learn is a hard dependency
         return frozenset()
     return frozenset(RandomForestRegressor().get_params())
+
+
+def _rebuild_config(cls: type, values: Mapping[str, Any]) -> Any:
+    """Reconstruct a configuration object from plain fields. Used by ``__reduce__``."""
+    return cls(**values)

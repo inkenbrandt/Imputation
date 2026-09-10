@@ -27,6 +27,7 @@ from rfrgapfill.config import (
     ColumnMapError,
     ConfigError,
     CVStrategy,
+    DailyStatisticStrategy,
     FeatureConfig,
     FeatureMode,
     GapClass,
@@ -205,10 +206,39 @@ def test_unknown_feature_modes_are_rejected() -> None:
 
 
 def test_min_daily_observations_controls_the_empty_day_policy() -> None:
-    assert FeatureConfig().min_daily_observations == 1
+    # Two, not one: the sample standard deviation of a single value is undefined,
+    # so a day with one observation cannot produce all four daily statistics.
+    assert FeatureConfig().min_daily_observations == 2
     assert FeatureConfig(min_daily_observations=4).min_daily_observations == 4
     with pytest.raises(ConfigError, match="min_daily_observations"):
         FeatureConfig(min_daily_observations=0)
+
+
+def test_the_empty_day_strategy_is_leakage_safe_and_reported() -> None:
+    assert FeatureConfig().daily_strategy is DailyStatisticStrategy.NEAREST_VISIBLE_DAY
+    assert FeatureConfig(daily_statistics_strategy="within_day").daily_strategy is (
+        DailyStatisticStrategy.WITHIN_DAY
+    )
+    # The implementation plan's names for the same two strategies.
+    assert FeatureConfig(daily_statistics_strategy="missing").daily_strategy is (
+        DailyStatisticStrategy.WITHIN_DAY
+    )
+    assert FeatureConfig(daily_statistics_strategy="neighbor_day_fallback").daily_strategy is (
+        DailyStatisticStrategy.NEAREST_VISIBLE_DAY
+    )
+    assert FeatureConfig().to_dict()["daily_statistics_strategy"] == "nearest_visible_day"
+    with pytest.raises(ConfigError, match="daily_statistics_strategy"):
+        FeatureConfig(daily_statistics_strategy="peek_at_the_truth")
+
+
+def test_configuration_objects_survive_a_pickle_round_trip() -> None:
+    # Fitted models are saved with joblib and carry their configuration, so the
+    # read-only mappings inside must not make the whole bundle unpicklable.
+    import pickle
+
+    original = config(mode="RFR10", latitude=51.5, site_id="GB-Ham")
+    restored = pickle.loads(pickle.dumps(original))
+    assert restored.to_dict() == original.to_dict()
 
 
 def test_orf_benchmark_switch_drops_the_hemisphere_requirement() -> None:

@@ -137,7 +137,8 @@ Required default behaviour:
 1. build the artificial-gap mask **before** computing target-derived features;
 2. compute daily statistics from target observations visible to the model only;
 3. never let held-out truth influence a feature used to predict that truth;
-4. days with no visible target observations yield missing daily statistics
+4. days with no visible target observations get their statistics from
+   `daily_statistics_strategy`, which reads only visible observations either way
    (see [Known ambiguities](#known-ambiguities), A4).
 
 `feature_mode="legacy_fluxlib"` is reserved for a compatibility mode to be added
@@ -302,7 +303,8 @@ described as reproducing the paper exactly.
 | A1 | The complete `GridSearchCV` hyperparameter grid is not enumerated in the article. | Documented default grid shipped with the package; any archived `fluxlib` grid only as a named preset. | `hyperparameter_grid` |
 | A2 | Radiation-category boundary handling at exactly 10 and 100 W m-2 is not explicit in the prose. | Inclusive, exhaustive bins: `<10` weak, `10–100` medium, `>100` strong. | `radiation_thresholds`, `boundary_convention` |
 | A3 | The 20/30/50 gap mix may refer to the number of gap events or the number of withheld half-hours. | `missing_records`. | `allocation_basis` |
-| A4 | Handling of daily target statistics when a whole day or longer interval has no visible observations is unspecified. | Statistics left missing; affected rows excluded from training and flagged at prediction time rather than imputed. | `feature_mode`, driver-completeness policy |
+| A4 | Handling of daily target statistics when a whole day or longer interval has no visible observations is unspecified. | `nearest_visible_day`: the day takes the statistics of the closest calendar day that does have enough visible observations, ties to the earlier day. Leakage-safe, and counted in the run report. `within_day` keeps the statistics missing — the literal reading, which cannot fill gaps longer than a day (see A4a). | `daily_statistics_strategy`, `min_daily_observations` |
+| A4a | Under a strictly leakage-safe reading, a gap longer than one day contains no visible target observation, so *every* day inside it has missing daily statistics and no row inside it is predictable. The paper's headline result is 7- and 30-day gaps, so its implementation cannot have behaved this way; whether it used a fallback like A4's or computed the statistics from the full series (which would be leakage, A6) is not recoverable from the article. | A documented leakage-safe fallback is the default, so long gaps stay fillable and no held-out value is ever read. The strict alternative is available and its cost is measurable. | `daily_statistics_strategy` |
 | A5 | Cross-validation details inside `GridSearchCV` (fold count, shuffling, temporal blocking) are unspecified. | Conventional `GridSearchCV` folds on the training portion; blocked/time-aware CV offered as a labelled enhancement. | `cv_strategy` |
 | A6 | Whether the historical `fluxlib` implementation computed daily target statistics leakage-safely is unverified. | Leakage-safe `paper_safe` mode is the default; a `legacy_fluxlib` mode is added only on implementation evidence. | `feature_mode` |
 | A7 | The achieved artificial-missing fraction cannot always hit exactly 25% given real gaps and series boundaries. | Report achieved fraction and class allocation against a documented tolerance. | `missing_fraction`, tolerance |

@@ -137,32 +137,83 @@ pip install -e ".[dev]"
 Notebooks are not a core or development dependency; install the optional
 `notebooks` extra if you want the example notebook environment.
 
-## Planned API
-
-Not implemented yet — recorded here as the target the modules are built toward.
-It is repeated in the specification and will become the tested quick-start once
-the modelling steps land.
+## Filling real gaps
 
 ```python
-from rfrgapfill import RFRConfig, RFRGapFiller
+from rfrgapfill import ColumnMap, RFRConfig, RFRGapFiller
 
-config = RFRConfig(mode="RFR10", frequency="30min", hemisphere="north", random_state=42)
-filler = RFRGapFiller(config)
-
-filler.fit(df, target="LE", qc_col="LE_QC", column_map={...})
-result = filler.fill(df)
-
-report = filler.validate(
-    df,
-    artificial_gaps=True,
-    missing_fraction=0.25,
-    gap_mix={"24h": 0.20, "7d": 0.30, "30d": 0.50},
+config = RFRConfig(
+    mode="RFR10",
+    frequency="30min",
+    latitude=51.5,
+    random_state=42,
+    column_map=ColumnMap.fluxnet2015("RFR10"),
 )
+
+filler = RFRGapFiller(config).fit(df, target="LE", qc_col="LE_QC")
+result = filler.fill()
+
+result.frame["LE_filled"]     # observed where measured, predicted where it was not
+result.n_filled, result.n_unfilled
+filler.manifest()             # environment, config, time axis, training report
 ```
 
 Observed values are never overwritten in place: filling returns
 `<target>_original`, `<target>_filled`, `<target>_is_observed`,
-`<target>_is_filled`, `<target>_fill_method` and `<target>_model_version`.
+`<target>_is_filled`, `<target>_fill_method` and `<target>_model_version`. A row
+missing a required driver is left unfilled rather than filled from an imputed
+input, and the input frame is never mutated.
+
+## Reproducing the paper's validation
+
+One call runs the whole artificial-gap experiment: identify the genuinely
+measured rows, draw the gap scenario, hide the truth, build leakage-safe
+features, tune and fit on what is left, predict inside the gaps, and score.
+
+```python
+from rfrgapfill import ColumnMap, validate_rfr
+
+report = validate_rfr(
+    df,
+    targets=["NEE", "H", "LE"],
+    mode="RFR10",
+    scenario="zhu2022",              # 25% withheld as 24h/7d/30d gaps, mixed 20/30/50
+    latitude=51.5,
+    column_map=ColumnMap.fluxnet2015("RFR10"),
+    qc_columns={"NEE": "NEE_VUT_REF_QC", "H": "H_F_MDS_QC", "LE": "LE_F_MDS_QC"},
+)
+
+report.metrics_frame()               # target x gap class x all/daytime/nighttime
+report.gap_manifest                  # start, end, duration, class, observed fraction
+report.energy_balance                # measured vs filled EBR over the same gaps
+report["NEE"].by_gap_class[GapClass.VERY_LONG].bias_iqr
+report.satisfied, report.warnings    # and, when it was not, exactly why not
+report.manifest()                    # everything needed to reproduce the run
+```
+
+The withheld observations **are** the test set — contiguous temporal intervals,
+never a row-wise random holdout, which would leave every held-out half-hour
+surrounded by its own neighbours. Given several targets, they are scored on
+identical gap locations, as the paper's joint NEE/H/LE validation was.
+
+`compare_receptive_limiter(...)` runs RFR and the ORF benchmark on exactly the
+same gaps and returns the paired metrics table.
+
+### One thing the paper does not settle
+
+The daily target statistics are derived from the target, so under a strictly
+leakage-safe reading a 30-day gap contains no visible target observation, every
+day inside it has no statistics, and **no row inside it is predictable**. The
+paper's headline result is 7- and 30-day gaps, so its implementation cannot have
+behaved that way; the article does not say what it did instead.
+
+The default is therefore `daily_statistics_strategy="nearest_visible_day"`: a day
+with too few visible observations takes the statistics of the closest calendar
+day that has enough, ties going to the earlier day. It reads only observations
+visible to the model, so it cannot leak, and every substituted day is counted in
+the run report. The strict reading is available as `"within_day"`, and what it
+costs is measurable — `report[target].coverage` drops to zero for long gaps.
+This is ambiguity A4/A4a in [`docs/method_spec.md`](docs/method_spec.md).
 
 ## Development
 
