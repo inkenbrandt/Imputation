@@ -496,8 +496,125 @@ def test_energy_balance_comparison_to_dict_names_both_ratios() -> None:
         soil_heat_flux=EBR_G,
     )
     payload = comparison.to_dict()
-    assert set(payload) == {"n", "n_offered", "measured_ebr", "filled_ebr", "difference"}
+    assert set(payload) == {
+        "n",
+        "n_offered",
+        "n_missing_measured",
+        "n_missing_filled",
+        "n_missing_available_energy",
+        "available_energy",
+        "measured_ebr",
+        "filled_ebr",
+        "difference",
+    }
     assert json.loads(json.dumps(payload)) == payload
+
+
+# ---------------------------------------------------------------------------
+# Step 19: the denominator, and what missing data costs
+# ---------------------------------------------------------------------------
+
+
+def test_the_comparison_reports_its_shared_denominator() -> None:
+    comparison = compare_energy_balance(
+        measured_sensible_heat=EBR_H,
+        measured_latent_heat=EBR_LE,
+        filled_sensible_heat=EBR_H,
+        filled_latent_heat=EBR_LE,
+        net_radiation=EBR_NETRAD,
+        soil_heat_flux=EBR_G,
+    )
+    assert comparison.available_energy == pytest.approx(220.0)
+
+
+def test_a_negative_denominator_is_undefined_rather_than_a_backwards_closure() -> None:
+    """A night-only interval: -60 / -40 = 1.5 would read as over-closure.
+
+    Worse, raising the turbulent flux there would *lower* the ratio, so the
+    filled-minus-measured difference would report a fill's effect with its sign
+    flipped. The ratio is undefined; the denominator is still reported.
+    """
+    night = {
+        "net_radiation": [-50.0, -40.0],
+        "soil_heat_flux": [-30.0, -20.0],
+    }
+    assert (
+        energy_balance_ratio(sensible_heat=[-20.0, -20.0], latent_heat=[-10.0, -10.0], **night)
+        is None
+    )
+    comparison = compare_energy_balance(
+        measured_sensible_heat=[-20.0, -20.0],
+        measured_latent_heat=[-10.0, -10.0],
+        filled_sensible_heat=[-10.0, -10.0],
+        filled_latent_heat=[-10.0, -10.0],
+        **night,
+    )
+    assert comparison.n == 2
+    assert comparison.available_energy == pytest.approx(-40.0)
+    assert comparison.measured is None
+    assert comparison.filled is None
+    assert comparison.difference is None
+
+
+def test_a_night_row_inside_a_positive_interval_still_counts() -> None:
+    """The rule is on the interval's sum, not on each row's sign."""
+    ratio = energy_balance_ratio(
+        sensible_heat=[*EBR_H, -5.0],
+        latent_heat=[*EBR_LE, 0.0],
+        net_radiation=[*EBR_NETRAD, -40.0],
+        soil_heat_flux=[*EBR_G, -10.0],
+    )
+    assert ratio == pytest.approx(125.0 / 190.0)
+
+
+def test_every_dropped_row_is_attributed_to_what_it_was_missing() -> None:
+    """Rows 3-6 are each missing something different; row 6 is missing two things."""
+    comparison = compare_energy_balance(
+        measured_sensible_heat=[*EBR_H, np.nan, 1.0, 1.0, np.nan],
+        measured_latent_heat=[*EBR_LE, 1.0, 1.0, 1.0, 1.0],
+        filled_sensible_heat=[*EBR_H, 1.0, 1.0, 1.0, 1.0],
+        filled_latent_heat=[*EBR_LE, 1.0, np.nan, 1.0, 1.0],
+        net_radiation=[*EBR_NETRAD, 50.0, 50.0, np.nan, 50.0],
+        soil_heat_flux=[*EBR_G, 5.0, 5.0, 5.0, np.nan],
+    )
+    assert comparison.n == 2
+    assert comparison.n_offered == 6
+    assert comparison.dropped_incomplete == 4
+    assert comparison.n_missing_measured == 2
+    assert comparison.n_missing_filled == 1
+    assert comparison.n_missing_available_energy == 2
+    # The two complete rows are the hand fixture, untouched by the four others.
+    assert comparison.measured == pytest.approx(EBR_EXPECTED)
+    assert comparison.available_energy == pytest.approx(220.0)
+
+
+def test_an_empty_comparison_has_no_denominator() -> None:
+    comparison = compare_energy_balance(
+        measured_sensible_heat=[np.nan],
+        measured_latent_heat=[1.0],
+        filled_sensible_heat=[1.0],
+        filled_latent_heat=[1.0],
+        net_radiation=[1.0],
+        soil_heat_flux=[0.0],
+    )
+    assert comparison.is_empty
+    assert comparison.available_energy is None
+    assert comparison.n_missing_measured == 1
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ({"n": 3, "n_offered": 2}, "cannot increase"),
+        ({"n": -1, "n_offered": 2}, "negative"),
+        ({"n": 1, "n_offered": 3, "n_missing_filled": 1}, "unexplained"),
+        ({"n": 1, "n_offered": 2, "n_missing_measured": 2}, "more rows"),
+    ],
+)
+def test_the_comparison_rejects_impossible_row_accounting(fields, message) -> None:
+    values = {"measured": None, "filled": None, "difference": None, **fields}
+    with pytest.raises(MetricError, match=message):
+        EnergyBalanceComparison(**values)
 
 
 def test_compare_energy_balance_accepts_series_on_one_index() -> None:

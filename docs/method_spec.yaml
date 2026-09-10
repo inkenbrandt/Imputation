@@ -278,6 +278,7 @@ validation_workflow:
     record: rfrgapfill.validation.BiasSpread
     unit: "one bias per placed interval, not per row"
     single_site_analogue_of: "Table S8 cross-site IQR"
+    table: "TargetValidation.bias_spread_frame / ValidationReport.bias_spread_frame"
   nothing_scored_warning: rfrgapfill.validation.ValidationWarning   # ambiguity A4
   manifest: RunManifest.from_validation, one per target
   provenance: paper
@@ -350,7 +351,18 @@ metrics:
     returns: [measured_ebr, filled_ebr, difference]
     implementation: rfrgapfill.metrics.compare_energy_balance
     row_rule: "a row is used only where every component is present; both ratios share one row set"
-    zero_denominator: null
+    non_positive_denominator: null     # sum(NETRAD - G) <= 0 is undefined, not a closure
+    denominator_rule_applies_to: "the interval's sum, not each row"
+    reports_denominator: available_energy
+    row_accounting: [n, n_offered, n_missing_measured, n_missing_filled,
+                     n_missing_available_energy]
+    in_validation:
+      record: rfrgapfill.validation.EnergyBalanceCheck
+      offered_rows: "every withheld row (one mask, shared by H and LE)"
+      measured_flux: "genuine measurements only; a pre-filled value counts as missing"
+      by_gap_class: true               # when report_by_gap_class
+      table: ValidationReport.energy_balance_frame
+      in_manifests_of: [H, LE]
   provenance: paper
 
 reporting:
@@ -392,6 +404,28 @@ reporting:
     derived_from: reporting tables only
     dependency: matplotlib
     dependency_required: false        # optional extra, imported when drawing
+  uncertainty:
+    module: rfrgapfill.uncertainty
+    bias_iqr_across_sites:
+      implementation: rfrgapfill.uncertainty.bias_iqr
+      population: "one bias per site: that site's gap_length_table cell"
+      grouped_by: [target, method, mode, gap_class, subset, units, igbp]
+      igbp: "optional site metadata; pooled rows labelled all; unclassified sites pooled only"
+      columns: [target, method, mode, gap_class, subset, igbp, units, n_sites,
+                n_sites_offered, bias_q1, bias_median, bias_q3, bias_iqr]
+      quantile_interpolation: linear  # A11
+      iqr_needs_defined_values: 2
+      undefined_site_bias: skipped
+      rejects_repeated_cells: true
+    bias_iqr_within_site: "TargetValidation.bias_spread_frame (one bias per placed interval)"
+    published_normalized_ranges:
+      values: rfrgapfill.uncertainty.TABLE_S8_RANGES
+      source_table: "Supplementary Table S8 (mmc6.docx)"
+      gap_class: very_long
+      quantity: "bias IQR / joint flux-uncertainty CI"
+      status: experimental            # fixed, not a per-record setting (A8)
+      computed_by_package: false
+      in_published_benchmarks: false  # never reaches compare_to_benchmarks
   provenance: default
 
 data_assumptions:
@@ -501,9 +535,9 @@ known_ambiguities:
     default: "report achieved fraction against documented tolerance"
     config: [missing_fraction, tolerance]
   - id: A8
-    topic: "denominator of normalized joint-uncertainty ratio not reconstructed"
-    default: "bias IQR only; normalized ratios experimental"
-    config: experimental_module
+    topic: "denominator of normalized joint-uncertainty ratio not reconstructed; IQR population unstated"
+    default: "bias IQR across sites and across gaps; published ratios carried as experimental data, never computed"
+    config: rfrgapfill.uncertainty
   - id: A9
     topic: "hemisphere inference at the equator"
     default: "latitude >= 0 -> north; explicit hemisphere overrides"

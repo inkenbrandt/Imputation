@@ -440,8 +440,8 @@ they cost (`n` scored out of `n_offered`):
   bias denominator `n` counts the pairs that survived.
 
 An undefined metric is `None`, never `NaN` or zero: an empty subset has no RMSE,
-constant measurements have no R2 and no slope, and zero available energy has no
-EBR. `None` reaches a JSON manifest as `null` and cannot propagate silently
+constant measurements have no R2 and no slope, and available energy summing to
+zero or less has no EBR (section 6.4). `None` reaches a JSON manifest as `null` and cannot propagate silently
 through a later mean the way `NaN` does.
 
 **Which R2 (A12).** The article reports R2 beside a slope without saying which
@@ -466,7 +466,34 @@ substantially weaker (see `supplement_benchmarks.md`) and must stay visible.
 ### 6.3 Reporting by gap class
 
 Core metrics are additionally reported per gap class (24 h / 7 d / 30 d), together
-with bias IQR by gap class.
+with bias IQR by gap class. A bias IQR is a spread *over* something, and it is
+reported over two populations that are different quantities and never mixed:
+
+| Population | One value is | Where |
+|---|---|---|
+| Gaps within one site | the bias of one placed interval | `TargetValidation.bias_spread`, `bias_spread_frame()` |
+| Sites within a study | the bias of one site's cell of `gap_length_table` | `rfrgapfill.uncertainty.bias_iqr()` |
+
+The across-site IQR is the analogue of the Supplementary Table S8 numerator. That
+Table S8 spreads bias across sites rather than across gaps is an inference from
+the supplement's cross-site framing, not a statement in it (ambiguity A8).
+
+`bias_iqr()` groups by target, method, mode, gap class, day/night subset and
+units, and - when site metadata supplies it - by IGBP class. Rows pooling every
+ecosystem are labelled `igbp="all"` and are always present; a site without an
+IGBP class contributes to the pooled rows only. Quartiles use linear
+interpolation (A11), a site with an undefined bias is skipped rather than counted
+as zero, and an IQR needs two defined values, so one site or one gap reports
+quartiles without a spread.
+
+The **normalized** ratios of Table S8 - bias IQR divided by a flux confidence
+interval or by a joint flux-uncertainty confidence interval - are not computed by
+this package, because their denominator has not been reconstructed. The published
+very-long-gap ranges are carried as data, `rfrgapfill.uncertainty.TABLE_S8_RANGES`,
+every record fixed at status `experimental`, and they are kept out of
+`rfrgapfill.benchmarks` so `compare_to_benchmarks()` can never difference a run
+against them. A ratio implemented later must carry "experimental" in its name
+until it has been reproduced against Table S8.
 
 ### 6.4 Energy-balance ratio
 
@@ -485,8 +512,28 @@ numerator and denominator always cover exactly the same half hours — summing e
 over whatever it happened to have would divide the turbulent flux of one interval
 by the available energy of another. The measured and filled ratios share one row
 set for the same reason: otherwise their difference would report the change in
-interval as much as the change in flux. A zero denominator yields `None` rather
-than an arbitrarily large closure.
+interval as much as the change in flux.
+
+A denominator at or below zero yields `None`. At zero the ratio does not exist;
+below zero — a night-dominated interval, where the surface loses energy — it
+exists but reads backwards: more turbulent flux gives a *smaller* ratio, so the
+closure and the filled-minus-measured difference would both carry the wrong
+sign. The rule is on the interval's sum, not on each row, so night rows inside a
+positive interval count. The shared denominator is reported beside the ratios
+(`available_energy`), so an undefined ratio says why.
+
+In a validation run the check is `validation.EnergyBalanceCheck`, computed
+whenever H and LE are validated together: over every withheld row, and again
+within each gap class. Every withheld row is offered, and each comparison counts
+what the shared row set cost — rows lacking a measured H or LE
+(`n_missing_measured`: absent, or not a genuine measurement by its QC flag, since
+a pre-filled value is no more closure evidence than it is scoring truth), rows
+the model left unpredicted (`n_missing_filled`), and rows lacking NETRAD or G
+(`n_missing_available_energy`). A row missing two components counts under both.
+The check appears in `ValidationReport.energy_balance_check`, in
+`energy_balance_frame()` (one row per gap class plus `all`), in the run summary,
+and in the run manifests of the H and LE targets. NETRAD and G are read as given:
+like every driver, they may arrive pre-filled.
 
 ### 6.5 Reporting across runs and sites
 
@@ -632,7 +679,7 @@ described as reproducing the paper exactly.
 | A5 | Cross-validation details inside `GridSearchCV` (fold count, shuffling, temporal blocking) are unspecified. | Conventional `GridSearchCV` folds on the training portion; blocked/time-aware CV offered as a labelled enhancement. | `cv_strategy` |
 | A6 | Whether the historical `fluxlib` implementation computed daily target statistics leakage-safely is unverified. | Leakage-safe `paper_safe` mode is the default; a `legacy_fluxlib` mode is added only on implementation evidence. | `feature_mode` |
 | A7 | The achieved artificial-missing fraction cannot always hit exactly 25% given real gaps and series boundaries. | Report achieved fraction and class allocation against a documented tolerance. | `missing_fraction`, tolerance |
-| A8 | The denominator of the supplement's normalized joint-uncertainty ratio is not reconstructed. | Bias-IQR by gap class supported now; normalized ratios remain explicitly experimental. | experimental module |
+| A8 | The denominator of the supplement's normalized joint-uncertainty ratio is not reconstructed, and whether its bias IQR is taken across sites or across gaps is not stated. | Bias IQR reported over both populations (section 6.3), the across-site one as the Table S8 analogue. The published ratios are carried as data fixed at status `experimental`; no ratio is computed. | `rfrgapfill.uncertainty` |
 | A9 | Hemisphere inference for sites at or very near the equator. | `latitude >= 0 -> north`; an explicit `hemisphere` always overrides. | `hemisphere`, `latitude` |
 | A10 | Units of Table S3 NEE RMSE/bias (`g C m-2 d-1`) differ from the half-hourly model units (`umol m-2 s-1`); the aggregation from half-hourly residuals to daily carbon units is not spelled out. | Report metrics in model units by default; `compare_to_benchmarks` refuses a cell whose units differ, and `convert_nee_to_carbon_units` applies the rate conversion explicitly (section 6.5). | `rfrgapfill.benchmarks`, `units=` on `gap_length_table` |
 | A11 | The paper names the daily standard deviation but not its degrees-of-freedom convention, nor the quantile interpolation behind Q1/Q2/Q3. | Sample standard deviation (`ddof=1`, the pandas default) and linear quantile interpolation (the numpy/pandas default). | `daily_std_ddof` |

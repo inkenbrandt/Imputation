@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 
@@ -84,7 +84,9 @@ from rfrgapfill.schema import (
 from rfrgapfill.time import DuplicatePolicy, TimeAxis, as_datetime_index, prepare_time_index
 
 __all__ = [
+    "ENERGY_BALANCE_TABLE_COLUMNS",
     "BiasSpread",
+    "EnergyBalanceCheck",
     "TargetValidation",
     "ValidationError",
     "ValidationReport",
@@ -270,6 +272,96 @@ def _bias_spread(
 
 
 # ---------------------------------------------------------------------------
+# The energy-balance check (method_spec.md 6.4; Step 19)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EnergyBalanceCheck(FrozenRecord):
+    """The paper's independent energy-balance check, over the artificial gaps.
+
+    ``EBR = sum(H + LE) / sum(NETRAD - G)`` computed twice on the withheld rows -
+    once from the measured H and LE, once from the values the model put there -
+    over every withheld row and again within each gap class. A fill that
+    reproduces the fluxes should leave closure where the measurements had it, and
+    this is the one check that does not score the model against its own target.
+
+    Every withheld row is *offered*; a row enters both ratios only where the
+    measured H and LE, both predictions, NETRAD and G are all present, and each
+    :class:`~rfrgapfill.metrics.EnergyBalanceComparison` counts what each missing
+    component cost. A measured flux that arrived already gap-filled counts as
+    missing: it was never scored against, and it is not closure evidence either.
+    """
+
+    #: The target column playing H.
+    sensible_heat: str
+    #: The target column playing LE.
+    latent_heat: str
+    #: The comparison over every withheld row.
+    overall: EnergyBalanceComparison
+    #: The comparison within each gap class, when the run reports by gap class.
+    by_gap_class: Mapping[GapClass, EnergyBalanceComparison]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "by_gap_class", MappingProxyType(dict(self.by_gap_class)))
+
+    @property
+    def targets(self) -> tuple[str, str]:
+        """The ``(H, LE)`` target columns the check was computed from."""
+        return (self.sensible_heat, self.latent_heat)
+
+    def comparison(self, gap_class: GapClass | str | None = None) -> EnergyBalanceComparison:
+        """Return the comparison over every withheld row, or within one gap class."""
+        if gap_class is None:
+            return self.overall
+        wanted = GapClass.coerce(gap_class)
+        if wanted not in self.by_gap_class:
+            raise ValidationError(
+                f"no energy-balance check for gap class {wanted.value!r}: this run reported "
+                + (
+                    ", ".join(cls.value for cls in self.by_gap_class)
+                    or "no gap classes at all (report_by_gap_class=False)"
+                )
+            )
+        return self.by_gap_class[wanted]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable summary for the run manifest.
+
+        The overall comparison's fields sit at the top level, so a reader after
+        only ``measured_ebr`` and ``filled_ebr`` need not know about gap classes.
+        """
+        return {
+            "sensible_heat": self.sensible_heat,
+            "latent_heat": self.latent_heat,
+            **self.overall.to_dict(),
+            "by_gap_class": {
+                gap_class.value: comparison.to_dict()
+                for gap_class, comparison in self.by_gap_class.items()
+            },
+        }
+
+
+#: Column order of every ``energy_balance_frame``.
+ENERGY_BALANCE_TABLE_COLUMNS: tuple[str, ...] = (
+    "method",
+    "mode",
+    "sensible_heat",
+    "latent_heat",
+    "gap_class",
+    "n",
+    "n_offered",
+    "n_missing_measured",
+    "n_missing_filled",
+    "n_missing_available_energy",
+    "available_energy",
+    "measured_ebr",
+    "filled_ebr",
+    "difference",
+)
+
+
+# ---------------------------------------------------------------------------
 # One target's result
 # ---------------------------------------------------------------------------
 
@@ -312,6 +404,8 @@ class TargetValidation:
     column_map: ColumnMap
     #: The QC column separating measured values from pre-filled ones.
     qc_column: str | None = None
+    #: The run's energy-balance check, carried by its H and LE results only.
+    energy_balance_check: EnergyBalanceCheck | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
@@ -406,6 +500,16 @@ class TargetValidation:
         table: pd.DataFrame = pd.DataFrame(rows, columns=list(METRIC_TABLE_COLUMNS))
         return table
 
+    def bias_spread_frame(self) -> pd.DataFrame:
+        """Return the spread of per-gap bias for this target, one row per gap class.
+
+        The within-site bias IQR of section 6.3: over the individual intervals of
+        one class at this site, not over sites - that is
+        :func:`rfrgapfill.uncertainty.bias_iqr`. Empty when the run was configured
+        with ``bias_iqr_by_gap_class=False``.
+        """
+        return _bias_spread_frame(_bias_spread_rows(self))
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable summary for the run manifest."""
         return {
@@ -423,6 +527,9 @@ class TargetValidation:
             "bias_spread_by_gap_class": {
                 gap_class.value: spread.to_dict() for gap_class, spread in self.bias_spread.items()
             },
+            "energy_balance": (
+                None if self.energy_balance_check is None else self.energy_balance_check.to_dict()
+            ),
             "rows": self.features.to_dict(),
         }
 
@@ -484,6 +591,51 @@ METRIC_TABLE_COLUMNS: tuple[str, ...] = (
     "bias",
 )
 
+#: Column order of every ``bias_spread_frame``.
+BIAS_SPREAD_TABLE_COLUMNS: tuple[str, ...] = (
+    "target",
+    "method",
+    "mode",
+    "gap_class",
+    "n_gaps",
+    "n_gaps_offered",
+    "bias_q1",
+    "bias_median",
+    "bias_q3",
+    "bias_iqr",
+)
+
+
+def _bias_spread_rows(result: TargetValidation) -> list[dict[str, Any]]:
+    """Return one tidy row per gap class of ``result``'s bias spread."""
+    return [
+        {
+            "target": result.target,
+            "method": result.method,
+            "mode": result.config.rfr_mode.value,
+            "gap_class": gap_class.value,
+            "n_gaps": spread.n_gaps,
+            "n_gaps_offered": spread.n_gaps_offered,
+            "bias_q1": spread.q1,
+            "bias_median": spread.median,
+            "bias_q3": spread.q3,
+            "bias_iqr": spread.iqr,
+        }
+        for gap_class, spread in result.bias_spread.items()
+    ]
+
+
+def _bias_spread_frame(rows: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
+    """Return bias-spread rows as a frame whose quartile columns are always float."""
+    table: pd.DataFrame = pd.DataFrame(list(rows), columns=list(BIAS_SPREAD_TABLE_COLUMNS))
+    for column in ("bias_q1", "bias_median", "bias_q3", "bias_iqr"):
+        # A class with no scored gap gives a column of `None`, which would
+        # otherwise arrive as object dtype.
+        table[column] = pd.to_numeric(table[column], errors="coerce").astype("float64")
+    for column in ("n_gaps", "n_gaps_offered"):
+        table[column] = pd.to_numeric(table[column], errors="coerce").astype("Int64")
+    return table
+
 
 def _format_metrics(scores: CoreMetrics) -> str:
     """Render one :class:`CoreMetrics` as a fixed-width line."""
@@ -525,12 +677,17 @@ class ValidationReport:
     column_map: ColumnMap
     #: QC column per target, where one was supplied.
     qc_columns: Mapping[str, str]
-    #: Measured against filled energy-balance ratio, when H and LE were both run.
-    energy_balance: EnergyBalanceComparison | None = None
+    #: The energy-balance check of section 6.4, when H and LE were both run.
+    energy_balance_check: EnergyBalanceCheck | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "results", MappingProxyType(dict(self.results)))
         object.__setattr__(self, "qc_columns", MappingProxyType(dict(self.qc_columns)))
+
+    @property
+    def energy_balance(self) -> EnergyBalanceComparison | None:
+        """The measured-against-filled comparison over every withheld row, if checked."""
+        return None if self.energy_balance_check is None else self.energy_balance_check.overall
 
     # -- access --------------------------------------------------------------
 
@@ -578,6 +735,43 @@ class ValidationReport:
         table: pd.DataFrame = pd.concat(frames, ignore_index=True)
         return table
 
+    def bias_spread_frame(self) -> pd.DataFrame:
+        """Return the per-gap bias spread of every target of this run."""
+        return _bias_spread_frame(
+            [row for result in self.results.values() for row in _bias_spread_rows(result)]
+        )
+
+    def energy_balance_frame(self) -> pd.DataFrame:
+        """Return the energy-balance check as a table: ``all``, then each gap class.
+
+        Empty, with the same columns, when the run had no H/LE pair to check.
+        """
+        check = self.energy_balance_check
+        rows: list[dict[str, Any]] = []
+        if check is not None:
+            scopes = [("all", check.overall)] + [
+                (gap_class.value, comparison)
+                for gap_class, comparison in check.by_gap_class.items()
+            ]
+            rows = [
+                {
+                    "method": self.method,
+                    "mode": self.config.rfr_mode.value,
+                    "sensible_heat": check.sensible_heat,
+                    "latent_heat": check.latent_heat,
+                    "gap_class": label,
+                    **comparison.to_dict(),
+                }
+                for label, comparison in scopes
+            ]
+        table: pd.DataFrame = pd.DataFrame(rows, columns=list(ENERGY_BALANCE_TABLE_COLUMNS))
+        for column in ("available_energy", "measured_ebr", "filled_ebr", "difference"):
+            # An undefined ratio is `None`, which would otherwise arrive as object dtype.
+            table[column] = pd.to_numeric(table[column], errors="coerce").astype("float64")
+        for column in ("n", "n_offered", *(c for c in table.columns if c.startswith("n_missing"))):
+            table[column] = pd.to_numeric(table[column], errors="coerce").astype("Int64")
+        return table
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable summary of the whole run."""
         return {
@@ -589,7 +783,7 @@ class ValidationReport:
             "time_axis": self.time_axis.to_dict(),
             "results": {target: result.to_dict() for target, result in self.results.items()},
             "energy_balance": (
-                None if self.energy_balance is None else self.energy_balance.to_dict()
+                None if self.energy_balance_check is None else self.energy_balance_check.to_dict()
             ),
             "config": self.config.to_dict(),
         }
@@ -617,12 +811,22 @@ class ValidationReport:
             self.gaps.summary(),
         ]
         lines += [result.summary() for result in self.results.values()]
-        if self.energy_balance is not None:
-            balance = self.energy_balance
+        check = self.energy_balance_check
+        if check is not None:
+            scopes = [("all", check.overall)] + [
+                (gap_class.value, comparison)
+                for gap_class, comparison in check.by_gap_class.items()
+            ]
             lines.append(
-                f"EBR over {balance.n} scored row(s): measured={_show(balance.measured)} "
-                f"filled={_show(balance.filled)} difference={_show(balance.difference)}"
+                f"Energy balance of {check.sensible_heat} + {check.latent_heat} "
+                "over the withheld rows (method_spec.md 6.4):"
             )
+            lines += [
+                f"  EBR {label:<10} {balance.n} of {balance.n_offered} row(s): "
+                f"measured={_show(balance.measured)} filled={_show(balance.filled)} "
+                f"difference={_show(balance.difference)}"
+                for label, balance in scopes
+            ]
         return "\n".join(lines)
 
 
@@ -801,11 +1005,20 @@ def validate_rfr(
         _warn_on_unscored(result)
         results[target] = result
 
-    balance = (
-        None
-        if balance_pair is None
-        else _energy_balance(results, pair=balance_pair, frame=frame, columns=columns)
-    )
+    check: EnergyBalanceCheck | None = None
+    if balance_pair is not None:
+        check = _energy_balance(
+            results,
+            pair=balance_pair,
+            frame=frame,
+            columns=columns,
+            labels=labels,
+            by_gap_class=settings.report_by_gap_class,
+        )
+        # A manifest is written per target, so the one result H and LE share is
+        # attached to both - otherwise it would be in neither manifest.
+        for name in balance_pair:
+            results[name] = replace(results[name], energy_balance_check=check)
     return ValidationReport(
         config=config,
         gaps=manifest,
@@ -813,7 +1026,7 @@ def validate_rfr(
         results=results,
         column_map=columns,
         qc_columns=qc_map,
-        energy_balance=balance,
+        energy_balance_check=check,
     )
 
 
@@ -1060,20 +1273,51 @@ def _energy_balance(
     pair: tuple[str, str],
     frame: pd.DataFrame,
     columns: ColumnMap,
-) -> EnergyBalanceComparison:
-    """Return the measured-against-filled energy-balance comparison (section 6.4).
+    labels: pd.Series,
+    by_gap_class: bool,
+) -> EnergyBalanceCheck:
+    """Return the measured-against-filled energy-balance check (section 6.4; Step 19).
 
-    Scored over the rows both fluxes were withheld *and* measured at, so the two
-    ratios describe the same half hours and their difference is the effect of the
-    fill rather than of a different row set.
+    Every withheld row is offered, and
+    :func:`~rfrgapfill.metrics.compare_energy_balance` keeps only the rows where
+    all six components are present, so the two ratios describe the same half
+    hours and their difference is the effect of the fill rather than of a
+    different row set. What it drops it counts, by component.
+
+    A measured value must be a *genuine* one: a withheld value that arrived
+    pre-filled is never scored against, and is no more closure evidence than it
+    is scoring truth, so it enters as missing.
     """
     heat, latent = (results[name] for name in pair)
-    rows = (heat.features.scoring_mask & latent.features.scoring_mask).to_numpy()
-    return compare_energy_balance(
-        measured_sensible_heat=heat.features.truth.loc[rows],
-        measured_latent_heat=latent.features.truth.loc[rows],
-        filled_sensible_heat=heat.predictions.loc[rows],
-        filled_latent_heat=latent.predictions.loc[rows],
-        net_radiation=frame[columns.column(NET_RADIATION)].loc[rows],
-        soil_heat_flux=frame[columns.column(SOIL_HEAT_FLUX)].loc[rows],
+    # One mask for every target (section 4.4); intersected only so a mismatch
+    # could never offer a row one of the fluxes was not withheld at.
+    withheld = (heat.features.holdout_mask & latent.features.holdout_mask).to_numpy()
+    measured_heat = heat.features.truth.where(heat.features.scoring_mask)
+    measured_latent = latent.features.truth.where(latent.features.scoring_mask)
+    radiation = frame[columns.column(NET_RADIATION)]
+    soil = frame[columns.column(SOIL_HEAT_FLUX)]
+
+    def compare(rows: np.ndarray) -> EnergyBalanceComparison:
+        return compare_energy_balance(
+            measured_sensible_heat=measured_heat.loc[rows],
+            measured_latent_heat=measured_latent.loc[rows],
+            filled_sensible_heat=heat.predictions.loc[rows],
+            filled_latent_heat=latent.predictions.loc[rows],
+            net_radiation=radiation.loc[rows],
+            soil_heat_flux=soil.loc[rows],
+        )
+
+    classes = (
+        {
+            gap_class: compare(withheld & (labels == gap_class.value).to_numpy())
+            for gap_class in GapClass
+        }
+        if by_gap_class
+        else {}
+    )
+    return EnergyBalanceCheck(
+        sensible_heat=pair[0],
+        latent_heat=pair[1],
+        overall=compare(withheld),
+        by_gap_class=classes,
     )

@@ -31,8 +31,8 @@ Undefined is ``None``, not ``NaN``
 ----------------------------------
 
 An empty subset has no ``RMSE``; a subset whose measurements are all identical
-has no ``R2`` and no slope; an interval whose available energy sums to zero has
-no ``EBR``. Every such case returns ``None``. That keeps an undefined metric
+has no ``R2`` and no slope; an interval whose available energy sums to zero or
+less has no ``EBR``. Every such case returns ``None``. That keeps an undefined metric
 distinguishable from a computed one, survives the trip into a JSON run manifest
 as ``null``, and refuses to propagate silently the way ``NaN`` does through a
 later mean or comparison.
@@ -430,9 +430,12 @@ def _ebr(
     if sensible_heat.size == 0:
         return None
     available_energy = float((net_radiation - soil_heat_flux).sum())
-    if available_energy == 0.0:
-        # No available energy over this interval: the ratio has no value, and
-        # dividing anyway would report an arbitrarily large closure.
+    if not available_energy > 0.0:
+        # No net energy input over this interval. At zero the ratio does not
+        # exist. Below zero - an interval dominated by night, when the surface
+        # loses energy - it exists but reads backwards: more turbulent flux gives
+        # a *smaller* ratio, so a closure, and what a fill did to it, would both
+        # be reported with the wrong sign. Neither is a closure.
         return None
     turbulent_flux = float((sensible_heat + latent_heat).sum())
     return _defined(turbulent_flux / available_energy)
@@ -462,7 +465,10 @@ def energy_balance_ratio(
     of half hours against the available energy of another.
 
     Returns ``None`` when no row is complete, and when the available energy sums
-    to zero - which a short interval can do by cancellation between night and day.
+    to zero or less. Zero a short interval can reach by cancellation between night
+    and day; below zero - a night-dominated interval - the ratio would read
+    backwards, falling as the turbulent flux rises. The rule applies to the
+    interval's sum, so a night row inside a positive interval still counts.
     """
     rows = _complete(
         *_aligned(
@@ -475,6 +481,14 @@ def energy_balance_ratio(
     return _ebr(*rows)
 
 
+def _count_incomplete(*arrays: np.ndarray[Any, Any]) -> int:
+    """Return how many rows lack a finite value in at least one of ``arrays``."""
+    present = np.ones(arrays[0].size, dtype=bool)
+    for array in arrays:
+        present &= np.isfinite(array)
+    return int((~present).sum())
+
+
 @dataclass(frozen=True)
 class EnergyBalanceComparison(FrozenRecord):
     """Measured against filled energy-balance ratio, over the same rows.
@@ -483,6 +497,11 @@ class EnergyBalanceComparison(FrozenRecord):
     measured H and LE, the ratio from the filled H and LE, and their difference.
     Both are computed over one shared set of rows, so :attr:`difference` reports
     what the fill did to closure and not what a different row set would have done.
+
+    The row accounting says what that shared row set cost: :attr:`n` rows were
+    complete out of :attr:`n_offered`, and each ``n_missing_*`` counts the offered
+    rows lacking that component. A row missing two components is counted under
+    both, so the three counts can sum to more than the rows dropped - never less.
     """
 
     #: Rows both ratios were computed from.
@@ -495,17 +514,57 @@ class EnergyBalanceComparison(FrozenRecord):
     filled: float | None
     #: ``filled - measured``, or ``None`` unless both are defined.
     difference: float | None
+    #: ``sum(NETRAD - G)`` over the :attr:`n` rows: the denominator both ratios
+    #: share, or ``None`` when no row is complete. At or below zero both ratios
+    #: are undefined, and this is the value that says why.
+    available_energy: float | None = None
+    #: Offered rows lacking a measured H or LE.
+    n_missing_measured: int = 0
+    #: Offered rows lacking a filled H or LE: rows the model left unpredicted.
+    n_missing_filled: int = 0
+    #: Offered rows lacking NETRAD or G.
+    n_missing_available_energy: int = 0
+
+    def __post_init__(self) -> None:
+        missing = (self.n_missing_measured, self.n_missing_filled, self.n_missing_available_energy)
+        if min(self.n, self.n_offered, *missing) < 0:
+            raise MetricError("row counts cannot be negative")
+        if self.n > self.n_offered:
+            raise MetricError(
+                f"compared {self.n} row(s) out of {self.n_offered} offered; "
+                "dropping incomplete rows cannot increase the count"
+            )
+        dropped = self.n_offered - self.n
+        if max(missing) > dropped:
+            raise MetricError(
+                f"a component is reported missing from {max(missing)} row(s), more rows than "
+                f"the {dropped} dropped; a row missing any component is never compared"
+            )
+        if dropped > sum(missing):
+            raise MetricError(
+                f"{dropped - sum(missing)} dropped row(s) are unexplained: every dropped row "
+                "must be missing at least one component"
+            )
 
     @property
     def is_empty(self) -> bool:
         """Whether no complete row was available."""
         return self.n == 0
 
+    @property
+    def dropped_incomplete(self) -> int:
+        """Offered rows that lacked at least one component."""
+        return self.n_offered - self.n
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable summary for the run manifest."""
         return {
             "n": self.n,
             "n_offered": self.n_offered,
+            "n_missing_measured": self.n_missing_measured,
+            "n_missing_filled": self.n_missing_filled,
+            "n_missing_available_energy": self.n_missing_available_energy,
+            "available_energy": self.available_energy,
             "measured_ebr": self.measured,
             "filled_ebr": self.filled,
             "difference": self.difference,
@@ -532,7 +591,9 @@ def compare_energy_balance(
     which is the one thing this comparison exists to rule out.
 
     Returns ``None`` for either ratio where it is undefined, and for
-    :attr:`~EnergyBalanceComparison.difference` unless both are defined.
+    :attr:`~EnergyBalanceComparison.difference` unless both are defined. The
+    shared denominator and the per-component row accounting are reported either
+    way, so an undefined or thinly supported comparison says why.
     """
     offered = _aligned(
         measured_sensible_heat=measured_sensible_heat,
@@ -556,4 +617,8 @@ def compare_energy_balance(
         measured=measured_ratio,
         filled=filled_ratio,
         difference=difference,
+        available_energy=float((radiation - soil).sum()) if radiation.size else None,
+        n_missing_measured=_count_incomplete(offered[0], offered[1]),
+        n_missing_filled=_count_incomplete(offered[2], offered[3]),
+        n_missing_available_energy=_count_incomplete(offered[4], offered[5]),
     )

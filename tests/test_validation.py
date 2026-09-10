@@ -29,13 +29,15 @@ import pytest
 
 from rfrgapfill.config import FeatureConfig, MetricSubset, RFRConfig, ValidationConfig
 from rfrgapfill.gaps import GapManifest
-from rfrgapfill.metrics import core_metrics
+from rfrgapfill.metrics import compare_energy_balance, core_metrics
 from rfrgapfill.provenance import RunManifest
-from rfrgapfill.schema import ColumnMap, ConfigError, GapClass
-from rfrgapfill.synthetic import TARGETS, synthetic_site
+from rfrgapfill.schema import NET_RADIATION, SOIL_HEAT_FLUX, ColumnMap, ConfigError, GapClass
+from rfrgapfill.synthetic import PRE_FILLED_QC, TARGETS, synthetic_site
 from rfrgapfill.validation import (
+    ENERGY_BALANCE_TABLE_COLUMNS,
     METRIC_TABLE_COLUMNS,
     BiasSpread,
+    EnergyBalanceCheck,
     ValidationError,
     ValidationReport,
     ValidationWarning,
@@ -383,9 +385,28 @@ class TestReportingSurfaces:
         assert frame.index.equals(site.index)
 
 
+def _drivers(site, report: ValidationReport) -> pd.DataFrame:
+    """NETRAD and G as the run read them; the site frame is on the run's time axis."""
+    columns = report.column_map
+    return site.frame[[columns.column(NET_RADIATION), columns.column(SOIL_HEAT_FLUX)]]
+
+
+def _complete_ebr_rows(site, report: ValidationReport) -> pd.Series:
+    """Rows carrying every component of the energy-balance check."""
+    heat, latent = report["H"], report["LE"]
+    complete: pd.Series = (
+        heat.features.scoring_mask
+        & latent.features.scoring_mask
+        & heat.predictions.notna()
+        & latent.predictions.notna()
+        & _drivers(site, report).notna().all(axis=1)
+    )
+    return complete
+
+
 @pytest.mark.slow
 class TestEnergyBalance:
-    """Section 6.4's independent check, over the artificial-gap rows."""
+    """Section 6.4's independent check, over the artificial-gap rows (Step 19)."""
 
     def test_measured_and_filled_ratios_share_one_row_set(self, report):
         balance = report.energy_balance
@@ -398,6 +419,88 @@ class TestEnergyBalance:
             arms["RFR10"].energy_balance.measured
         )
 
+    def test_every_withheld_row_is_offered(self, report):
+        check = report.energy_balance_check
+        assert isinstance(check, EnergyBalanceCheck)
+        assert check.targets == ("H", "LE")
+        assert check.overall.n_offered == report["H"].withheld_rows
+
+    def test_the_ratios_are_the_formula_over_this_runs_own_rows(self, site, report):
+        heat, latent = report["H"], report["LE"]
+        rows = _complete_ebr_rows(site, report).to_numpy()
+        netrad = site.frame[report.column_map.column(NET_RADIATION)].to_numpy()[rows]
+        soil = site.frame[report.column_map.column(SOIL_HEAT_FLUX)].to_numpy()[rows]
+        available = (netrad - soil).sum()
+        measured = (heat.features.truth.to_numpy() + latent.features.truth.to_numpy())[rows]
+        filled = (heat.predictions.to_numpy() + latent.predictions.to_numpy())[rows]
+
+        overall = report.energy_balance_check.overall
+        assert overall.n == int(rows.sum())
+        assert overall.available_energy == pytest.approx(available)
+        assert overall.measured == pytest.approx(measured.sum() / available)
+        assert overall.filled == pytest.approx(filled.sum() / available)
+
+    def test_the_accounting_explains_every_dropped_row(self, site, report):
+        heat, latent = report["H"], report["LE"]
+        withheld = heat.features.holdout_mask
+        genuine = heat.features.scoring_mask & latent.features.scoring_mask
+        unpredicted = heat.predictions.isna() | latent.predictions.isna()
+        drivers = _drivers(site, report)
+        no_energy = drivers.isna().any(axis=1)
+
+        overall = report.energy_balance_check.overall
+        assert overall.n_missing_measured == int((withheld & ~genuine).sum())
+        assert overall.n_missing_filled == int((withheld & unpredicted).sum())
+        assert overall.n_missing_available_energy == int((withheld & no_energy).sum())
+        assert overall.dropped_incomplete == int(
+            (withheld & ~_complete_ebr_rows(site, report)).sum()
+        )
+
+    def test_each_gap_class_is_checked_and_the_classes_partition_the_run(self, report):
+        check = report.energy_balance_check
+        assert set(check.by_gap_class) == set(GapClass)
+        assert sum(item.n for item in check.by_gap_class.values()) == check.overall.n
+        assert (
+            sum(item.n_offered for item in check.by_gap_class.values()) == check.overall.n_offered
+        )
+        labels = gap_class_labels(report.gaps, report.time_axis.index)
+        for gap_class, item in check.by_gap_class.items():
+            assert item.n_offered == int((labels == gap_class.value).sum())
+            assert item.n > 0
+            assert item.measured is not None and item.filled is not None
+            assert item.difference == pytest.approx(item.filled - item.measured)
+
+    def test_an_unchecked_gap_class_is_named(self, report):
+        with pytest.raises(ConfigError):
+            report.energy_balance_check.comparison("fortnight")
+
+    def test_the_h_and_le_manifests_carry_the_check_and_nee_does_not(self, report):
+        for target in ("H", "LE"):
+            document = json.loads(json.dumps(report.manifest(target).to_dict()))
+            balance = document["metrics"]["energy_balance"]
+            assert (balance["sensible_heat"], balance["latent_heat"]) == ("H", "LE")
+            assert balance["measured_ebr"] == pytest.approx(report.energy_balance.measured)
+            assert balance["filled_ebr"] == pytest.approx(report.energy_balance.filled)
+            assert set(balance["by_gap_class"]) == {gap_class.value for gap_class in GapClass}
+        assert report["NEE"].to_dict()["energy_balance"] is None
+        assert report["NEE"].energy_balance_check is None
+
+    def test_the_energy_balance_table_has_the_run_and_each_class(self, report):
+        table = report.energy_balance_frame()
+        assert tuple(table.columns) == ENERGY_BALANCE_TABLE_COLUMNS
+        assert list(table["gap_class"]) == ["all"] + [gap_class.value for gap_class in GapClass]
+        assert set(table["method"]) == {"RFR3"}
+        long = report.energy_balance_check.comparison("long")
+        row = table.set_index("gap_class").loc["long"]
+        assert row["n"] == long.n
+        assert row["filled_ebr"] == pytest.approx(long.filled)
+        assert table["measured_ebr"].dtype == np.float64
+
+    def test_the_summary_reports_the_run_and_each_class(self, report):
+        lines = [line for line in report.summary().splitlines() if "EBR" in line]
+        assert len(lines) == 1 + len(GapClass)
+        assert all("measured=" in line and "filled=" in line for line in lines)
+
     def test_a_run_without_both_fluxes_reports_no_ratio(self, site, gaps):
         run = validate_rfr(
             site.frame,
@@ -407,7 +510,89 @@ class TestEnergyBalance:
             gaps=gaps,
         )
         assert run.energy_balance is None
+        assert run.energy_balance_check is None
+        assert run.energy_balance_frame().empty
+        assert tuple(run.energy_balance_frame().columns) == ENERGY_BALANCE_TABLE_COLUMNS
         assert run.targets == ("NEE",)
+
+    def test_pre_filled_fluxes_and_missing_radiation_are_counted_not_used(self, site, gaps, report):
+        """Step 19's missing-data handling, on rows that were complete before.
+
+        Six withheld H values are re-flagged as pre-filled and four withheld NETRAD
+        values removed. The RFR3 driver set does not read NETRAD, and withheld
+        rows are never trained on, so the forests are unchanged and exactly those
+        ten rows leave both ratios - each counted under what it lost.
+        """
+        short = next(gap for gap in gaps if gap.gap_class is GapClass.SHORT)
+        index = site.frame.index
+        inside = pd.Series((index >= short.start) & (index < short.end), index=index)
+        candidates = index[(inside & _complete_ebr_rows(site, report)).to_numpy()]
+        pre_filled, no_radiation = candidates[:6], candidates[6:10]
+
+        frame = site.frame.copy()
+        frame.loc[pre_filled, site.qc_column("H")] = PRE_FILLED_QC
+        frame.loc[no_radiation, report.column_map.column(NET_RADIATION)] = np.nan
+        run = validate_rfr(
+            frame,
+            config=_config(site, "RFR3"),
+            targets=["H", "LE"],
+            qc_columns={"H": "H_QC", "LE": "LE_QC"},
+            gaps=gaps,
+        )
+
+        before = report.energy_balance_check
+        after = run.energy_balance_check
+        for scope in (None, GapClass.SHORT):
+            old, new = before.comparison(scope), after.comparison(scope)
+            assert new.n_offered == old.n_offered
+            assert new.n == old.n - 10
+            assert new.n_missing_measured == old.n_missing_measured + 6
+            assert new.n_missing_available_energy == old.n_missing_available_energy + 4
+            assert new.n_missing_filled == old.n_missing_filled
+        # The other classes' rows were not touched, and nor were the forests.
+        for gap_class in (GapClass.LONG, GapClass.VERY_LONG):
+            assert after.comparison(gap_class) == before.comparison(gap_class)
+
+
+class TestEnergyBalanceCheckRecord:
+    """The record itself, without a run behind it."""
+
+    @staticmethod
+    def _check(by_gap_class=None) -> EnergyBalanceCheck:
+        comparison = compare_energy_balance(
+            measured_sensible_heat=[30.0, 50.0],
+            measured_latent_heat=[20.0, 30.0],
+            filled_sensible_heat=[35.0, 45.0],
+            filled_latent_heat=[20.0, 30.0],
+            net_radiation=[100.0, 150.0],
+            soil_heat_flux=[10.0, 20.0],
+        )
+        return EnergyBalanceCheck(
+            sensible_heat="H",
+            latent_heat="LE",
+            overall=comparison,
+            by_gap_class={GapClass.SHORT: comparison} if by_gap_class is None else by_gap_class,
+        )
+
+    def test_its_mapping_is_read_only(self):
+        with pytest.raises(TypeError):
+            self._check().by_gap_class[GapClass.LONG] = None  # type: ignore[index]
+
+    def test_it_survives_a_pickle_round_trip(self):
+        import pickle
+
+        check = self._check()
+        assert pickle.loads(pickle.dumps(check)) == check
+
+    def test_a_run_without_gap_classes_says_so(self):
+        with pytest.raises(ValidationError, match="report_by_gap_class=False"):
+            self._check(by_gap_class={}).comparison("short")
+
+    def test_its_document_keeps_the_overall_ratios_at_the_top(self):
+        document = json.loads(json.dumps(self._check().to_dict()))
+        assert document["measured_ebr"] == pytest.approx(130.0 / 220.0)
+        assert document["available_energy"] == pytest.approx(220.0)
+        assert set(document["by_gap_class"]) == {"short"}
 
 
 # ---------------------------------------------------------------------------

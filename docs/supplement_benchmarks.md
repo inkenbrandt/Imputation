@@ -34,6 +34,12 @@ metric. It asserts nothing: a cell whose units differ from the published units i
 marked not comparable rather than differenced (ambiguity A10), and no function in
 that module turns a benchmark into a pass/fail threshold.
 
+Section 7's Table S8 ranges are carried separately, as
+`rfrgapfill.uncertainty.TABLE_S8_RANGES`, and `tests/test_uncertainty.py`
+re-reads this document to check them in the same way. They are deliberately
+**not** in `PUBLISHED_BENCHMARKS`: the package cannot compute the quantity they
+describe (section 7), so there is nothing a run could be compared against.
+
 ---
 
 ## 1. Source map
@@ -206,11 +212,19 @@ RFR.
 
 **Implementation position:**
 
-- bias IQR **by gap class** is a supported core output now;
+- bias IQR **by gap class** is a supported core output: across sites, stratified
+  by IGBP class where site metadata is available, by
+  `rfrgapfill.uncertainty.bias_iqr()`; across the gaps of one site by
+  `TargetValidation.bias_spread_frame()` (`method_spec.md` §6.3). Treating the
+  published IQR as a spread across sites is an inference, not a statement in
+  the supplement;
 - the normalized ratios above depend on a denominator (flux CI and joint
   flux-uncertainty CI) that has **not** been reconstructed from the supplementary
-  methods. Exact reproduction of these ratios must not be claimed. They belong to
-  an optional research module explicitly marked experimental (ambiguity A8).
+  methods. Exact reproduction of these ratios must not be claimed. The package
+  does not compute them; the ranges are carried in
+  `rfrgapfill.uncertainty.TABLE_S8_RANGES` with a fixed `experimental` status and
+  a caveat on every row (ambiguity A8). Any later implementation must carry
+  "experimental" in its name until it has been reproduced against Table S8.
 
 ---
 
