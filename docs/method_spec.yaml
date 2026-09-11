@@ -196,11 +196,7 @@ leakage_policy:
       mask_before_feature_computation: true
       daily_statistics_use_visible_observations_only: true
       held_out_truth_in_features: forbidden
-      # A4/A4a: what a day with too few visible observations gets instead. Both
-      # options read only visible observations, so neither can leak.
-      empty_day_statistics: nearest_visible_day
-      empty_day_statistics_options: [nearest_visible_day, within_day]
-      min_daily_observations: 2
+      empty_day_statistics: missing
     legacy_fluxlib:
       status: implemented              # Step 20, on implementation evidence
       evidence: docs/fluxlib_audit.md
@@ -554,8 +550,6 @@ reproducibility:
     - time_resolution
     - hemisphere_or_latitude
     - qc_rules
-    - daily_statistics_strategy
-    - achieved_gap_fraction_and_mix
   manifest_format: [json, yaml]
   module: rfrgapfill.provenance
   implementation: rfrgapfill.provenance.RunManifest
@@ -587,13 +581,10 @@ known_ambiguities:
     achieved_mix_reported_on_both_bases: true
     config: allocation_basis
   - id: A4
-    topic: "daily target statistics when a whole day or longer has no visible observations"
-    default: "nearest_visible_day: take the closest qualifying day's statistics, ties to the earlier day"
-    config: [daily_statistics_strategy, min_daily_observations]
-  - id: A4a
-    topic: "a strictly leakage-safe reading makes gaps longer than a day unpredictable, which the paper's 7- and 30-day results rule out"
-    default: "documented leakage-safe fallback by default; the strict within_day reading offered and its cost measurable"
-    config: daily_statistics_strategy
+    topic: "daily target statistics when a whole day or longer has too few visible observations"
+    default: "missing: leave missing; exclude from training, flag at prediction"
+    alternatives: [within_day_available, neighbor_day_fallback, rolling_available]
+    config: [daily_statistic_strategy, min_daily_observations, fallback_window_days]
   - id: A5
     topic: "cross-validation details inside GridSearchCV"
     default: "conventional GridSearchCV folds on training portion"
