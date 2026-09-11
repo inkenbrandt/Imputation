@@ -1,449 +1,766 @@
-"""End-to-end artificial-gap validation tests. Covers acceptance tests 34-35 and 40.
+"""End-to-end artificial-gap validation. Covers Steps 13 and 17, acceptance 34-35.
 
-The exit criterion for the orchestration step is that one call runs the whole
-Zhu-style experiment transparently, so most of these tests assert on the shape
-and the provenance of what comes back rather than on any particular metric
-value: the synthetic site is not the paper's, and its numbers are not the
-paper's either.
+Step 17 asks for one thing that no unit test can give: both published
+configurations, run whole, on data with known structure, reporting R2, slope,
+RMSE, bias, day/night, metrics by gap class and the gap manifest - and leaving
+the observed values exactly as they were. The ``arms`` fixture is that run, done
+once for RFR3 and once for RFR10 over the same fixed intervals, and most of this
+module reads its output rather than producing more of it.
 
-The exceptions are the two that must hold for the run to mean anything at all -
-that the gaps are contiguous 24-hour, 7-day and 30-day intervals rather than a
-random row-wise holdout, and that no held-out truth reached the features built
-to predict it.
+The forests are deliberately tiny (15 trees, 3 folds, a one-point grid): nothing
+here tests predictive quality, and Step 17 explicitly refuses to require RFR10 to
+beat RFR3 on any individual metric. What is asserted is that the workflow runs,
+that it is deterministic, that the numbers it reports are the ones its own
+predictions imply, and that nothing it did touched a measurement.
 
-See ``docs/method_spec.md`` for the contract and
-``docs/supplement_benchmarks.md`` for benchmark provenance.
+The intervals come from :meth:`SyntheticSite.known_gaps` rather than from the
+sampler, so a change in placement cannot move a metric here; the sampled
+generator gets its own test.
 """
 
 from __future__ import annotations
 
 import json
+import warnings
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from fixtures import synthetic_site
-from rfrgapfill.config import (
-    ColumnMap,
-    FeatureConfig,
-    GapClass,
-    GapScenarioConfig,
-    RFRConfig,
-    ValidationConfig,
-)
-from rfrgapfill.schema import ConfigError
+from rfrgapfill.config import FeatureConfig, MetricSubset, RFRConfig, ValidationConfig
+from rfrgapfill.gaps import GapManifest
+from rfrgapfill.metrics import compare_energy_balance, core_metrics
+from rfrgapfill.provenance import RunManifest
+from rfrgapfill.schema import NET_RADIATION, SOIL_HEAT_FLUX, ColumnMap, ConfigError, GapClass
+from rfrgapfill.synthetic import PRE_FILLED_QC, TARGETS, synthetic_site
 from rfrgapfill.validation import (
-    SCENARIOS,
+    ENERGY_BALANCE_TABLE_COLUMNS,
+    METRIC_TABLE_COLUMNS,
+    BiasSpread,
+    EnergyBalanceCheck,
     ValidationError,
     ValidationReport,
-    compare_receptive_limiter,
+    ValidationWarning,
+    daytime_mask,
+    gap_class_labels,
+    subset_masks,
     validate_rfr,
 )
 
-pytestmark = pytest.mark.slow
+DAYTIME_THRESHOLD = 20.0
 
-#: Small enough to fit repeatedly, large enough to be a real search.
-FAST_GRID = {"n_estimators": (30,), "min_samples_leaf": (1, 5)}
+#: One grid point and three folds. This module scores nothing for quality.
+TEST_GRID = {"n_estimators": (15,)}
 
-QC_COLUMNS = {"NEE": "NEE_QC", "H": "H_QC", "LE": "LE_QC"}
-
-
-def config(mode: str = "RFR10", **changes: object) -> RFRConfig:
-    settings: dict[str, object] = {
-        "mode": mode,
-        "frequency": "30min",
-        "latitude": 51.5,
-        "site_id": "SYN-01",
-        "column_map": ColumnMap.fluxnet2015("RFR10"),
-        "hyperparameter_grid": FAST_GRID,
-        "cv_folds": 3,
-    }
-    settings.update(changes)
-    return RFRConfig(**settings)  # type: ignore[arg-type]
-
-
-@pytest.fixture(scope="module")
-def site() -> pd.DataFrame:
-    # Long enough to carry two 30-day gaps and the shorter classes around them.
-    return synthetic_site(days=400, seed=0)
-
-
-@pytest.fixture(scope="module")
-def report(site: pd.DataFrame) -> ValidationReport:
-    return validate_rfr(site, targets=["NEE", "H", "LE"], config=config(), qc_columns=QC_COLUMNS)
+#: The reaching strategy a long-gap run has to choose deliberately (A4): under
+#: the default, a 7-day gap has no daily statistics and nothing in it is scored.
+REACHING = FeatureConfig(daily_statistic_strategy="rolling_available")
 
 
 # ---------------------------------------------------------------------------
-# One call runs the whole experiment (acceptance tests 34-35)
+# Fixtures
 # ---------------------------------------------------------------------------
 
 
-def test_one_call_returns_predictions_metrics_manifest_and_configuration(
-    report: ValidationReport,
-) -> None:
-    assert report.targets == ("NEE", "H", "LE")
-    assert not report.predictions().empty
-    assert not report.metrics_frame().empty
-    assert not report.gap_manifest.empty
-    assert report.config.rfr_mode.value == "RFR10"
+@pytest.fixture(scope="module")
+def site():
+    """The reference synthetic site: one year of half-hourly data, seeded."""
+    return synthetic_site()
 
 
-def test_all_three_gap_classes_are_exercised_and_reported(report: ValidationReport) -> None:
-    classes = set(report.gap_manifest["gap_class"])
-    assert classes == {"short", "long", "very_long"}
+@pytest.fixture(scope="module")
+def gaps(site) -> GapManifest:
+    """The fixed 30-day / 7-day / 24-hour intervals, shared by every arm."""
+    return site.known_gaps()
 
-    for target in report.targets:
-        assert set(report[target].by_gap_class) == {
-            GapClass.SHORT,
-            GapClass.LONG,
-            GapClass.VERY_LONG,
+
+def _config(site, mode: str) -> RFRConfig:
+    """Return a fast validation configuration for one arm of the Step 17 run."""
+    return site.config(
+        mode,
+        hyperparameter_grid=TEST_GRID,
+        cv_folds=3,
+        features=REACHING,
+    )
+
+
+def _run(site, gaps: GapManifest, mode: str) -> ValidationReport:
+    """Validate all three fluxes on the fixed intervals under one driver set."""
+    return validate_rfr(
+        site.frame,
+        config=_config(site, mode),
+        targets=list(TARGETS),
+        qc_columns=dict(site.qc_columns()),
+        gaps=gaps,
+    )
+
+
+@pytest.fixture(scope="module")
+def arms(site, gaps) -> dict[str, ValidationReport]:
+    """Step 17 itself: RFR3 and RFR10, run end to end over identical gaps."""
+    return {"RFR3": _run(site, gaps, "RFR3"), "RFR10": _run(site, gaps, "RFR10")}
+
+
+@pytest.fixture(scope="module")
+def report(arms) -> ValidationReport:
+    """The RFR3 arm, for assertions that do not care which arm produced them."""
+    return arms["RFR3"]
+
+
+# ---------------------------------------------------------------------------
+# Row selections
+# ---------------------------------------------------------------------------
+
+
+class TestSubsets:
+    """The day/night split of Step 12 and method_spec.md section 6.2."""
+
+    def test_boundary_value_is_night(self):
+        radiation = pd.Series(
+            [19.9, 20.0, 20.1], index=pd.date_range("2020-06-01", periods=3, freq="30min")
+        )
+        masks = subset_masks(radiation, threshold=DAYTIME_THRESHOLD)
+        assert list(masks[MetricSubset.DAYTIME]) == [False, False, True]
+        assert list(masks[MetricSubset.NIGHTTIME]) == [True, True, False]
+
+    def test_threshold_is_configurable(self):
+        radiation = pd.Series([5.0, 15.0], index=pd.date_range("2020-06-01", periods=2, freq="h"))
+        assert list(daytime_mask(radiation, threshold=10.0)) == [False, True]
+        assert list(daytime_mask(radiation, threshold=DAYTIME_THRESHOLD)) == [False, False]
+
+    def test_missing_radiation_is_neither_day_nor_night(self):
+        radiation = pd.Series(
+            [np.nan, 100.0], index=pd.date_range("2020-06-01", periods=2, freq="h")
+        )
+        masks = subset_masks(radiation)
+        assert list(masks[MetricSubset.ALL]) == [True, True]
+        assert list(masks[MetricSubset.DAYTIME]) == [False, True]
+        assert list(masks[MetricSubset.NIGHTTIME]) == [False, False]
+
+    def test_day_and_night_partition_the_known_rows(self, site):
+        masks = subset_masks(site.frame["SW_IN_F"], threshold=DAYTIME_THRESHOLD)
+        day = masks[MetricSubset.DAYTIME].to_numpy()
+        night = masks[MetricSubset.NIGHTTIME].to_numpy()
+        assert not (day & night).any()
+        assert (day | night).all()  # the synthetic radiation is never missing
+
+
+class TestGapClassLabels:
+    """Labelling each row with the duration class that withheld it."""
+
+    def test_labels_follow_the_intervals(self, site, gaps):
+        labels = gap_class_labels(gaps, site.index)
+        for gap in gaps:
+            inside = labels.loc[gap.start : gap.end - site.time_step]
+            assert set(inside) == {gap.gap_class.value}
+        assert labels.notna().sum() == gaps.n_withheld_rows
+
+    def test_the_interval_end_is_not_labelled(self, site, gaps):
+        """The intervals are half-open, so the row at ``end`` was never withheld."""
+        labels = gap_class_labels(gaps, site.index)
+        for gap in gaps:
+            assert labels.get(gap.end) is None
+
+    def test_rejects_something_that_is_not_a_manifest(self, site):
+        with pytest.raises(ValidationError, match="GapManifest"):
+            gap_class_labels("every 30 days", site.index)
+
+
+# ---------------------------------------------------------------------------
+# Step 17: both published configurations, end to end
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+class TestBothArmsRun:
+    """Step 17's exit criterion: RFR3 and RFR10 both run, and report what is asked."""
+
+    def test_each_arm_validates_every_target(self, arms):
+        for method, run in arms.items():
+            assert run.method == method
+            assert run.targets == TARGETS
+            assert len(run) == 3
+
+    def test_each_arm_uses_its_own_driver_set(self, arms):
+        assert len(arms["RFR3"].config.drivers) == 3
+        assert len(arms["RFR10"].config.drivers) == 10
+        for method, run in arms.items():
+            for result in run:
+                assert set(arms[method].config.drivers) <= set(result.model.get_feature_names())
+
+    @pytest.mark.parametrize("metric", ["r2", "slope", "rmse", "bias"])
+    def test_the_four_core_metrics_are_reported(self, arms, metric):
+        for run in arms.values():
+            for result in run:
+                assert getattr(result.overall, metric) is not None
+
+    def test_day_and_night_are_reported_separately(self, arms):
+        for run in arms.values():
+            for result in run:
+                day = result.metric(subset="daytime")
+                night = result.metric(subset="nighttime")
+                assert day.n > 0 and night.n > 0
+                assert day.n + night.n == result.overall.n
+
+    def test_metrics_are_reported_by_gap_class(self, arms):
+        for run in arms.values():
+            for result in run:
+                classes = set(result.metrics_by_gap_class)
+                assert classes == set(GapClass)
+                scored = sum(result.metric(gap_class=gap_class).n for gap_class in GapClass)
+                assert scored == result.overall.n
+
+    def test_the_gap_manifest_travels_with_the_result(self, arms, gaps):
+        for run in arms.values():
+            assert run.gaps is gaps
+            assert {gap.gap_class for gap in run.gaps} == set(GapClass)
+            assert len(run.gaps.to_frame()) == len(gaps)
+
+    def test_all_three_durations_are_present_and_elapsed(self, gaps):
+        expected = {
+            GapClass.SHORT: pd.Timedelta(hours=24),
+            GapClass.LONG: pd.Timedelta(days=7),
+            GapClass.VERY_LONG: pd.Timedelta(days=30),
         }
+        for gap in gaps:
+            assert gap.duration == expected[gap.gap_class]
+
+    def test_the_run_summarises_itself(self, report):
+        text = report.summary()
+        assert "RFR3 validation of NEE, H, LE" in text
+        assert "very_long" in text and "nighttime" in text
 
 
-def test_the_gaps_are_contiguous_intervals_not_a_random_row_holdout(
-    report: ValidationReport,
-) -> None:
-    manifest = report.gap_manifest
-    durations = {
-        "short": pd.Timedelta(hours=24),
-        "long": pd.Timedelta(days=7),
-        "very_long": pd.Timedelta(days=30),
-    }
-    for gap_class, expected in durations.items():
-        rows = manifest[manifest["gap_class"] == gap_class]
-        assert len(rows) > 0
-        assert ((rows["end"] - rows["start"]) == expected).all()
+@pytest.mark.slow
+class TestObservedValuesAreUnchanged:
+    """Step 17 task 4: nothing the run did touched a measurement."""
+
+    def test_the_input_frame_is_not_modified(self, site, gaps):
+        before = site.frame.copy(deep=True)
+        _run(site, gaps, "RFR3")
+        pd.testing.assert_frame_equal(site.frame, before)
+
+    def test_the_scored_truth_is_the_input_column(self, site, report):
+        for target in TARGETS:
+            truth = report[target].features.truth
+            original = site.frame[target].astype(float)
+            pd.testing.assert_series_equal(truth, original, check_names=False)
+
+    def test_no_prediction_lands_outside_an_artificial_gap(self, report):
+        for result in report:
+            outside = ~result.features.holdout_mask.to_numpy()
+            assert result.predictions.to_numpy()[outside].size
+            assert np.isnan(result.predictions.to_numpy()[outside]).all()
+
+    def test_observed_rows_keep_their_observed_flag(self, site, report):
+        for target in TARGETS:
+            observed = report[target].features.observed_mask
+            expected = site.observed(target)
+            pd.testing.assert_series_equal(observed, expected, check_names=False)
 
 
-def test_the_withheld_rows_are_the_test_set_and_the_rest_is_training(
-    report: ValidationReport, site: pd.DataFrame
-) -> None:
-    result = report["NEE"]
-    withheld = result.n_withheld
-    trained = result.training.n_trained
+@pytest.mark.slow
+class TestDeterminism:
+    """Step 17's exit criterion: both workflows run *deterministically*."""
 
-    # Roughly a quarter withheld, the remainder trained on: Figure 2's design.
-    assert result.gaps.achieved_fraction == pytest.approx(0.25, abs=0.06)
-    assert trained > withheld * 2
-    # Nothing withheld was trained on.
-    assert (
-        not (result.gaps.mask & site["NEE"].notna())[report.time_axis.index]
-        .reindex(result.predictions.index)
-        .eq(False)
-        .any()
+    def test_the_same_seed_reproduces_the_metrics(self, site, gaps, report):
+        again = _run(site, gaps, "RFR3")
+        pd.testing.assert_frame_equal(report.to_frame(), again.to_frame())
+
+    def test_the_same_seed_reproduces_the_predictions(self, site, gaps, report):
+        again = _run(site, gaps, "RFR3")
+        pd.testing.assert_frame_equal(report.predictions(), again.predictions())
+
+
+@pytest.mark.slow
+class TestTheNumbersAreTheirOwnPredictions:
+    """The reported metrics describe the predictions this run actually made."""
+
+    def test_bias_is_the_paper_formula_over_the_scored_rows(self, report):
+        for result in report:
+            rows = result.features.scoring_mask.to_numpy()
+            measured = result.features.truth.to_numpy()[rows]
+            predicted = result.predictions.to_numpy()[rows]
+            complete = np.isfinite(measured) & np.isfinite(predicted)
+            expected = (predicted[complete].sum() - measured[complete].sum()) / complete.sum()
+            assert result.overall.bias == pytest.approx(expected)
+            assert result.overall.n == int(complete.sum())
+
+    def test_a_subset_scores_exactly_its_own_rows(self, site, report):
+        result = report["LE"]
+        night = subset_masks(site.frame["SW_IN_F"], threshold=DAYTIME_THRESHOLD)[
+            MetricSubset.NIGHTTIME
+        ]
+        rows = (result.features.scoring_mask & night).to_numpy()
+        expected = core_metrics(
+            result.features.truth.loc[rows],
+            result.predictions.loc[rows],
+            definition=result.config.validation.r2,
+        )
+        assert result.metric(subset="nighttime").to_dict() == expected.to_dict()
+
+    def test_a_row_the_model_could_not_predict_is_not_scored(self, report):
+        for result in report:
+            withheld = result.features.holdout_mask
+            complete = int((withheld & result.features.complete_mask).sum())
+            assert result.overall.n <= complete
+            assert result.overall.n_offered == int(result.features.scoring_mask.sum())
+
+
+@pytest.mark.slow
+class TestSharedGapsAndComparability:
+    """One mask, every target and every arm (method_spec.md 4.4 and 3.6)."""
+
+    def test_the_targets_share_one_holdout_mask(self, report):
+        masks = [result.features.holdout_mask for result in report]
+        for mask in masks[1:]:
+            pd.testing.assert_series_equal(masks[0], mask)
+
+    def test_the_arms_are_scored_on_the_same_rows(self, arms):
+        for target in TARGETS:
+            three = arms["RFR3"][target].features.scoring_mask
+            ten = arms["RFR10"][target].features.scoring_mask
+            pd.testing.assert_series_equal(three, ten)
+            assert arms["RFR3"][target].overall.n == arms["RFR10"][target].overall.n
+
+    def test_the_arms_differ_only_in_their_features(self, arms):
+        three = set(arms["RFR3"]["LE"].model.get_feature_names())
+        ten = set(arms["RFR10"]["LE"].model.get_feature_names())
+        assert three < ten
+        assert ten - three == set(arms["RFR10"].config.drivers) - set(arms["RFR3"].config.drivers)
+
+
+@pytest.mark.slow
+class TestReportingSurfaces:
+    """The tables, the manifest and the JSON a validation run has to produce."""
+
+    def test_the_tidy_table_has_one_row_per_target_class_and_subset(self, report):
+        table = report.to_frame()
+        assert tuple(table.columns) == METRIC_TABLE_COLUMNS
+        assert len(table) == 3 * (1 + len(GapClass)) * 3
+        assert set(table["gap_class"]) == {"all", "short", "long", "very_long"}
+        assert set(table["subset"]) == {"all", "daytime", "nighttime"}
+
+    def test_the_table_agrees_with_the_records(self, report):
+        table = report.to_frame()
+        row = table.query("target == 'H' and gap_class == 'long' and subset == 'daytime'")
+        scores = report["H"].metric(subset="daytime", gap_class="long")
+        assert row["r2"].item() == pytest.approx(scores.r2)
+        assert row["n"].item() == scores.n
+
+    def test_bias_spread_is_reported_per_gap_class(self, report):
+        for result in report:
+            assert set(result.bias_spread) == set(GapClass)
+            for gap_class, spread in result.bias_spread.items():
+                assert isinstance(spread, BiasSpread)
+                assert spread.n_gaps_offered == len(result.gaps.by_class(gap_class))
+                if spread.n_gaps > 1:
+                    assert spread.iqr == pytest.approx(spread.q3 - spread.q1)
+                    assert spread.q1 <= spread.median <= spread.q3
+
+    def test_bias_spread_of_a_single_gap_has_no_iqr(self, report):
+        very_long = report["LE"].bias_spread[GapClass.VERY_LONG]
+        assert very_long.n_gaps == 1
+        assert very_long.iqr is None
+        assert very_long.median is not None
+
+    def test_the_manifest_is_complete_and_serialisable(self, report):
+        manifest = report.manifest("LE")
+        assert isinstance(manifest, RunManifest)
+        manifest.require_complete()
+        document = json.loads(json.dumps(manifest.to_dict()))
+        assert document["kind"] == "validation"
+        assert document["gaps"]["manifest"]["gaps"]
+        assert document["metrics"]["metrics"]["nighttime"]["rmse"] is not None
+
+    def test_the_whole_run_is_serialisable(self, report):
+        document = json.loads(json.dumps(report.to_dict()))
+        assert document["method"] == "RFR3"
+        assert set(document["results"]) == set(TARGETS)
+        assert document["energy_balance"]["measured_ebr"] is not None
+
+    def test_predictions_come_back_on_the_run_axis(self, site, report):
+        frame = report.predictions()
+        assert list(frame.columns) == [f"{target}_predicted" for target in TARGETS]
+        assert frame.index.equals(site.index)
+
+
+def _drivers(site, report: ValidationReport) -> pd.DataFrame:
+    """NETRAD and G as the run read them; the site frame is on the run's time axis."""
+    columns = report.column_map
+    return site.frame[[columns.column(NET_RADIATION), columns.column(SOIL_HEAT_FLUX)]]
+
+
+def _complete_ebr_rows(site, report: ValidationReport) -> pd.Series:
+    """Rows carrying every component of the energy-balance check."""
+    heat, latent = report["H"], report["LE"]
+    complete: pd.Series = (
+        heat.features.scoring_mask
+        & latent.features.scoring_mask
+        & heat.predictions.notna()
+        & latent.predictions.notna()
+        & _drivers(site, report).notna().all(axis=1)
     )
+    return complete
 
 
-def test_every_subset_is_reported_never_the_aggregate_alone(report: ValidationReport) -> None:
-    frame = report.metrics_frame()
-    assert set(frame["subset"]) == {"all", "daytime", "nighttime"}
+@pytest.mark.slow
+class TestEnergyBalance:
+    """Section 6.4's independent check, over the artificial-gap rows (Step 19)."""
 
-    for target in report.targets:
-        metrics = report[target].metrics
-        assert metrics.all.n == metrics.daytime.n + metrics.nighttime.n
-        assert np.isfinite(metrics.nighttime.rmse)
+    def test_measured_and_filled_ratios_share_one_row_set(self, report):
+        balance = report.energy_balance
+        assert balance is not None
+        assert balance.n > 0
+        assert balance.difference == pytest.approx(balance.filled - balance.measured)
 
-
-def test_the_model_learns_something_on_a_learnable_site(report: ValidationReport) -> None:
-    # Not a paper benchmark: the fixture is synthetic. It only asserts the
-    # orchestration wired the pieces together rather than predicting noise.
-    for target in report.targets:
-        assert report[target].metrics.daytime.r2 > 0.5
-
-
-# ---------------------------------------------------------------------------
-# Shared gaps across targets (acceptance test 20)
-# ---------------------------------------------------------------------------
-
-
-def test_the_three_targets_are_scored_on_identical_gap_locations(
-    report: ValidationReport,
-) -> None:
-    assert report.shared_gaps
-    masks = [report[target].gaps.mask for target in report.targets]
-    for mask in masks[1:]:
-        pd.testing.assert_series_equal(mask, masks[0])
-
-
-def test_separate_scenarios_are_available_and_are_not_identical(site: pd.DataFrame) -> None:
-    settings = config(
-        validation=ValidationConfig(gaps=GapScenarioConfig(shared_gaps_across_targets=False))
-    )
-    separate = validate_rfr(site, targets=["NEE", "H"], config=settings, qc_columns=QC_COLUMNS)
-
-    assert not separate.shared_gaps
-    assert not separate["NEE"].gaps.mask.equals(separate["H"].gaps.mask)
-    assert "target" in separate.gap_manifest.columns
-
-
-# ---------------------------------------------------------------------------
-# Leakage, end to end
-# ---------------------------------------------------------------------------
-
-
-def test_altering_hidden_truth_does_not_change_the_features_that_predict_it(
-    site: pd.DataFrame,
-) -> None:
-    settings = config("RFR3")
-    base = validate_rfr(site, targets="NEE", config=settings, qc_columns=QC_COLUMNS)
-
-    # Corrupt only the values the artificial gaps hide, then rerun.
-    corrupted = site.copy()
-    hidden = base["NEE"].gaps.mask.reindex(corrupted.index, fill_value=False)
-    corrupted.loc[hidden, "NEE"] = 1e6
-
-    altered = validate_rfr(corrupted, targets="NEE", config=settings, qc_columns=QC_COLUMNS)
-
-    pd.testing.assert_frame_equal(base["NEE"].features.frame, altered["NEE"].features.frame)
-    pd.testing.assert_series_equal(
-        base["NEE"].predictions["predicted"], altered["NEE"].predictions["predicted"]
-    )
-
-
-def test_the_same_seed_reproduces_the_whole_run(site: pd.DataFrame) -> None:
-    settings = config("RFR3")
-    first = validate_rfr(site, targets="LE", config=settings, qc_columns=QC_COLUMNS)
-    second = validate_rfr(site, targets="LE", config=settings, qc_columns=QC_COLUMNS)
-
-    pd.testing.assert_frame_equal(first.gap_manifest, second.gap_manifest)
-    pd.testing.assert_frame_equal(first["LE"].predictions, second["LE"].predictions)
-
-
-# ---------------------------------------------------------------------------
-# Energy-balance ratio (acceptance test 33, applied end to end)
-# ---------------------------------------------------------------------------
-
-
-def test_the_energy_balance_ratio_is_reported_for_h_and_le(report: ValidationReport) -> None:
-    balance = report.energy_balance
-    assert balance is not None
-    assert balance.n_rows > 0
-    assert np.isfinite(balance.measured)
-    assert np.isfinite(balance.filled)
-    assert balance.difference == balance.filled - balance.measured
-
-
-def test_no_energy_balance_is_reported_when_only_one_heat_flux_was_validated(
-    site: pd.DataFrame,
-) -> None:
-    single = validate_rfr(site, targets="H", config=config("RFR3"), qc_columns=QC_COLUMNS)
-    assert single.energy_balance is None
-
-
-def test_naming_an_unvalidated_target_for_the_ebr_is_an_error(site: pd.DataFrame) -> None:
-    with pytest.raises(ValidationError, match="did not validate"):
-        validate_rfr(
-            site,
-            targets=["H", "LE"],
-            config=config(),
-            qc_columns=QC_COLUMNS,
-            energy_balance_targets=("H", "NEE"),
+    def test_the_measured_ratio_is_the_arms_common_ground(self, arms):
+        assert arms["RFR3"].energy_balance.measured == pytest.approx(
+            arms["RFR10"].energy_balance.measured
         )
 
+    def test_every_withheld_row_is_offered(self, report):
+        check = report.energy_balance_check
+        assert isinstance(check, EnergyBalanceCheck)
+        assert check.targets == ("H", "LE")
+        assert check.overall.n_offered == report["H"].withheld_rows
+
+    def test_the_ratios_are_the_formula_over_this_runs_own_rows(self, site, report):
+        heat, latent = report["H"], report["LE"]
+        rows = _complete_ebr_rows(site, report).to_numpy()
+        netrad = site.frame[report.column_map.column(NET_RADIATION)].to_numpy()[rows]
+        soil = site.frame[report.column_map.column(SOIL_HEAT_FLUX)].to_numpy()[rows]
+        available = (netrad - soil).sum()
+        measured = (heat.features.truth.to_numpy() + latent.features.truth.to_numpy())[rows]
+        filled = (heat.predictions.to_numpy() + latent.predictions.to_numpy())[rows]
+
+        overall = report.energy_balance_check.overall
+        assert overall.n == int(rows.sum())
+        assert overall.available_energy == pytest.approx(available)
+        assert overall.measured == pytest.approx(measured.sum() / available)
+        assert overall.filled == pytest.approx(filled.sum() / available)
+
+    def test_the_accounting_explains_every_dropped_row(self, site, report):
+        heat, latent = report["H"], report["LE"]
+        withheld = heat.features.holdout_mask
+        genuine = heat.features.scoring_mask & latent.features.scoring_mask
+        unpredicted = heat.predictions.isna() | latent.predictions.isna()
+        drivers = _drivers(site, report)
+        no_energy = drivers.isna().any(axis=1)
+
+        overall = report.energy_balance_check.overall
+        assert overall.n_missing_measured == int((withheld & ~genuine).sum())
+        assert overall.n_missing_filled == int((withheld & unpredicted).sum())
+        assert overall.n_missing_available_energy == int((withheld & no_energy).sum())
+        assert overall.dropped_incomplete == int(
+            (withheld & ~_complete_ebr_rows(site, report)).sum()
+        )
+
+    def test_each_gap_class_is_checked_and_the_classes_partition_the_run(self, report):
+        check = report.energy_balance_check
+        assert set(check.by_gap_class) == set(GapClass)
+        assert sum(item.n for item in check.by_gap_class.values()) == check.overall.n
+        assert (
+            sum(item.n_offered for item in check.by_gap_class.values()) == check.overall.n_offered
+        )
+        labels = gap_class_labels(report.gaps, report.time_axis.index)
+        for gap_class, item in check.by_gap_class.items():
+            assert item.n_offered == int((labels == gap_class.value).sum())
+            assert item.n > 0
+            assert item.measured is not None and item.filled is not None
+            assert item.difference == pytest.approx(item.filled - item.measured)
+
+    def test_an_unchecked_gap_class_is_named(self, report):
+        with pytest.raises(ConfigError):
+            report.energy_balance_check.comparison("fortnight")
+
+    def test_the_h_and_le_manifests_carry_the_check_and_nee_does_not(self, report):
+        for target in ("H", "LE"):
+            document = json.loads(json.dumps(report.manifest(target).to_dict()))
+            balance = document["metrics"]["energy_balance"]
+            assert (balance["sensible_heat"], balance["latent_heat"]) == ("H", "LE")
+            assert balance["measured_ebr"] == pytest.approx(report.energy_balance.measured)
+            assert balance["filled_ebr"] == pytest.approx(report.energy_balance.filled)
+            assert set(balance["by_gap_class"]) == {gap_class.value for gap_class in GapClass}
+        assert report["NEE"].to_dict()["energy_balance"] is None
+        assert report["NEE"].energy_balance_check is None
+
+    def test_the_energy_balance_table_has_the_run_and_each_class(self, report):
+        table = report.energy_balance_frame()
+        assert tuple(table.columns) == ENERGY_BALANCE_TABLE_COLUMNS
+        assert list(table["gap_class"]) == ["all"] + [gap_class.value for gap_class in GapClass]
+        assert set(table["method"]) == {"RFR3"}
+        long = report.energy_balance_check.comparison("long")
+        row = table.set_index("gap_class").loc["long"]
+        assert row["n"] == long.n
+        assert row["filled_ebr"] == pytest.approx(long.filled)
+        assert table["measured_ebr"].dtype == np.float64
+
+    def test_the_summary_reports_the_run_and_each_class(self, report):
+        lines = [line for line in report.summary().splitlines() if "EBR" in line]
+        assert len(lines) == 1 + len(GapClass)
+        assert all("measured=" in line and "filled=" in line for line in lines)
+
+    def test_a_run_without_both_fluxes_reports_no_ratio(self, site, gaps):
+        run = validate_rfr(
+            site.frame,
+            config=_config(site, "RFR3"),
+            targets="NEE",
+            qc_columns=site.qc_column("NEE"),
+            gaps=gaps,
+        )
+        assert run.energy_balance is None
+        assert run.energy_balance_check is None
+        assert run.energy_balance_frame().empty
+        assert tuple(run.energy_balance_frame().columns) == ENERGY_BALANCE_TABLE_COLUMNS
+        assert run.targets == ("NEE",)
+
+    def test_pre_filled_fluxes_and_missing_radiation_are_counted_not_used(self, site, gaps, report):
+        """Step 19's missing-data handling, on rows that were complete before.
+
+        Six withheld H values are re-flagged as pre-filled and four withheld NETRAD
+        values removed. The RFR3 driver set does not read NETRAD, and withheld
+        rows are never trained on, so the forests are unchanged and exactly those
+        ten rows leave both ratios - each counted under what it lost.
+        """
+        short = next(gap for gap in gaps if gap.gap_class is GapClass.SHORT)
+        index = site.frame.index
+        inside = pd.Series((index >= short.start) & (index < short.end), index=index)
+        candidates = index[(inside & _complete_ebr_rows(site, report)).to_numpy()]
+        pre_filled, no_radiation = candidates[:6], candidates[6:10]
+
+        frame = site.frame.copy()
+        frame.loc[pre_filled, site.qc_column("H")] = PRE_FILLED_QC
+        frame.loc[no_radiation, report.column_map.column(NET_RADIATION)] = np.nan
+        run = validate_rfr(
+            frame,
+            config=_config(site, "RFR3"),
+            targets=["H", "LE"],
+            qc_columns={"H": "H_QC", "LE": "LE_QC"},
+            gaps=gaps,
+        )
+
+        before = report.energy_balance_check
+        after = run.energy_balance_check
+        for scope in (None, GapClass.SHORT):
+            old, new = before.comparison(scope), after.comparison(scope)
+            assert new.n_offered == old.n_offered
+            assert new.n == old.n - 10
+            assert new.n_missing_measured == old.n_missing_measured + 6
+            assert new.n_missing_available_energy == old.n_missing_available_energy + 4
+            assert new.n_missing_filled == old.n_missing_filled
+        # The other classes' rows were not touched, and nor were the forests.
+        for gap_class in (GapClass.LONG, GapClass.VERY_LONG):
+            assert after.comparison(gap_class) == before.comparison(gap_class)
+
+
+class TestEnergyBalanceCheckRecord:
+    """The record itself, without a run behind it."""
+
+    @staticmethod
+    def _check(by_gap_class=None) -> EnergyBalanceCheck:
+        comparison = compare_energy_balance(
+            measured_sensible_heat=[30.0, 50.0],
+            measured_latent_heat=[20.0, 30.0],
+            filled_sensible_heat=[35.0, 45.0],
+            filled_latent_heat=[20.0, 30.0],
+            net_radiation=[100.0, 150.0],
+            soil_heat_flux=[10.0, 20.0],
+        )
+        return EnergyBalanceCheck(
+            sensible_heat="H",
+            latent_heat="LE",
+            overall=comparison,
+            by_gap_class={GapClass.SHORT: comparison} if by_gap_class is None else by_gap_class,
+        )
+
+    def test_its_mapping_is_read_only(self):
+        with pytest.raises(TypeError):
+            self._check().by_gap_class[GapClass.LONG] = None  # type: ignore[index]
+
+    def test_it_survives_a_pickle_round_trip(self):
+        import pickle
+
+        check = self._check()
+        assert pickle.loads(pickle.dumps(check)) == check
+
+    def test_a_run_without_gap_classes_says_so(self):
+        with pytest.raises(ValidationError, match="report_by_gap_class=False"):
+            self._check(by_gap_class={}).comparison("short")
+
+    def test_its_document_keeps_the_overall_ratios_at_the_top(self):
+        document = json.loads(json.dumps(self._check().to_dict()))
+        assert document["measured_ebr"] == pytest.approx(130.0 / 220.0)
+        assert document["available_energy"] == pytest.approx(220.0)
+        assert set(document["by_gap_class"]) == {"short"}
+
 
 # ---------------------------------------------------------------------------
-# Bias IQR by gap class (acceptance test 40)
+# The sampled generator, and ambiguity A4
 # ---------------------------------------------------------------------------
 
 
-def test_bias_iqr_is_reported_per_gap_class(report: ValidationReport) -> None:
-    for gap_class, result in report["NEE"].by_gap_class.items():
-        assert result.n_gaps >= 1
-        assert len(result.bias_by_gap) == result.n_gaps
-        if result.n_gaps >= 2:
-            assert np.isfinite(result.bias_iqr)
-        assert gap_class in GapClass
+@pytest.mark.slow
+def test_a_sampled_scenario_runs_end_to_end(site):
+    """The default path: gaps sampled from the configured scenario, not handed in."""
+    with warnings.catch_warnings():
+        # The achieved fraction can miss the requested 25% (A7); the manifest
+        # reports it, and this test is about the workflow completing.
+        warnings.simplefilter("ignore")
+        run = validate_rfr(
+            site.frame,
+            config=_config(site, "RFR3"),
+            targets=["H", "LE"],
+            qc_columns={"H": "H_QC", "LE": "LE_QC"},
+        )
+    assert run.gaps.random_state == site.seed
+    assert len(run.gaps) > 0
+    assert run["H"].overall.n > 0
+    assert run.gaps.achieved_fraction is not None
 
 
-def test_bias_iqr_is_missing_rather_than_zero_for_a_single_gap() -> None:
-    from rfrgapfill.metrics import CoreMetrics, SubsetMetrics
-    from rfrgapfill.validation import GapClassMetrics
-
-    single = GapClassMetrics(
-        gap_class=GapClass.VERY_LONG,
-        metrics=SubsetMetrics(metrics={}, daytime_threshold=20.0, n_missing_shortwave=0),
-        n_gaps=1,
-        bias_by_gap=(0.5,),
-    )
-    assert np.isnan(single.bias_iqr)
-    assert CoreMetrics  # imported for the fixture's shape, not asserted on
-
-
-# ---------------------------------------------------------------------------
-# The ORF benchmark (acceptance test 10)
-# ---------------------------------------------------------------------------
-
-
-def test_rfr_and_orf_are_compared_on_identical_gaps(site: pd.DataFrame) -> None:
-    rfr, orf, comparison = compare_receptive_limiter(
-        site, targets="LE", config=config("RFR3"), qc_columns=QC_COLUMNS
-    )
-
-    pd.testing.assert_frame_equal(rfr.gap_manifest, orf.gap_manifest)
-    assert rfr["LE"].features.use_receptive_limiter
-    assert not orf["LE"].features.use_receptive_limiter
-    # Same drivers, same estimator family, same grid: only the features differ.
-    assert orf["LE"].training.feature_names == rfr["LE"].training.feature_names[:3]
-    assert rfr.config.hyperparameter_grid == orf.config.hyperparameter_grid
-
-    # Recorded, not asserted: the supplement does not claim RFR wins every metric.
-    assert {"r2_rfr", "r2_orf", "r2_difference"} <= set(comparison.columns)
-    assert not comparison.empty
+@pytest.mark.slow
+def test_the_default_daily_statistic_strategy_scores_nothing_and_says_so(site, gaps):
+    """Ambiguity A4: under ``missing``, a whole-day gap has no feature rows at all."""
+    config = site.config("RFR3", hyperparameter_grid=TEST_GRID, cv_folds=3)
+    assert config.features.statistic_strategy.value == "missing"
+    with pytest.warns(ValidationWarning, match="ambiguity A4"):
+        run = validate_rfr(
+            site.frame,
+            config=config,
+            targets="LE",
+            qc_columns="LE_QC",
+            gaps=gaps,
+        )
+    result = run["LE"]
+    assert result.withheld_rows > 0
+    assert result.scored_rows == 0
+    assert result.overall.r2 is None
+    # The row accounting says why, rather than leaving an empty table unexplained.
+    assert result.features.to_dict()["holdout_rows_with_complete_features"] == 0
 
 
 # ---------------------------------------------------------------------------
-# Provenance and reporting
+# What the request layer refuses
 # ---------------------------------------------------------------------------
 
 
-def test_the_run_manifest_records_everything_the_specification_asks_for(
-    report: ValidationReport,
-) -> None:
-    manifest = report.manifest()
-    assert json.loads(json.dumps(manifest)) == manifest
+class TestRejectedRequests:
+    """Bad requests fail before anything is fitted, naming what is wrong."""
 
-    assert manifest["config"]["mode"] == "RFR10"
-    assert manifest["config"]["site_id"] == "SYN-01"
-    assert manifest["config"]["random_state"] == 42
-    assert manifest["config"]["features"]["feature_mode"] == "paper_safe"
-    assert manifest["config"]["resolved_hemisphere"] == "north"
-    assert manifest["config"]["validation"]["gaps"]["allocation_basis"] == "missing_records"
-    assert manifest["time_axis"]["time_step"] == "P0DT0H30M0S"
-    assert manifest["gaps"]["shared"] is True
-    assert manifest["training"]["NEE"]["best_params"]
-    assert manifest["environment"]["scikit_learn"]
-    assert manifest["paper_doi"] == "10.1016/j.agrformet.2021.108777"
+    def test_data_must_be_a_frame(self, site):
+        with pytest.raises(ValidationError, match="DataFrame"):
+            validate_rfr("the whole site", config=_config(site, "RFR3"), targets="LE")
 
+    def test_config_must_be_an_rfr_config(self, site):
+        with pytest.raises(ConfigError, match="RFRConfig"):
+            validate_rfr(site.frame, config={"mode": "RFR3"}, targets="LE")
 
-def test_the_whole_report_serialises_to_json(report: ValidationReport) -> None:
-    payload = report.to_dict()
-    assert json.loads(json.dumps(payload)) == payload
-    assert set(payload["results"]) == {"NEE", "H", "LE"}
+    def test_an_unknown_target_column_is_named(self, site):
+        with pytest.raises(ValidationError, match="target column"):
+            validate_rfr(site.frame, config=_config(site, "RFR3"), targets="CH4")
 
+    def test_a_missing_qc_column_is_named(self, site):
+        with pytest.raises(ValidationError, match="QC column"):
+            validate_rfr(
+                site.frame, config=_config(site, "RFR3"), targets="LE", qc_columns="LE_FLAG"
+            )
 
-def test_the_report_states_the_achieved_fraction_and_mix_against_the_request(
-    report: ValidationReport,
-) -> None:
-    manifest = report.manifest()["gaps"]["by_target"]["NEE"]
+    def test_a_repeated_target_is_rejected(self, site):
+        with pytest.raises(ValidationError, match="more than once"):
+            validate_rfr(site.frame, config=_config(site, "RFR3"), targets=["LE", "LE"])
 
-    assert manifest["requested_fraction"] == 0.25
-    assert manifest["achieved_fraction"] == pytest.approx(0.25, abs=0.06)
-    assert set(manifest["achieved_mix"]) == {"short", "long", "very_long"}
-    assert isinstance(manifest["satisfied"], bool)
-    # A report never says the design was missed without saying why.
-    assert bool(report.warnings) is not report.satisfied
+    def test_no_target_is_rejected(self, site):
+        with pytest.raises(ValidationError, match="at least one target"):
+            validate_rfr(site.frame, config=_config(site, "RFR3"), targets=[])
 
+    def test_one_qc_column_for_several_targets_is_ambiguous(self, site):
+        with pytest.raises(ValidationError, match="ambiguous"):
+            validate_rfr(
+                site.frame, config=_config(site, "RFR3"), targets=["H", "LE"], qc_columns="LE_QC"
+            )
 
-def test_the_daily_statistic_fallback_is_counted_not_hidden(report: ValidationReport) -> None:
-    daily = report["NEE"].features.daily_statistics
-    assert daily is not None
-    # A 30-day gap has no visible target observation of its own, so its days must
-    # have taken a neighbour's statistics - and the count must say so.
-    assert daily.n_days_from_neighbour > 0
-    assert daily.to_dict()["strategy"] == "nearest_visible_day"
+    def test_qc_columns_for_an_unvalidated_target_are_rejected(self, site):
+        with pytest.raises(ValidationError, match="does not validate"):
+            validate_rfr(
+                site.frame,
+                config=_config(site, "RFR3"),
+                targets=["LE"],
+                qc_columns={"LE": "LE_QC", "H": "H_QC"},
+            )
 
+    def test_handed_gaps_must_be_a_manifest(self, site):
+        with pytest.raises(ValidationError, match="GapManifest"):
+            validate_rfr(site.frame, config=_config(site, "RFR3"), targets="LE", gaps=[("a", "b")])
 
-def test_every_withheld_row_carries_its_gap_id_and_class(report: ValidationReport) -> None:
-    predictions = report["NEE"].predictions
-    assert predictions["gap_id"].notna().all()
-    assert predictions["gap_class"].notna().all()
-    assert set(predictions["gap_class"]) <= {"short", "long", "very_long"}
+    def test_the_energy_balance_needs_its_own_variables_mapped(self, site):
+        """Section 6.4 requires NETRAD and G whatever the driver mode is."""
+        config = site.config(
+            "RFR3",
+            column_map=ColumnMap.fluxnet2015("RFR3"),
+            hyperparameter_grid=TEST_GRID,
+        )
+        with pytest.raises(ValidationError, match="compute_energy_balance_ratio=False"):
+            validate_rfr(
+                site.frame,
+                config=config,
+                targets=["H", "LE"],
+                qc_columns={"H": "H_QC", "LE": "LE_QC"},
+            )
 
+    @pytest.mark.slow
+    def test_switching_the_energy_balance_off_lets_that_run_proceed(self, site, gaps):
+        config = site.config(
+            "RFR3",
+            column_map=ColumnMap.fluxnet2015("RFR3"),
+            hyperparameter_grid=TEST_GRID,
+            cv_folds=3,
+            features=REACHING,
+            validation=ValidationConfig(compute_energy_balance_ratio=False),
+        )
+        run = validate_rfr(
+            site.frame,
+            config=config,
+            targets=["H", "LE"],
+            qc_columns={"H": "H_QC", "LE": "LE_QC"},
+            gaps=gaps,
+        )
+        assert run.energy_balance is None
 
-# ---------------------------------------------------------------------------
-# Argument handling
-# ---------------------------------------------------------------------------
+    @pytest.mark.slow
+    def test_an_unknown_gap_class_is_named(self, report):
+        with pytest.raises(ConfigError):
+            report["LE"].metric(gap_class="fortnight")
 
-
-def test_the_named_scenario_is_the_published_design() -> None:
-    scenario = SCENARIOS["zhu2022"]
-    assert scenario.missing_fraction == 0.25
-    assert scenario.share(GapClass.SHORT) == 0.20
-    assert scenario.share(GapClass.LONG) == 0.30
-    assert scenario.share(GapClass.VERY_LONG) == 0.50
-    assert scenario.min_observed_fraction == 0.50
-
-
-def test_an_unknown_scenario_name_lists_the_registered_ones(site: pd.DataFrame) -> None:
-    with pytest.raises(ValidationError, match="unknown scenario"):
-        validate_rfr(site, targets="NEE", config=config(), scenario="made_up")
-
-
-def test_a_missing_driver_set_is_refused_rather_than_defaulted(site: pd.DataFrame) -> None:
-    with pytest.raises(ConfigError, match="no default driver set"):
-        validate_rfr(site, targets="NEE", column_map=ColumnMap.fluxnet2015("RFR3"))
-
-
-def test_mixing_a_config_with_loose_settings_is_refused(site: pd.DataFrame) -> None:
-    with pytest.raises(ConfigError, match="not both"):
-        validate_rfr(site, targets="NEE", config=config(), mode="RFR3")
-
-
-def test_a_target_the_frame_does_not_carry_is_named(site: pd.DataFrame) -> None:
-    with pytest.raises(ValidationError, match="FCH4"):
-        validate_rfr(site, targets=["NEE", "FCH4"], config=config())
-
-
-def test_the_loose_settings_build_the_same_configuration(site: pd.DataFrame) -> None:
-    loose = validate_rfr(
-        site.head(48 * 200),
-        targets="NEE",
-        mode="RFR3",
-        latitude=51.5,
-        frequency="30min",
-        column_map=ColumnMap.fluxnet2015("RFR3"),
-        qc_columns=QC_COLUMNS,
-        scenario=GapScenarioConfig(gap_mix={"short": 1.0}),
-    )
-    assert loose.config.rfr_mode.value == "RFR3"
-    assert loose.config.resolve_hemisphere().value == "north"
-    assert set(loose.gap_manifest["gap_class"]) == {"short"}
+    @pytest.mark.slow
+    def test_an_unvalidated_target_is_named(self, report):
+        with pytest.raises(ValidationError, match="no result for target"):
+            report["CH4"]
 
 
-def test_the_orf_switch_is_reachable_from_the_loose_settings(site: pd.DataFrame) -> None:
-    orf = validate_rfr(
-        site.head(48 * 200),
-        targets="NEE",
-        mode="RFR3",
-        latitude=51.5,
-        frequency="30min",
-        use_receptive_limiter=False,
-        column_map=ColumnMap.fluxnet2015("RFR3"),
-        qc_columns=QC_COLUMNS,
-        scenario=GapScenarioConfig(gap_mix={"short": 0.5, "long": 0.5}),
-    )
-    assert not orf.config.features.use_receptive_limiter
-    assert not orf.config.is_paper_faithful
-    assert orf["NEE"].features.daily_statistics is None
+class TestMissingDriverColumns:
+    """A mapped column the data does not carry fails as a name, not a KeyError."""
+
+    def test_an_absent_driver_column_is_named(self, site):
+        config = site.config(
+            "RFR3",
+            column_map=ColumnMap(
+                {"shortwave": "SW", "vpd": "VPD_F_MDS", "air_temperature": "TA_F_MDS"}
+            ),
+            hyperparameter_grid=TEST_GRID,
+        )
+        with pytest.raises(ValidationError, match="mapped driver column"):
+            validate_rfr(site.frame, config=config, targets="LE", qc_columns="LE_QC")
 
 
-def test_a_within_day_strategy_leaves_long_gaps_all_but_unpredictable(
-    site: pd.DataFrame,
-) -> None:
-    # The literal reading of ambiguity A4, and what it costs. A 30-day gap holds
-    # no visible target observation, so no whole day inside it has statistics of
-    # its own and almost nothing inside it can be predicted - the survivors are
-    # the partial days at each end, where the gap starts and stops mid-day.
-    settings = config(
-        "RFR3",
-        features=FeatureConfig(daily_statistics_strategy="within_day"),
-        validation=ValidationConfig(gaps=GapScenarioConfig(gap_mix={"very_long": 1.0})),
-    )
-    strict = validate_rfr(site, targets="NEE", config=settings, qc_columns=QC_COLUMNS)
-    daily = strict["NEE"].features.daily_statistics
-    assert daily is not None
-
-    assert strict["NEE"].coverage < 0.10
-    assert daily.n_days_missing > 0
-    assert daily.n_days_from_neighbour == 0
-
-    # The default recovers what the strict reading forfeits, without ever reading
-    # a held-out value: see the leakage test above, which uses the same default.
-    lenient = validate_rfr(
-        site,
-        targets="NEE",
-        config=config("RFR3", validation=settings.validation),
-        qc_columns=QC_COLUMNS,
-    )
-    assert lenient["NEE"].coverage == 1.0
+def test_a_manifest_from_another_record_is_rejected(site):
+    """A handed-in manifest that withholds nothing would score an empty test set."""
+    elsewhere = synthetic_site(days=365, start="2001-01-01", seed=7)
+    with pytest.raises(ValidationError, match="withholds no row"):
+        validate_rfr(
+            site.frame,
+            config=_config(site, "RFR3"),
+            targets="LE",
+            qc_columns="LE_QC",
+            gaps=elsewhere.known_gaps(),
+        )

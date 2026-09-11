@@ -1,547 +1,624 @@
-"""Validation metrics.
+"""Validation metrics (``docs/method_spec.md`` section 6).
 
-The quantities the paper reports for artificial-gap validation
-(``docs/method_spec.md`` section 6): the coefficient of determination, the
-regression slope of filled on measured, RMSE, the paper's bias definition, the
-energy-balance ratio, and the all/daytime/nighttime split those core metrics are
-reported over.
+The paper's evaluation quantities, and only those: the four core metrics scored
+on paired measured and predicted values - ``R2``, the regression slope, ``RMSE``
+and the paper's ``bias`` - plus the energy-balance ratio for H and LE. Each is an
+independent function of the values handed to it. Nothing here knows about gaps,
+models, or where a subset came from, so the same functions score a whole
+validation run, one gap class, one daytime subset, or a hand-built fixture.
 
-Two rules shape the module.
+What this module deliberately does not do: choose the subsets. Day/night
+splitting at ``daytime_threshold`` and grouping by gap class are the validation
+layer's job, which hands the resulting slices here one at a time.
 
-* **Orientation is fixed.** Every core metric takes ``measured`` first and
-  ``filled`` second, and the regression that produces the slope puts measured on
-  x and filled on y (method_spec.md 6.1). Swapping them silently would change
-  published numbers, so the argument order is part of the contract.
-* **Aggregate-only reporting is not acceptable.** Nighttime skill is
-  substantially weaker than daytime skill (``docs/supplement_benchmarks.md``),
-  so :func:`metrics_by_subset` reports ``all``, ``daytime`` and ``nighttime``
-  together and no caller has to remember to ask for the split.
+Pairing
+-------
 
-The functions are pure: they take array-likes, never a fitted model or a
-configuration object, and they do not know where the predictions came from. The
-validation workflow assembles them.
+Every paired metric applies the same two rules before it computes anything, and
+:class:`CoreMetrics` reports what they cost:
+
+* **Alignment is checked, never performed.** Two :class:`pandas.Series` with
+  different indexes raise :class:`MetricError` rather than being aligned into a
+  quiet union of missing values. Silent realignment is how a metric ends up
+  comparing a prediction against the wrong timestamp's measurement.
+* **Incomplete pairs are dropped, both sides at once.** A row is scored only when
+  measured *and* predicted are finite - so a row the model left unfilled because
+  its predictors were incomplete (``docs/method_spec.md`` section 5) removes
+  itself from the score instead of poisoning it. ``n`` is the number of pairs
+  that survived, and it is the ``n`` in the bias denominator.
+
+Undefined is ``None``, not ``NaN``
+----------------------------------
+
+An empty subset has no ``RMSE``; a subset whose measurements are all identical
+has no ``R2`` and no slope; an interval whose available energy sums to zero or
+less has no ``EBR``. Every such case returns ``None``. That keeps an undefined metric
+distinguishable from a computed one, survives the trip into a JSON run manifest
+as ``null``, and refuses to propagate silently the way ``NaN`` does through a
+later mean or comparison.
+
+The ``R2`` ambiguity (A12)
+--------------------------
+
+The article reports ``R2`` next to a regression slope and does not say which of
+the two standard quantities it means. :class:`~rfrgapfill.config.R2Definition`
+exposes both. The default is ``residual`` - ``1 - SS_res / SS_tot``, scikit-learn's
+``r2_score`` - because that is the unqualified meaning of "coefficient of
+determination", and because the alternative, the squared Pearson correlation, is
+invariant to any affine rescaling of the predictions and so cannot see a
+systematic offset at all. A package that reports bias in the next column should
+not report an ``R2`` that ignores it.
+
+The two coincide exactly when the predictions are unbiased and their spread has
+shrunk to ``r`` times the measured spread, which is the ordinary behaviour of a
+forest regressing toward the mean. Supplementary Table S3 sits close to that
+regime - its median ``R2`` and median slope agree to about 0.01 in every RFR row
+- so the published numbers do not settle the question either way, and neither
+reading may be called paper exact.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, Union
 
 import numpy as np
 import pandas as pd
 
-from rfrgapfill.config import DEFAULT_DAYTIME_THRESHOLD, MetricSubset, ValidationConfig
+from rfrgapfill.config import R2Definition
+from rfrgapfill.schema import FrozenRecord
 
 __all__ = [
-    "DEFAULT_SUBSETS",
     "CoreMetrics",
+    "EnergyBalanceComparison",
     "MetricError",
-    "MetricSubset",
-    "SubsetMetrics",
+    "MetricInput",
+    "R2Definition",
     "bias",
+    "compare_energy_balance",
     "core_metrics",
-    "daytime_mask",
     "energy_balance_ratio",
-    "metrics_by_subset",
-    "metrics_from_config",
-    "nighttime_mask",
     "r2",
     "regression_slope",
     "rmse",
-    "subset_mask",
 ]
+
+#: What a metric accepts for one series of values.
+MetricInput = Union[pd.Series, "np.ndarray[Any, Any]", Sequence[float]]
 
 
 class MetricError(ValueError):
-    """Raised when values cannot be scored.
+    """Raised when values cannot be scored as given.
 
-    Reports invalid *data* - misaligned or non-numeric inputs, a day/night split
-    requested without radiation - as opposed to
-    :class:`~rfrgapfill.schema.ConfigError`, which reports an invalid
-    configuration. Both subclass :class:`ValueError`.
-
-    An empty subset is not an error: it scores as ``n=0`` with missing metrics,
-    because a site with no nighttime observations is a real and reportable
-    outcome rather than a failure.
+    Reports invalid *data* - series of different lengths, two series indexed
+    differently, values that are not numbers. An invalid *configuration* still
+    raises :class:`~rfrgapfill.schema.ConfigError`.
     """
 
 
-#: Subsets reported by default, matching :class:`~rfrgapfill.config.ValidationConfig`.
-DEFAULT_SUBSETS: Final[tuple[MetricSubset, ...]] = (
-    MetricSubset.ALL,
-    MetricSubset.DAYTIME,
-    MetricSubset.NIGHTTIME,
-)
-
-
 # ---------------------------------------------------------------------------
-# Input coercion
+# Pairing
 # ---------------------------------------------------------------------------
 
 
-def _reference_index(values: Sequence[object]) -> pd.Index | None:
-    """Return the index of the first pandas input, or ``None`` if there is none."""
-    for value in values:
-        if isinstance(value, pd.Series):
-            return value.index
-    return None
-
-
-def _as_float_array(
-    values: object,
-    *,
-    field_name: str,
-    index: pd.Index | None = None,
-    length: int | None = None,
-) -> np.ndarray:
-    """Return ``values`` as a 1-D float array, checked against its companions.
-
-    Pandas inputs are checked for index equality rather than merely for matching
-    length: two series of the same length covering different timestamps would
-    otherwise be scored against each other row by row.
-    """
-    if isinstance(values, pd.Series):
-        if index is not None and not values.index.equals(index):
-            raise MetricError(
-                f"{field_name} does not share an index with the other inputs; "
-                "align the series (for example with .reindex) before scoring"
-            )
-        array = values.to_numpy(dtype=float, na_value=np.nan)
-    else:
-        if isinstance(values, pd.DataFrame):
-            raise MetricError(f"{field_name} must be one-dimensional, got a DataFrame")
-        try:
-            array = np.asarray(values, dtype=float)
-        except (TypeError, ValueError) as error:
-            raise MetricError(f"{field_name} is not numeric: {error}") from error
-    array = np.atleast_1d(array)
+def _as_array(values: MetricInput, *, name: str) -> np.ndarray[Any, Any]:
+    """Return ``values`` as a one-dimensional float array."""
+    if isinstance(values, pd.DataFrame):
+        raise MetricError(f"{name} must be a single series of values, got a DataFrame")
+    data = values.to_numpy() if isinstance(values, pd.Series) else values
+    try:
+        array = np.asarray(data, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise MetricError(f"{name} must hold numeric values: {error}") from error
     if array.ndim != 1:
-        raise MetricError(f"{field_name} must be one-dimensional, got {array.ndim} dimensions")
-    if length is not None and array.size != length:
-        raise MetricError(
-            f"{field_name} has {array.size} value(s) but the other inputs have {length}"
-        )
+        raise MetricError(f"{name} must be one-dimensional, got {array.ndim} dimensions")
     return array
 
 
-def _pair(measured: object, filled: object) -> tuple[np.ndarray, np.ndarray]:
-    """Return ``(measured, filled)`` as aligned float arrays of equal length."""
-    index = _reference_index((measured, filled))
-    x = _as_float_array(measured, field_name="measured", index=index)
-    y = _as_float_array(filled, field_name="filled", index=index, length=x.size)
-    return x, y
+def _aligned(**named: MetricInput) -> tuple[np.ndarray[Any, Any], ...]:
+    """Return the named inputs as float arrays, refusing to align them silently.
 
-
-def _scored(measured: object, filled: object) -> tuple[np.ndarray, np.ndarray]:
-    """Return the pairs that can actually be scored: both values finite.
-
-    A prediction is missing wherever the model had incomplete features
-    (method_spec.md section 7), and the measured side is missing wherever the
-    observation was not genuinely observed. Such pairs carry no information
-    about skill, so they are dropped rather than counted as zero error.
+    Series are required to carry the *same* index, not merely the same length: a
+    metric is meaningful only when row ``i`` of each input describes the same half
+    hour, and pandas would otherwise be happy to align two different time axes
+    into a union of missing values.
     """
-    x, y = _pair(measured, filled)
-    valid = np.isfinite(x) & np.isfinite(y)
-    return x[valid], y[valid]
+    arrays: dict[str, np.ndarray[Any, Any]] = {}
+    reference: tuple[str, pd.Index] | None = None
+    for name, values in named.items():
+        if isinstance(values, pd.Series):
+            if reference is None:
+                reference = (name, values.index)
+            elif not values.index.equals(reference[1]):
+                raise MetricError(
+                    f"{name} and {reference[0]} are indexed differently; metrics compare "
+                    "values row by row and will not align two series for you"
+                )
+        arrays[name] = _as_array(values, name=name)
+    lengths = {name: array.size for name, array in arrays.items()}
+    if len(set(lengths.values())) > 1:
+        detail = ", ".join(f"{name}={length}" for name, length in lengths.items())
+        raise MetricError(f"every series must be the same length, got {detail}")
+    return tuple(arrays.values())
+
+
+def _complete(*arrays: np.ndarray[Any, Any]) -> tuple[np.ndarray[Any, Any], ...]:
+    """Return ``arrays`` restricted to the rows where every one of them is finite."""
+    keep = np.ones(arrays[0].size, dtype=bool)
+    for array in arrays:
+        keep &= np.isfinite(array)
+    return tuple(array[keep] for array in arrays)
+
+
+def _paired(
+    measured: MetricInput, predicted: MetricInput
+) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any]]:
+    """Return the complete (measured, predicted) pairs, in order."""
+    pair = _complete(*_aligned(measured=measured, predicted=predicted))
+    return pair[0], pair[1]
+
+
+def _defined(value: float) -> float | None:
+    """Return ``value`` when it is a real number, otherwise ``None``."""
+    return value if math.isfinite(value) else None
 
 
 # ---------------------------------------------------------------------------
-# Core metrics (method_spec.md 6.1)
+# Core metrics
 # ---------------------------------------------------------------------------
 
 
-def r2(measured: object, filled: object) -> float:
-    """Return the coefficient of determination of ``filled`` against ``measured``.
-
-    ``1 - SS_res / SS_tot``, with residuals taken about the measured values and
-    ``SS_tot`` about their mean - the usual regression-free definition, which
-    (unlike a squared correlation) penalises a prediction that is well
-    correlated but biased or mis-scaled. Returns NaN when fewer than two pairs
-    can be scored or when the measured values do not vary, because the ratio is
-    then undefined rather than zero.
-    """
-    x, y = _scored(measured, filled)
-    if x.size < 2:
-        return float("nan")
-    total = float(np.sum((x - x.mean()) ** 2))
+def _r2(
+    measured: np.ndarray[Any, Any],
+    predicted: np.ndarray[Any, Any],
+    definition: R2Definition,
+) -> float | None:
+    """Compute ``R2`` over complete pairs."""
+    if measured.size == 0:
+        return None
+    centred = measured - measured.mean()
+    total = float(centred @ centred)
     if total == 0.0:
-        return float("nan")
-    residual = float(np.sum((x - y) ** 2))
-    return 1.0 - residual / total
+        # Every measurement is identical: there is no variance to account for, so
+        # neither definition has a value. A single pair lands here too.
+        return None
+    if definition is R2Definition.RESIDUAL:
+        residual = predicted - measured
+        return _defined(1.0 - float(residual @ residual) / total)
+    spread = predicted - predicted.mean()
+    predicted_total = float(spread @ spread)
+    if predicted_total == 0.0:
+        # A constant prediction correlates with nothing.
+        return None
+    covariance = float(centred @ spread)
+    return _defined(covariance * covariance / (total * predicted_total))
 
 
-def regression_slope(measured: object, filled: object) -> float:
-    """Return the ordinary least-squares slope of ``filled`` on ``measured``.
-
-    Orientation is the paper's and is fixed: ``x = measured``, ``y = filled``,
-    fitted with an intercept, so 1.0 means the filled values track the measured
-    amplitude and a slope below 1.0 means the model under-predicts the range.
-    Returns NaN when fewer than two pairs can be scored or when the measured
-    values do not vary.
-    """
-    x, y = _scored(measured, filled)
-    if x.size < 2:
-        return float("nan")
-    centred_x = x - x.mean()
-    variance = float(np.dot(centred_x, centred_x))
-    if variance == 0.0:
-        return float("nan")
-    return float(np.dot(centred_x, y - y.mean()) / variance)
-
-
-def rmse(measured: object, filled: object) -> float:
-    """Return the root mean squared error of ``filled`` against ``measured``.
-
-    In the units of the target. Returns NaN when no pair can be scored.
-    """
-    x, y = _scored(measured, filled)
-    if x.size == 0:
-        return float("nan")
-    return float(np.sqrt(np.mean((y - x) ** 2)))
-
-
-def bias(measured: object, filled: object) -> float:
-    """Return the paper's bias, ``(sum(filled) - sum(measured)) / n``.
-
-    Equivalent to the mean prediction error for equal-weighted observations, and
-    signed: positive means the filled values overestimate. Returns NaN when no
-    pair can be scored.
-    """
-    x, y = _scored(measured, filled)
-    if x.size == 0:
-        return float("nan")
-    return float((y.sum() - x.sum()) / x.size)
-
-
-def energy_balance_ratio(
-    sensible_heat: object,
-    latent_heat: object,
-    net_radiation: object,
-    soil_heat_flux: object,
-) -> float:
-    """Return ``sum(H + LE) / sum(NETRAD - G)`` (method_spec.md 6.4).
-
-    Summed over the rows where all four fluxes are finite, so the numerator and
-    the denominator always cover the same rows. Returns NaN when no such row
-    exists or when the available energy sums to exactly zero, rather than
-    reporting an infinite ratio.
-
-    Called twice over the same artificial-gap intervals - once with measured H
-    and LE, once with filled - the two ratios and their difference say whether
-    gap filling distorted the site's energy balance.
-    """
-    index = _reference_index((sensible_heat, latent_heat, net_radiation, soil_heat_flux))
-    h = _as_float_array(sensible_heat, field_name="sensible_heat", index=index)
-    le = _as_float_array(latent_heat, field_name="latent_heat", index=index, length=h.size)
-    rn = _as_float_array(net_radiation, field_name="net_radiation", index=index, length=h.size)
-    g = _as_float_array(soil_heat_flux, field_name="soil_heat_flux", index=index, length=h.size)
-    valid = np.isfinite(h) & np.isfinite(le) & np.isfinite(rn) & np.isfinite(g)
-    if not valid.any():
-        return float("nan")
-    available = float(np.sum(rn[valid] - g[valid]))
-    if available == 0.0:
-        return float("nan")
-    return float(np.sum(h[valid] + le[valid]) / available)
-
-
-# ---------------------------------------------------------------------------
-# Day/night masks (method_spec.md 6.2)
-# ---------------------------------------------------------------------------
-
-
-def _shortwave_series(shortwave: object) -> pd.Series:
-    """Return ``shortwave`` as a float Series, keeping a pandas index when given."""
-    index = shortwave.index if isinstance(shortwave, pd.Series) else None
-    values = _as_float_array(shortwave, field_name="shortwave")
-    series: pd.Series = pd.Series(values, index=index, name="shortwave")
-    return series
-
-
-def daytime_mask(
-    shortwave: object,
+def r2(
+    measured: MetricInput,
+    predicted: MetricInput,
     *,
-    threshold: float = DEFAULT_DAYTIME_THRESHOLD,
-) -> pd.Series:
-    """Return ``shortwave > threshold``: the paper's daytime definition.
+    definition: R2Definition | str = R2Definition.RESIDUAL,
+) -> float | None:
+    """Return the coefficient of determination, or ``None`` where it is undefined.
 
-    The threshold is downward shortwave radiation in W m-2 and defaults to the
-    paper's 20; pass :attr:`~rfrgapfill.config.ValidationConfig.daytime_threshold`
-    to honour a run's configuration. The comparison is strict, so a value of
-    exactly the threshold is nighttime.
+    :param measured: the known measurements (the paper's ``x``).
+    :param predicted: the model's values for the same rows (the paper's filled
+        series, ``y``).
+    :param definition: which quantity to report (ambiguity A12, see the module
+        docstring). ``residual`` is ``1 - SS_res / SS_tot`` and falls below zero
+        for predictions worse than the measured mean; ``squared_correlation`` is
+        the squared Pearson correlation and stays within ``[0, 1]``.
 
-    Rows with missing radiation are neither daytime nor nighttime: the class is
-    unknown, and guessing one would move real observations into the wrong
-    subset. They still count towards the ``all`` subset, so day and night need
-    not sum to it - :attr:`SubsetMetrics.n_missing_shortwave` records how many.
+    Undefined - and so ``None`` - for an empty subset, for a single pair, and
+    wherever every measurement is identical, since a constant series has no
+    variance to explain. ``squared_correlation`` is additionally undefined for a
+    constant prediction.
     """
-    mask: pd.Series = _shortwave_series(shortwave) > _check_threshold(threshold)
-    return mask
+    return _r2(*_paired(measured, predicted), R2Definition.coerce(definition))
 
 
-def nighttime_mask(
-    shortwave: object,
+def _slope(
+    measured: np.ndarray[Any, Any],
+    predicted: np.ndarray[Any, Any],
     *,
-    threshold: float = DEFAULT_DAYTIME_THRESHOLD,
-) -> pd.Series:
-    """Return ``shortwave <= threshold``: the complement of :func:`daytime_mask`.
+    fit_intercept: bool,
+) -> float | None:
+    """Compute the least-squares slope over complete pairs."""
+    if measured.size == 0:
+        return None
+    if fit_intercept:
+        x = measured - measured.mean()
+        y = predicted - predicted.mean()
+    else:
+        x, y = measured, predicted
+    denominator = float(x @ x)
+    if denominator == 0.0:
+        return None
+    return _defined(float(x @ y) / denominator)
 
-    Complementary only over rows with observed radiation; see
-    :func:`daytime_mask` for missing values.
-    """
-    mask: pd.Series = _shortwave_series(shortwave) <= _check_threshold(threshold)
-    return mask
 
-
-def subset_mask(
-    shortwave: object,
-    subset: MetricSubset | str,
+def regression_slope(
+    measured: MetricInput,
+    predicted: MetricInput,
     *,
-    threshold: float = DEFAULT_DAYTIME_THRESHOLD,
-) -> pd.Series:
-    """Return the boolean mask selecting ``subset``.
+    fit_intercept: bool = True,
+) -> float | None:
+    """Return the least-squares slope of predicted on measured.
 
-    ``all`` selects every row, including rows with missing radiation; ``daytime``
-    and ``nighttime`` apply :func:`daytime_mask` and :func:`nighttime_mask`.
+    The orientation is fixed by the specification and is not an option:
+    ``x = measured``, ``y = predicted`` (``docs/method_spec.md`` section 6.1).
+    Regressing the other way answers a different question and reports a different
+    number for the same data.
+
+    :param measured: the known measurements, ``x``.
+    :param predicted: the model's values for the same rows, ``y``.
+    :param fit_intercept: whether the fit carries an intercept. The default, and
+        the ordinary reading of "linear-regression slope"; ``False`` forces the
+        line through the origin, which the paper neither states nor rules out.
+
+    A slope of 1 means the predictions track the measurements across their range;
+    the shrinkage typical of a forest shows up as a slope below 1. Undefined - and
+    so ``None`` - for an empty subset, and wherever the measurements are constant,
+    since a vertical scatter has no slope.
     """
-    chosen = MetricSubset.coerce(subset)
-    if chosen is MetricSubset.DAYTIME:
-        return daytime_mask(shortwave, threshold=threshold)
-    if chosen is MetricSubset.NIGHTTIME:
-        return nighttime_mask(shortwave, threshold=threshold)
-    series = _shortwave_series(shortwave)
-    every_row: pd.Series = pd.Series(
-        np.ones(len(series), dtype=bool), index=series.index, name="shortwave"
-    )
-    return every_row
+    return _slope(*_paired(measured, predicted), fit_intercept=fit_intercept)
 
 
-def _check_threshold(threshold: float) -> float:
-    """Return ``threshold`` as a finite float or raise :class:`MetricError`."""
-    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
-        raise MetricError(f"daytime threshold must be a number, got {threshold!r}")
-    value = float(threshold)
-    if not np.isfinite(value):
-        raise MetricError(f"daytime threshold must be finite, got {threshold!r}")
-    return value
+def _rmse(measured: np.ndarray[Any, Any], predicted: np.ndarray[Any, Any]) -> float | None:
+    """Compute the root mean squared error over complete pairs."""
+    if measured.size == 0:
+        return None
+    residual = predicted - measured
+    return _defined(math.sqrt(float(residual @ residual) / residual.size))
 
 
-# ---------------------------------------------------------------------------
-# Reported results
-# ---------------------------------------------------------------------------
+def rmse(measured: MetricInput, predicted: MetricInput) -> float | None:
+    """Return the root mean squared error, in the units of the flux.
+
+    :param measured: the known measurements.
+    :param predicted: the model's values for the same rows.
+
+    ``None`` for an empty subset. Errors of both signs contribute, so unlike
+    :func:`bias` this cannot cancel: a run with an ``RMSE`` of 30 W m-2 and a bias
+    of 0 is making large errors that happen to balance.
+    """
+    return _rmse(*_paired(measured, predicted))
+
+
+def _bias(measured: np.ndarray[Any, Any], predicted: np.ndarray[Any, Any]) -> float | None:
+    """Compute the paper's bias over complete pairs."""
+    if measured.size == 0:
+        return None
+    difference = float(predicted.sum()) - float(measured.sum())
+    return _defined(difference / measured.size)
+
+
+def bias(measured: MetricInput, predicted: MetricInput) -> float | None:
+    """Return the paper's bias, ``(sum(predicted) - sum(measured)) / n``.
+
+    :param measured: the known measurements.
+    :param predicted: the model's values for the same rows.
+
+    Computed in the published form (``docs/method_spec.md`` section 6.1), which
+    for equally weighted observations is the mean prediction error. The sign is
+    the direction of the error in the predictions: positive means the fill runs
+    high. ``n`` counts the complete pairs, so a row the model left unfilled is
+    absent from both sums and from the denominator alike. ``None`` for an empty
+    subset.
+    """
+    return _bias(*_paired(measured, predicted))
 
 
 @dataclass(frozen=True)
-class CoreMetrics:
-    """The four core metrics of method_spec.md 6.1 over one set of pairs."""
+class CoreMetrics(FrozenRecord):
+    """The four core metrics of ``docs/method_spec.md`` section 6.1, scored together.
 
-    #: Pairs actually scored: both the measurement and the prediction finite.
+    Produced by :func:`core_metrics` for one subset of one target - all of it, its
+    daytime rows, one gap class - and carrying the row accounting that makes the
+    numbers readable: :attr:`n` pairs were scored out of :attr:`n_offered` rows,
+    and the difference is rows that had no measurement, no prediction, or neither.
+
+    A field is ``None`` where its metric is undefined for this subset, rather than
+    zero or ``NaN``; :attr:`is_empty` separates "nothing to score" from "scored,
+    but the metric has no value here".
+    """
+
+    #: Complete measured/predicted pairs the metrics were computed from.
     n: int
-    #: Coefficient of determination.
-    r2: float
-    #: Regression slope, measured on x and filled on y.
-    slope: float
-    #: Root mean squared error, in target units.
-    rmse: float
-    #: ``(sum(filled) - sum(measured)) / n``.
-    bias: float
+    #: Rows offered, before incomplete pairs were dropped.
+    n_offered: int
+    #: Coefficient of determination, under :attr:`r2_definition`.
+    r2: float | None
+    #: Least-squares slope of predicted on measured.
+    slope: float | None
+    #: Root mean squared error, in the units of the flux.
+    rmse: float | None
+    #: ``(sum(predicted) - sum(measured)) / n``.
+    bias: float | None
+    #: Which coefficient of determination :attr:`r2` is (A12).
+    r2_definition: R2Definition | str = R2Definition.RESIDUAL
+
+    def __post_init__(self) -> None:
+        if self.n < 0 or self.n_offered < 0:
+            raise MetricError("row counts cannot be negative")
+        if self.n > self.n_offered:
+            raise MetricError(
+                f"scored {self.n} pair(s) out of {self.n_offered} offered row(s); "
+                "dropping incomplete pairs cannot increase the count"
+            )
+        object.__setattr__(self, "r2_definition", R2Definition.coerce(self.r2_definition))
 
     @property
     def is_empty(self) -> bool:
-        """Whether no pair could be scored, so every metric is missing."""
+        """Whether no complete pair was available to score."""
         return self.n == 0
 
-    def to_dict(self) -> dict[str, Any]:
-        """Return a serialisable representation for the run report.
+    @property
+    def dropped_incomplete(self) -> int:
+        """Offered rows that lacked a measurement, a prediction, or both."""
+        return self.n_offered - self.n
 
-        Metrics that are undefined stay NaN rather than becoming ``0.0``: a
-        subset that could not be scored must not read as a perfect or a failed
-        one.
-        """
+    @property
+    def r2_kind(self) -> R2Definition:
+        """The validated ``R2`` definition (narrowed from the input union)."""
+        definition = self.r2_definition
+        assert isinstance(definition, R2Definition)
+        return definition
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable summary for the run manifest."""
         return {
             "n": self.n,
+            "n_offered": self.n_offered,
+            "dropped_incomplete": self.dropped_incomplete,
             "r2": self.r2,
+            "r2_definition": self.r2_kind.value,
             "slope": self.slope,
             "rmse": self.rmse,
             "bias": self.bias,
         }
 
 
-def core_metrics(measured: object, filled: object) -> CoreMetrics:
-    """Return :class:`CoreMetrics` for one set of measured/filled pairs.
+def core_metrics(
+    measured: MetricInput,
+    predicted: MetricInput,
+    *,
+    definition: R2Definition | str = R2Definition.RESIDUAL,
+    fit_intercept: bool = True,
+) -> CoreMetrics:
+    """Score one subset on all four core metrics at once.
 
-    Computed over the pairs where both sides are finite; ``n`` reports how many
-    that was, so a metric can never be read without its sample size.
+    A convenience over :func:`r2`, :func:`regression_slope`, :func:`rmse` and
+    :func:`bias` that pairs the inputs once and reports how many rows survived.
+    The values are identical to calling the four functions separately with the
+    same arguments - they share the same kernels.
+
+    :param measured: the known measurements.
+    :param predicted: the model's values for the same rows.
+    :param definition: which ``R2`` to report (A12).
+    :param fit_intercept: whether the slope's fit carries an intercept.
     """
-    x, y = _scored(measured, filled)
+    r2_definition = R2Definition.coerce(definition)
+    offered = _aligned(measured=measured, predicted=predicted)
+    clean_measured, clean_predicted = _complete(*offered)
     return CoreMetrics(
-        n=int(x.size),
-        r2=r2(x, y),
-        slope=regression_slope(x, y),
-        rmse=rmse(x, y),
-        bias=bias(x, y),
+        n=int(clean_measured.size),
+        n_offered=int(offered[0].size),
+        r2=_r2(clean_measured, clean_predicted, r2_definition),
+        slope=_slope(clean_measured, clean_predicted, fit_intercept=fit_intercept),
+        rmse=_rmse(clean_measured, clean_predicted),
+        bias=_bias(clean_measured, clean_predicted),
+        r2_definition=r2_definition,
     )
+
+
+# ---------------------------------------------------------------------------
+# Energy-balance ratio
+# ---------------------------------------------------------------------------
+
+
+def _ebr(
+    sensible_heat: np.ndarray[Any, Any],
+    latent_heat: np.ndarray[Any, Any],
+    net_radiation: np.ndarray[Any, Any],
+    soil_heat_flux: np.ndarray[Any, Any],
+) -> float | None:
+    """Compute ``sum(H + LE) / sum(NETRAD - G)`` over complete rows."""
+    if sensible_heat.size == 0:
+        return None
+    available_energy = float((net_radiation - soil_heat_flux).sum())
+    if not available_energy > 0.0:
+        # No net energy input over this interval. At zero the ratio does not
+        # exist. Below zero - an interval dominated by night, when the surface
+        # loses energy - it exists but reads backwards: more turbulent flux gives
+        # a *smaller* ratio, so a closure, and what a fill did to it, would both
+        # be reported with the wrong sign. Neither is a closure.
+        return None
+    turbulent_flux = float((sensible_heat + latent_heat).sum())
+    return _defined(turbulent_flux / available_energy)
+
+
+def energy_balance_ratio(
+    *,
+    sensible_heat: MetricInput,
+    latent_heat: MetricInput,
+    net_radiation: MetricInput,
+    soil_heat_flux: MetricInput,
+) -> float | None:
+    """Return ``sum(H + LE) / sum(NETRAD - G)`` (``docs/method_spec.md`` section 6.4).
+
+    How well the turbulent fluxes account for the available energy over the rows
+    given. A ratio of 1 is closure; eddy-covariance sites typically fall short of
+    it, and the quantity of interest is whether *filling* the fluxes changes that
+    - see :func:`compare_energy_balance`.
+
+    Every argument is keyword-only. All four are fluxes in W m-2, and swapping
+    ``net_radiation`` for ``soil_heat_flux`` positionally would return a plausible
+    wrong number rather than fail.
+
+    A row contributes only when all four of its values are finite, so numerator
+    and denominator are always summed over exactly the same rows. Summing each
+    over whatever it happened to have would compare the turbulent flux of one set
+    of half hours against the available energy of another.
+
+    Returns ``None`` when no row is complete, and when the available energy sums
+    to zero or less. Zero a short interval can reach by cancellation between night
+    and day; below zero - a night-dominated interval - the ratio would read
+    backwards, falling as the turbulent flux rises. The rule applies to the
+    interval's sum, so a night row inside a positive interval still counts.
+    """
+    rows = _complete(
+        *_aligned(
+            sensible_heat=sensible_heat,
+            latent_heat=latent_heat,
+            net_radiation=net_radiation,
+            soil_heat_flux=soil_heat_flux,
+        )
+    )
+    return _ebr(*rows)
+
+
+def _count_incomplete(*arrays: np.ndarray[Any, Any]) -> int:
+    """Return how many rows lack a finite value in at least one of ``arrays``."""
+    present = np.ones(arrays[0].size, dtype=bool)
+    for array in arrays:
+        present &= np.isfinite(array)
+    return int((~present).sum())
 
 
 @dataclass(frozen=True)
-class SubsetMetrics:
-    """Core metrics reported over the all/daytime/nighttime subsets.
+class EnergyBalanceComparison(FrozenRecord):
+    """Measured against filled energy-balance ratio, over the same rows.
 
-    The result of one validation run's scoring step. It always carries the
-    threshold it used and how many rows had no radiation to classify, so a
-    reported nighttime number can be traced back to the split that produced it.
+    The pair required by ``docs/method_spec.md`` section 6.4: the ratio from the
+    measured H and LE, the ratio from the filled H and LE, and their difference.
+    Both are computed over one shared set of rows, so :attr:`difference` reports
+    what the fill did to closure and not what a different row set would have done.
+
+    The row accounting says what that shared row set cost: :attr:`n` rows were
+    complete out of :attr:`n_offered`, and each ``n_missing_*`` counts the offered
+    rows lacking that component. A row missing two components is counted under
+    both, so the three counts can sum to more than the rows dropped - never less.
     """
 
-    #: Metrics keyed by subset, in the order they were requested.
-    metrics: Mapping[MetricSubset, CoreMetrics]
-    #: The daytime threshold in W m-2 that produced the split.
-    daytime_threshold: float
-    #: Scored pairs whose radiation was missing, so they joined neither day nor
-    #: night. It is exactly the shortfall in ``daytime.n + nighttime.n`` against
-    #: ``all.n``, which is why the count is reported next to the metrics.
-    n_missing_shortwave: int
+    #: Rows both ratios were computed from.
+    n: int
+    #: Rows offered, before incomplete ones were dropped.
+    n_offered: int
+    #: ``EBR`` from the measured H and LE.
+    measured: float | None
+    #: ``EBR`` from the filled H and LE.
+    filled: float | None
+    #: ``filled - measured``, or ``None`` unless both are defined.
+    difference: float | None
+    #: ``sum(NETRAD - G)`` over the :attr:`n` rows: the denominator both ratios
+    #: share, or ``None`` when no row is complete. At or below zero both ratios
+    #: are undefined, and this is the value that says why.
+    available_energy: float | None = None
+    #: Offered rows lacking a measured H or LE.
+    n_missing_measured: int = 0
+    #: Offered rows lacking a filled H or LE: rows the model left unpredicted.
+    n_missing_filled: int = 0
+    #: Offered rows lacking NETRAD or G.
+    n_missing_available_energy: int = 0
 
-    def __getitem__(self, subset: MetricSubset | str) -> CoreMetrics:
-        """Return the metrics for ``subset``, accepting ``"day"``/``"night"``."""
-        chosen = MetricSubset.coerce(subset)
-        try:
-            return self.metrics[chosen]
-        except KeyError:
-            raise KeyError(
-                f"{chosen.value} was not reported; this run scored: "
-                f"{', '.join(subset.value for subset in self.metrics)}"
-            ) from None
-
-    def __contains__(self, subset: object) -> bool:
-        try:
-            return MetricSubset.coerce(subset) in self.metrics
-        except ValueError:
-            return False
+    def __post_init__(self) -> None:
+        missing = (self.n_missing_measured, self.n_missing_filled, self.n_missing_available_energy)
+        if min(self.n, self.n_offered, *missing) < 0:
+            raise MetricError("row counts cannot be negative")
+        if self.n > self.n_offered:
+            raise MetricError(
+                f"compared {self.n} row(s) out of {self.n_offered} offered; "
+                "dropping incomplete rows cannot increase the count"
+            )
+        dropped = self.n_offered - self.n
+        if max(missing) > dropped:
+            raise MetricError(
+                f"a component is reported missing from {max(missing)} row(s), more rows than "
+                f"the {dropped} dropped; a row missing any component is never compared"
+            )
+        if dropped > sum(missing):
+            raise MetricError(
+                f"{dropped - sum(missing)} dropped row(s) are unexplained: every dropped row "
+                "must be missing at least one component"
+            )
 
     @property
-    def all(self) -> CoreMetrics:
-        """Metrics over every scored pair."""
-        return self[MetricSubset.ALL]
+    def is_empty(self) -> bool:
+        """Whether no complete row was available."""
+        return self.n == 0
 
     @property
-    def daytime(self) -> CoreMetrics:
-        """Metrics over pairs with ``shortwave > daytime_threshold``."""
-        return self[MetricSubset.DAYTIME]
-
-    @property
-    def nighttime(self) -> CoreMetrics:
-        """Metrics over pairs with ``shortwave <= daytime_threshold``."""
-        return self[MetricSubset.NIGHTTIME]
-
-    def to_frame(self) -> pd.DataFrame:
-        """Return one row per subset, for tables and multi-site reports."""
-        frame: pd.DataFrame = pd.DataFrame(
-            [metrics.to_dict() for metrics in self.metrics.values()],
-            index=pd.Index([subset.value for subset in self.metrics], name="subset"),
-        )
-        return frame
+    def dropped_incomplete(self) -> int:
+        """Offered rows that lacked at least one component."""
+        return self.n_offered - self.n
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a serialisable representation for the run report."""
+        """Return a JSON-serialisable summary for the run manifest."""
         return {
-            "daytime_threshold": self.daytime_threshold,
-            "n_missing_shortwave": self.n_missing_shortwave,
-            "subsets": {
-                subset.value: metrics.to_dict() for subset, metrics in self.metrics.items()
-            },
+            "n": self.n,
+            "n_offered": self.n_offered,
+            "n_missing_measured": self.n_missing_measured,
+            "n_missing_filled": self.n_missing_filled,
+            "n_missing_available_energy": self.n_missing_available_energy,
+            "available_energy": self.available_energy,
+            "measured_ebr": self.measured,
+            "filled_ebr": self.filled,
+            "difference": self.difference,
         }
 
 
-# ---------------------------------------------------------------------------
-# Subset reporting (method_spec.md 6.2)
-# ---------------------------------------------------------------------------
-
-
-def metrics_by_subset(
-    measured: object,
-    filled: object,
-    shortwave: object | None = None,
+def compare_energy_balance(
     *,
-    threshold: float = DEFAULT_DAYTIME_THRESHOLD,
-    subsets: Sequence[MetricSubset | str] = DEFAULT_SUBSETS,
-) -> SubsetMetrics:
-    """Return core metrics for the ``all``, ``daytime`` and ``nighttime`` subsets.
+    measured_sensible_heat: MetricInput,
+    measured_latent_heat: MetricInput,
+    filled_sensible_heat: MetricInput,
+    filled_latent_heat: MetricInput,
+    net_radiation: MetricInput,
+    soil_heat_flux: MetricInput,
+) -> EnergyBalanceComparison:
+    """Return the measured and filled energy-balance ratios and their difference.
 
-    ``measured`` and ``filled`` are the known measurements inside the artificial
-    gaps and the model's predictions for them; ``shortwave`` is the downward
-    shortwave radiation on the same rows, which splits day from night. Pandas
-    inputs must share an index - a mismatch raises rather than being scored row
-    by row.
+    The section 6.4 comparison: the same artificial-gap rows scored twice, once
+    with the measured H and LE and once with the values the model put there.
 
-    ``shortwave`` may be omitted only when ``subsets`` asks for ``all`` alone;
-    otherwise the split cannot be made, and the omission is an error rather than
-    a silently missing subset.
+    A row is used only where all six series are finite, so both ratios cover an
+    identical set of half hours. Scoring each over its own complete rows would let
+    the difference reflect the change in row set as much as the change in flux,
+    which is the one thing this comparison exists to rule out.
 
-    The scored counts satisfy ``all.n == daytime.n + nighttime.n +
-    n_missing_shortwave`` whenever all three subsets are reported.
+    Returns ``None`` for either ratio where it is undefined, and for
+    :attr:`~EnergyBalanceComparison.difference` unless both are defined. The
+    shared denominator and the per-component row accounting are reported either
+    way, so an undefined or thinly supported comparison says why.
     """
-    limit = _check_threshold(threshold)
-    requested = _requested_subsets(subsets)
-    index = _reference_index((measured, filled, shortwave))
-    x = _as_float_array(measured, field_name="measured", index=index)
-    y = _as_float_array(filled, field_name="filled", index=index, length=x.size)
-
-    if shortwave is None:
-        unclassifiable = [subset for subset in requested if subset is not MetricSubset.ALL]
-        if unclassifiable:
-            raise MetricError(
-                "shortwave radiation is required to report the "
-                f"{', '.join(subset.value for subset in unclassifiable)} subset(s); "
-                "pass the shortwave driver or request only the 'all' subset"
-            )
-        radiation = np.full(x.size, np.nan)
-    else:
-        radiation = _as_float_array(shortwave, field_name="shortwave", index=index, length=x.size)
-
-    results: dict[MetricSubset, CoreMetrics] = {}
-    for subset in requested:
-        selected = subset_mask(radiation, subset, threshold=limit).to_numpy(dtype=bool)
-        results[subset] = core_metrics(x[selected], y[selected])
-
-    scored = np.isfinite(x) & np.isfinite(y)
-    return SubsetMetrics(
-        metrics=MappingProxyType(results),
-        daytime_threshold=limit,
-        n_missing_shortwave=int(np.sum(scored & ~np.isfinite(radiation))),
+    offered = _aligned(
+        measured_sensible_heat=measured_sensible_heat,
+        measured_latent_heat=measured_latent_heat,
+        filled_sensible_heat=filled_sensible_heat,
+        filled_latent_heat=filled_latent_heat,
+        net_radiation=net_radiation,
+        soil_heat_flux=soil_heat_flux,
     )
-
-
-def metrics_from_config(
-    measured: object,
-    filled: object,
-    shortwave: object | None = None,
-    *,
-    config: ValidationConfig,
-) -> SubsetMetrics:
-    """Return :func:`metrics_by_subset` using a run's validation configuration.
-
-    The threshold and the reported subsets come from ``config``, so a run cannot
-    report one split while its manifest records another.
-    """
-    return metrics_by_subset(
-        measured,
-        filled,
-        shortwave,
-        threshold=config.daytime_threshold,
-        subsets=config.metric_subsets,
+    measured_h, measured_le, filled_h, filled_le, radiation, soil = _complete(*offered)
+    measured_ratio = _ebr(measured_h, measured_le, radiation, soil)
+    filled_ratio = _ebr(filled_h, filled_le, radiation, soil)
+    difference = (
+        filled_ratio - measured_ratio
+        if measured_ratio is not None and filled_ratio is not None
+        else None
     )
-
-
-def _requested_subsets(subsets: Sequence[MetricSubset | str]) -> tuple[MetricSubset, ...]:
-    """Return the requested subsets, validated, deduplicated and order-preserving."""
-    if isinstance(subsets, str) or not isinstance(subsets, Sequence):
-        raise MetricError(f"subsets must be a sequence of metric subsets, got {subsets!r}")
-    if not subsets:
-        raise MetricError("subsets must name at least one metric subset")
-    ordered: list[MetricSubset] = []
-    for entry in subsets:
-        subset = MetricSubset.coerce(entry)
-        if subset not in ordered:
-            ordered.append(subset)
-    return tuple(ordered)
+    return EnergyBalanceComparison(
+        n=int(measured_h.size),
+        n_offered=int(offered[0].size),
+        measured=measured_ratio,
+        filled=filled_ratio,
+        difference=difference,
+        available_energy=float((radiation - soil).sum()) if radiation.size else None,
+        n_missing_measured=_count_incomplete(offered[0], offered[1]),
+        n_missing_filled=_count_incomplete(offered[2], offered[3]),
+        n_missing_available_energy=_count_incomplete(offered[4], offered[5]),
+    )

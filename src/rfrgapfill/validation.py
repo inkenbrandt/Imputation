@@ -1,295 +1,693 @@
-"""Artificial-gap validation: the paper's experiment as one call.
+"""End-to-end artificial-gap validation (method_spec.md sections 4-6; Step 13).
 
-:func:`validate_rfr` runs the whole of Zhu et al.'s validation design end to end
-and returns everything needed to read the result: predictions, metrics, the gap
-manifest and the configuration that produced them.
+The layer that turns the pieces below it into the paper's experiment. One call
+places the artificial gaps, hides their truth, builds leakage-safe features,
+fits, predicts the withheld intervals and scores them::
 
-The order of operations is the method, not an implementation detail::
+    report = validate_rfr(df, config=config, targets=["NEE", "H", "LE"])
+    report.to_frame()          # target x gap class x subset, tidy
+    report["LE"].manifest()    # the run manifest of that arm
 
-    identify genuinely measured target rows      provenance.observed_mask
-        v
-    generate the artificial-gap manifest         gaps.GapScenarioGenerator
-        v
-    keep the hidden truth aside                  never passed to features
-        v
-    mask the artificial gaps                     a masked copy of the frame
-        v
-    build leakage-safe features                  features.build_feature_matrix
-        v
-    fit and tune on what is left                 model.RFRModel
-        v
-    predict inside the gaps                      the withheld 25%
-        v
-    score against the hidden truth               metrics + EBR
+and performs the steps in the order ``docs/method_spec.md`` section 3.5
+requires, because the order *is* the protection:
 
-Two of those steps are the ones that make or break the experiment.
+1. the gap scenario places its intervals over the genuinely observed values;
+2. the holdout mask is derived from those intervals - before any target-derived
+   feature exists;
+3. :func:`~rfrgapfill.leakage.build_validation_features` hides the held-out
+   values and computes the daily statistics from what remains visible;
+4. the model is fitted on the remaining eligible observations - the ~75% of
+   Figure 2, never a random row-wise split;
+5. the withheld rows are predicted and scored against the truth that was kept
+   back for exactly that purpose, and for nothing else.
 
-**The gap mask is built before the features.** The daily target statistics of
-method_spec.md 3.4 are derived from the target itself, so building them first
-would let each held-out value help predict itself and inflate every metric
-reported here (3.5, ambiguity A6). The masking is belt and braces: the withheld
-values are removed from the frame the features are built from *and* excluded by
-the ``available`` mask, so no future feature can reintroduce the leak quietly.
+What this module adds to those pieces is the *bookkeeping* the paper's tables
+need: the same predictions scored over all rows, daytime rows and nighttime rows
+(section 6.2), again per gap class (section 6.3), the spread of bias across the
+gaps of a class, and the energy-balance comparison of section 6.4 when H and LE
+were validated together.
 
-**The withheld observations are the test set.** Not a random 25% of rows - a set
-of contiguous 24-hour, 7-day and 30-day intervals (method_spec.md 4.5). A
-row-wise split would leave every held-out half-hour surrounded by its own
-neighbours and would measure a problem the paper is not about; this package does
-not offer one.
+Three properties are worth stating outright, since a validation number is only
+as good as what produced it:
+
+* **the caller's frame is never modified.** Every stage works on a copy on a
+  validated time axis, and the observed values that come back out are the ones
+  that went in.
+* **the gap locations are shared.** One manifest, one mask, every target - the
+  paper's joint NEE/H/LE rule (section 4.4) - so the arms are comparable to each
+  other and to the ORF benchmark scored on the same mask (section 3.6).
+* **a run blocked by ambiguity A4 says so.** Under the default
+  ``daily_statistic_strategy="missing"`` a gap covering a whole calendar day
+  leaves every row of that day without daily statistics, so the 7-day and 30-day
+  classes yield no complete feature rows and receive no predictions at all. That
+  is reported as a :class:`ValidationWarning` and visible in the row accounting
+  rather than arriving as a mysteriously empty gap class.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+import warnings
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Any, Final, cast
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from rfrgapfill.config import (
+from rfrgapfill.config import DEFAULT_DAYTIME_THRESHOLD, MetricSubset, Mode, RFRConfig
+from rfrgapfill.fill import method_label
+from rfrgapfill.gaps import GapManifest, GapScenarioGenerator, Shortfall
+from rfrgapfill.leakage import (
+    ValidationFeatureSet,
+    build_validation_features,
+    require_no_target_leakage,
+)
+from rfrgapfill.metrics import (
+    CoreMetrics,
+    EnergyBalanceComparison,
+    compare_energy_balance,
+    core_metrics,
+)
+from rfrgapfill.model import IncompletePolicy, RFRModel
+from rfrgapfill.provenance import RunManifest
+from rfrgapfill.schema import (
+    EBR_VARIABLES,
+    NET_RADIATION,
+    SHORTWAVE,
+    SOIL_HEAT_FLUX,
     ColumnMap,
     ConfigError,
-    FeatureConfig,
+    FrozenRecord,
     GapClass,
-    GapScenarioConfig,
-    Mode,
-    RFRConfig,
-    ValidationConfig,
 )
-from rfrgapfill.features import FeatureMatrix, build_feature_matrix
-from rfrgapfill.gaps import ArtificialGaps, GapScenarioGenerator
-from rfrgapfill.metrics import (
-    SubsetMetrics,
-    bias,
-    energy_balance_ratio,
-    metrics_from_config,
-)
-from rfrgapfill.model import RFRModel, TrainingReport
-from rfrgapfill.provenance import observed_mask, run_manifest
-from rfrgapfill.schema import NET_RADIATION, SHORTWAVE, SOIL_HEAT_FLUX
-from rfrgapfill.time import DuplicatePolicy, TimeAxis, prepare_time_index
+from rfrgapfill.time import DuplicatePolicy, TimeAxis, as_datetime_index, prepare_time_index
 
 __all__ = [
-    "SCENARIOS",
-    "EnergyBalance",
-    "GapClassMetrics",
+    "ENERGY_BALANCE_TABLE_COLUMNS",
+    "BiasSpread",
+    "EnergyBalanceCheck",
     "TargetValidation",
     "ValidationError",
     "ValidationReport",
-    "compare_receptive_limiter",
+    "ValidationWarning",
+    "daytime_mask",
+    "gap_class_labels",
+    "subset_masks",
     "validate_rfr",
 ]
 
+#: The two fluxes the energy-balance ratio is defined for (method_spec.md 6.4).
+SENSIBLE_HEAT: str = "H"
+LATENT_HEAT: str = "LE"
 
-class ValidationError(ValueError):
-    """Raised when a validation run cannot be carried out as requested.
 
-    Reports a run that cannot proceed - a target the frame does not carry, no
-    genuinely observed values to withhold, a scenario name that is not
-    registered. A run that *completes* but falls short of the requested gap
-    design is not an error: it is reported on
-    :attr:`ArtificialGaps.satisfied <rfrgapfill.gaps.ArtificialGaps.satisfied>`.
+class ValidationError(RuntimeError):
+    """Raised when an artificial-gap validation run cannot be assembled."""
+
+
+class ValidationWarning(UserWarning):
+    """Warns that a run completed but scored nothing it withheld.
+
+    Not an error: a run whose gaps produced no complete feature rows is a
+    legitimate consequence of ambiguity A4's default, and it must not pass
+    quietly, because "no metrics for the 30-day class" reads like a defect and is
+    actually a configuration choice (method_spec.md section 3.4).
     """
 
 
-#: Named artificial-gap scenarios. ``zhu2022`` is the published design: 25%
-#: withheld as 24-hour, 7-day and 30-day gaps mixed 20/30/50, each interval
-#: needing 50% genuine measurements (method_spec.md section 4).
-SCENARIOS: Final[Mapping[str, GapScenarioConfig]] = MappingProxyType(
-    {"zhu2022": GapScenarioConfig()}
-)
+# ---------------------------------------------------------------------------
+# Row selections: subsets and gap classes
+# ---------------------------------------------------------------------------
 
-#: Default target names the energy-balance ratio is computed for (6.4).
-_DEFAULT_HEAT_TARGETS: Final[tuple[str, str]] = ("H", "LE")
+
+def daytime_mask(
+    shortwave: pd.Series,
+    *,
+    threshold: float = DEFAULT_DAYTIME_THRESHOLD,
+) -> pd.Series:
+    """Return the daytime rows: downward shortwave radiation above ``threshold``.
+
+    The paper's definition (method_spec.md section 6.2) is ``SW_IN > 20 W m-2``,
+    so the boundary value itself is night. A row whose radiation is missing is
+    neither day nor night - see :func:`subset_masks`.
+    """
+    values = np.asarray(pd.to_numeric(shortwave, errors="coerce").to_numpy(), dtype=float)
+    day: pd.Series = pd.Series(values > float(threshold), index=shortwave.index, name="daytime")
+    return day
+
+
+def subset_masks(
+    shortwave: pd.Series,
+    *,
+    threshold: float = DEFAULT_DAYTIME_THRESHOLD,
+) -> Mapping[MetricSubset, pd.Series]:
+    """Return the ``all``/``daytime``/``nighttime`` row masks (method_spec.md 6.2).
+
+    ``daytime`` is ``SW_IN > threshold`` and ``nighttime`` is
+    ``SW_IN <= threshold``, so the two partition every row whose radiation is
+    known. A row with **missing** radiation belongs to ``all`` and to neither of
+    the others: the paper's split is defined by a measurement, and putting an
+    unknown row on one side of it would silently invent that measurement.
+    """
+    values = np.asarray(pd.to_numeric(shortwave, errors="coerce").to_numpy(), dtype=float)
+    index = shortwave.index
+    return MappingProxyType(
+        {
+            MetricSubset.ALL: pd.Series(True, index=index, name="all"),
+            MetricSubset.DAYTIME: pd.Series(values > float(threshold), index=index, name="daytime"),
+            MetricSubset.NIGHTTIME: pd.Series(
+                values <= float(threshold), index=index, name="nighttime"
+            ),
+        }
+    )
+
+
+def gap_class_labels(gaps: GapManifest, values: object) -> pd.Series:
+    """Return the gap class each timestamp falls in, or ``None`` outside every gap.
+
+    The label metrics are grouped by for section 6.3's per-class reporting, and a
+    tidy column in its own right: joined onto a prediction frame it says which
+    duration class produced each scored row.
+    """
+    if not isinstance(gaps, GapManifest):
+        raise ValidationError(f"gaps must be a GapManifest, got {type(gaps).__name__}")
+    index = as_datetime_index(values, field_name="timestamps")
+    # `np.full(..., None)` rather than a scalar `None`, which pandas would turn
+    # into NaN: an unlabelled row is *absent from every gap*, not a missing
+    # number, and `.isna()` recognises both.
+    labels: pd.Series = pd.Series(
+        np.full(len(index), None, dtype=object), index=index, dtype=object, name="gap_class"
+    )
+    for gap in gaps:
+        # Half-open [start, end), the convention every other interval in this
+        # package uses, so adjacent gaps never claim the same row.
+        labels.loc[(index >= gap.start) & (index < gap.end)] = gap.gap_class.value
+    return labels
 
 
 # ---------------------------------------------------------------------------
-# Results
+# Bias spread within a gap class
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class GapClassMetrics:
-    """Metrics for one gap-duration class (method_spec.md 6.3).
+class BiasSpread(FrozenRecord):
+    """How bias is distributed across the individual gaps of one duration class.
 
-    Reported per class because that is where the paper's claim lives: RFR is
-    offered as a method that stays stable as gaps get longer, and an aggregate
-    number cannot show whether it did.
+    One bias per placed interval - not per row - because that is the quantity
+    Supplementary Table S8 spreads: a single gap the model drifts through is one
+    bad fill, however many half hours it covers. This is the single-site analogue
+    of the published cross-site IQR; the cross-site version belongs to the
+    multi-site reproduction layer and is not this.
+
+    Every field is ``None`` where the quantity is undefined, matching
+    :mod:`rfrgapfill.metrics`: one scored gap has a bias but no spread, and none
+    at all has neither.
     """
 
-    #: The duration class these metrics cover.
-    gap_class: GapClass
-    #: All/daytime/nighttime metrics over the withheld rows of this class.
-    metrics: SubsetMetrics
-    #: Gap events of this class that contributed scored rows.
+    #: Gaps of this class that had at least one scored row.
     n_gaps: int
-    #: Bias of each individual gap event, in manifest order.
-    bias_by_gap: tuple[float, ...]
-
-    @property
-    def bias_iqr(self) -> float:
-        """Interquartile range of the per-gap biases (method_spec.md 6.3).
-
-        Spread *between gap events*, not between half-hours: it answers how much
-        the bias of a filled gap varies from one gap to the next, which is the
-        quantity the supplement's uncertainty discussion is built on. NaN with
-        fewer than two events, where a range would be meaningless.
-
-        The normalized joint-uncertainty ratios of Supplementary Table S8 are a
-        different quantity and are **not** computed here: their denominator has
-        not been reconstructed from the supplementary methods (ambiguity A8).
-        """
-        values = np.asarray([value for value in self.bias_by_gap if np.isfinite(value)])
-        if values.size < 2:
-            return float("nan")
-        return float(np.percentile(values, 75) - np.percentile(values, 25))
+    #: Gaps of this class the scenario placed, scored or not.
+    n_gaps_offered: int
+    #: 25th percentile of the per-gap biases.
+    q1: float | None
+    #: Median per-gap bias.
+    median: float | None
+    #: 75th percentile of the per-gap biases.
+    q3: float | None
+    #: ``q3 - q1``. Needs at least two scored gaps to exist.
+    iqr: float | None
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-serialisable summary for the run report."""
+        """Return a JSON-serialisable summary for the run manifest."""
         return {
-            "gap_class": self.gap_class.value,
             "n_gaps": self.n_gaps,
-            "bias_iqr": self.bias_iqr,
-            "bias_by_gap": list(self.bias_by_gap),
-            **self.metrics.to_dict(),
+            "n_gaps_offered": self.n_gaps_offered,
+            "q1": self.q1,
+            "median": self.median,
+            "q3": self.q3,
+            "iqr": self.iqr,
         }
 
 
-@dataclass(frozen=True)
-class EnergyBalance:
-    """Measured and filled energy-balance ratios over the artificial gaps (6.4).
+def _bias_spread(
+    gaps: GapManifest,
+    gap_class: GapClass,
+    *,
+    measured: pd.Series,
+    predicted: pd.Series,
+    scored: np.ndarray,
+) -> BiasSpread:
+    """Return the spread of per-gap bias within ``gap_class``."""
+    placed = gaps.by_class(gap_class)
+    index = measured.index
+    truth = measured.to_numpy(dtype=float)
+    filled = predicted.to_numpy(dtype=float)
+    biases: list[float] = []
+    for gap in placed:
+        inside = (index >= gap.start) & (index < gap.end) & scored
+        if not inside.any():
+            continue
+        error = filled[inside] - truth[inside]
+        error = error[np.isfinite(error)]
+        if error.size:
+            biases.append(float(error.mean()))
+    if not biases:
+        return BiasSpread(
+            n_gaps=0, n_gaps_offered=len(placed), q1=None, median=None, q3=None, iqr=None
+        )
+    values = np.asarray(biases, dtype=float)
+    # Linear interpolation between order statistics, the convention ambiguity
+    # A11 settles for every quantile this package reports.
+    q1, median, q3 = (float(value) for value in np.percentile(values, (25.0, 50.0, 75.0)))
+    return BiasSpread(
+        n_gaps=int(values.size),
+        n_gaps_offered=len(placed),
+        q1=q1,
+        median=median,
+        q3=q3,
+        iqr=q3 - q1 if values.size > 1 else None,
+    )
 
-    ``EBR = sum(H + LE) / sum(NETRAD - G)``, computed twice over the same rows:
-    once from the measurements that were hidden, once from what the model put in
-    their place. The difference says whether gap filling distorted the site's
-    energy balance - a check on the two heat fluxes together that neither one's
-    RMSE can make on its own.
+
+# ---------------------------------------------------------------------------
+# The energy-balance check (method_spec.md 6.4; Step 19)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EnergyBalanceCheck(FrozenRecord):
+    """The paper's independent energy-balance check, over the artificial gaps.
+
+    ``EBR = sum(H + LE) / sum(NETRAD - G)`` computed twice on the withheld rows -
+    once from the measured H and LE, once from the values the model put there -
+    over every withheld row and again within each gap class. A fill that
+    reproduces the fluxes should leave closure where the measurements had it, and
+    this is the one check that does not score the model against its own target.
+
+    Every withheld row is *offered*; a row enters both ratios only where the
+    measured H and LE, both predictions, NETRAD and G are all present, and each
+    :class:`~rfrgapfill.metrics.EnergyBalanceComparison` counts what each missing
+    component cost. A measured flux that arrived already gap-filled counts as
+    missing: it was never scored against, and it is not closure evidence either.
     """
 
-    #: EBR from the hidden measurements.
-    measured: float
-    #: EBR from the model's predictions.
-    filled: float
-    #: Rows both fluxes were withheld, predicted and energy-closed on.
-    n_rows: int
-    #: Target names the two heat fluxes were read from.
+    #: The target column playing H.
     sensible_heat: str
+    #: The target column playing LE.
     latent_heat: str
+    #: The comparison over every withheld row.
+    overall: EnergyBalanceComparison
+    #: The comparison within each gap class, when the run reports by gap class.
+    by_gap_class: Mapping[GapClass, EnergyBalanceComparison]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "by_gap_class", MappingProxyType(dict(self.by_gap_class)))
 
     @property
-    def difference(self) -> float:
-        """``filled - measured``. Positive means filling raised the ratio."""
-        return self.filled - self.measured
+    def targets(self) -> tuple[str, str]:
+        """The ``(H, LE)`` target columns the check was computed from."""
+        return (self.sensible_heat, self.latent_heat)
+
+    def comparison(self, gap_class: GapClass | str | None = None) -> EnergyBalanceComparison:
+        """Return the comparison over every withheld row, or within one gap class."""
+        if gap_class is None:
+            return self.overall
+        wanted = GapClass.coerce(gap_class)
+        if wanted not in self.by_gap_class:
+            raise ValidationError(
+                f"no energy-balance check for gap class {wanted.value!r}: this run reported "
+                + (
+                    ", ".join(cls.value for cls in self.by_gap_class)
+                    or "no gap classes at all (report_by_gap_class=False)"
+                )
+            )
+        return self.by_gap_class[wanted]
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-serialisable summary for the run report."""
+        """Return a JSON-serialisable summary for the run manifest.
+
+        The overall comparison's fields sit at the top level, so a reader after
+        only ``measured_ebr`` and ``filled_ebr`` need not know about gap classes.
+        """
         return {
-            "measured": self.measured,
-            "filled": self.filled,
-            "difference": self.difference,
-            "n_rows": self.n_rows,
             "sensible_heat": self.sensible_heat,
             "latent_heat": self.latent_heat,
-        }
-
-
-@dataclass(frozen=True)
-class TargetValidation:
-    """One target's validation result: what was withheld, predicted and scored."""
-
-    #: The target column.
-    target: str
-    #: All/daytime/nighttime metrics over every withheld observation.
-    metrics: SubsetMetrics
-    #: The same, per gap-duration class.
-    by_gap_class: Mapping[GapClass, GapClassMetrics]
-    #: One row per withheld observation: measured, predicted, gap id and class,
-    #: and the shortwave radiation that split day from night.
-    predictions: pd.DataFrame
-    #: The artificial gaps this target was scored on.
-    gaps: ArtificialGaps
-    #: The fit that produced the predictions, including what it dropped.
-    training: TrainingReport
-    #: The design matrix's provenance, including daily-statistic fallbacks.
-    features: FeatureMatrix
-    #: The fitted model, kept so a caller can save it or inspect importances.
-    model: RFRModel
-    #: Genuine observations withheld by the artificial gaps.
-    n_withheld: int
-    #: Withheld observations the model could predict.
-    n_predicted: int
-
-    @property
-    def n_unpredicted(self) -> int:
-        """Withheld observations left unpredicted for want of a driver."""
-        return self.n_withheld - self.n_predicted
-
-    @property
-    def coverage(self) -> float:
-        """Share of the withheld observations that were predicted, in [0, 1].
-
-        Well below 1 means the metrics describe an easier subset than the
-        scenario asked for - usually a driver missing exactly where the gaps
-        fell - and should be read before the metrics themselves.
-        """
-        if self.n_withheld == 0:
-            return 0.0
-        return self.n_predicted / self.n_withheld
-
-    def metrics_frame(self) -> pd.DataFrame:
-        """Return one row per subset and gap class, for tables and reports."""
-        rows = self.metrics.to_frame().assign(gap_class="all")
-        for gap_class, result in self.by_gap_class.items():
-            rows = pd.concat([rows, result.metrics.to_frame().assign(gap_class=gap_class.value)])
-        return cast(
-            "pd.DataFrame",
-            rows.reset_index()
-            .assign(target=self.target)
-            .loc[:, ["target", "gap_class", "subset", "n", "r2", "slope", "rmse", "bias"]],
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-serialisable summary for the run report."""
-        return {
-            "target": self.target,
-            "n_withheld": self.n_withheld,
-            "n_predicted": self.n_predicted,
-            "n_unpredicted": self.n_unpredicted,
-            "coverage": self.coverage,
-            "metrics": self.metrics.to_dict(),
+            **self.overall.to_dict(),
             "by_gap_class": {
-                gap_class.value: result.to_dict() for gap_class, result in self.by_gap_class.items()
+                gap_class.value: comparison.to_dict()
+                for gap_class, comparison in self.by_gap_class.items()
             },
-            "training": self.training.to_dict(),
-            "features": self.features.to_dict(),
         }
 
 
-@dataclass(frozen=True)
-class ValidationReport:
-    """The result of one artificial-gap validation run.
+#: Column order of every ``energy_balance_frame``.
+ENERGY_BALANCE_TABLE_COLUMNS: tuple[str, ...] = (
+    "method",
+    "mode",
+    "sensible_heat",
+    "latent_heat",
+    "gap_class",
+    "n",
+    "n_offered",
+    "n_missing_measured",
+    "n_missing_filled",
+    "n_missing_available_energy",
+    "available_energy",
+    "measured_ebr",
+    "filled_ebr",
+    "difference",
+)
 
-    Everything Step 13 asks a run to return - predictions, metrics, the gap
-    manifest and the configuration - reachable from one object, and serialisable
-    in full through :meth:`to_dict` so a run can be archived beside the numbers
-    it produced.
+
+# ---------------------------------------------------------------------------
+# One target's result
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, eq=False)
+class TargetValidation:
+    """What one arm produced for one target: predictions, metrics and provenance.
+
+    Equality is identity-based (``eq=False``): the record holds pandas objects,
+    whose ``==`` is element-wise.
+
+    :attr:`metrics` answers "how did this arm do"; :attr:`metrics_by_gap_class`
+    answers the question the paper is actually about - whether it stays stable as
+    the gap grows - and :attr:`features` carries the row accounting behind both.
     """
 
-    #: Per-target results, in the order the targets were requested.
-    results: Mapping[str, TargetValidation]
-    #: The artificial gaps used for each target. Identical objects across targets
-    #: when the scenario shares gap locations, as the paper's joint validation does.
-    gaps: Mapping[str, ArtificialGaps]
-    #: Measured and filled energy-balance ratios, when H and LE were both validated.
-    energy_balance: EnergyBalance | None
+    #: The target flux column this result is for.
+    target: str
+    #: The arm that produced it: ``RFR3``, ``RFR10``, ``ORF3`` or ``ORF10``.
+    method: str
     #: The configuration the run used.
     config: RFRConfig
-    #: The validated time axis of the input series.
+    #: The fitted model, carrying its grid, best parameters and row accounting.
+    model: RFRModel
+    #: The leakage-safe feature set, carrying the masks and the untouched truth.
+    features: ValidationFeatureSet
+    #: Predictions on the run's full time axis; missing outside the artificial gaps.
+    predictions: pd.Series
+    #: Core metrics per subset, over every scored row (method_spec.md 6.1-6.2).
+    metrics: Mapping[MetricSubset, CoreMetrics]
+    #: Core metrics per gap class and subset (method_spec.md 6.3).
+    metrics_by_gap_class: Mapping[GapClass, Mapping[MetricSubset, CoreMetrics]]
+    #: Spread of per-gap bias within each class, when it was asked for.
+    bias_spread: Mapping[GapClass, BiasSpread]
+    #: The intervals that were withheld.
+    gaps: GapManifest
+    #: The validated time axis the run ran on.
     time_axis: TimeAxis
-    #: Whether every target was scored on the same gap locations (4.4).
-    shared_gaps: bool
+    #: The mapping from canonical variables to this frame's columns.
+    column_map: ColumnMap
+    #: The QC column separating measured values from pre-filled ones.
+    qc_column: str | None = None
+    #: The run's energy-balance check, carried by its H and LE results only.
+    energy_balance_check: EnergyBalanceCheck | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
+        object.__setattr__(
+            self,
+            "metrics_by_gap_class",
+            MappingProxyType(
+                {
+                    gap_class: MappingProxyType(dict(by_subset))
+                    for gap_class, by_subset in self.metrics_by_gap_class.items()
+                }
+            ),
+        )
+        object.__setattr__(self, "bias_spread", MappingProxyType(dict(self.bias_spread)))
+
+    # -- accessors -----------------------------------------------------------
+
+    @property
+    def overall(self) -> CoreMetrics:
+        """The four core metrics over every scored row, of any gap class."""
+        return self.metrics[MetricSubset.ALL]
+
+    @property
+    def scored_rows(self) -> int:
+        """Rows that carried both a withheld measurement and a prediction."""
+        return self.overall.n
+
+    @property
+    def withheld_rows(self) -> int:
+        """Rows the scenario withheld, whether or not they could be scored."""
+        return int(self.features.holdout_mask.sum())
+
+    def metric(
+        self,
+        *,
+        subset: MetricSubset | str = MetricSubset.ALL,
+        gap_class: GapClass | str | None = None,
+    ) -> CoreMetrics:
+        """Return one cell of the metric table.
+
+        ``gap_class=None`` is every scored row; a class name restricts to the rows
+        that class's intervals withheld.
+        """
+        chosen = MetricSubset.coerce(subset)
+        if gap_class is None:
+            return self.metrics[chosen]
+        wanted = GapClass.coerce(gap_class)
+        if wanted not in self.metrics_by_gap_class:
+            available = ", ".join(sorted(cls.value for cls in self.metrics_by_gap_class))
+            raise ValidationError(
+                f"no metrics for gap class {wanted.value!r}: this run reported "
+                + (available or "no gap classes at all (report_by_gap_class=False)")
+            )
+        return self.metrics_by_gap_class[wanted][chosen]
+
+    def predicted_holdout(self) -> pd.Series:
+        """The predictions inside the artificial gaps, unpredicted rows included."""
+        values: pd.Series = self.predictions.loc[self.features.holdout_mask.to_numpy()]
+        return values
+
+    # -- tables and export ---------------------------------------------------
+
+    def to_frame(self) -> pd.DataFrame:
+        """Return the tidy metric table for this target.
+
+        One row per gap class and subset, with ``gap_class="all"`` for the rows
+        that pool every class - the shape Step 18's gap-length comparison and any
+        multi-site aggregation both consume.
+        """
+        groups: list[tuple[str, Mapping[MetricSubset, CoreMetrics]]] = [("all", self.metrics)]
+        groups += [
+            (gap_class.value, by_subset)
+            for gap_class, by_subset in self.metrics_by_gap_class.items()
+        ]
+        rows = [
+            {
+                "target": self.target,
+                "method": self.method,
+                "mode": self.config.rfr_mode.value,
+                "gap_class": label,
+                "subset": subset.value,
+                "n": scores.n,
+                "n_offered": scores.n_offered,
+                "r2": scores.r2,
+                "slope": scores.slope,
+                "rmse": scores.rmse,
+                "bias": scores.bias,
+            }
+            for label, by_subset in groups
+            for subset, scores in by_subset.items()
+        ]
+        table: pd.DataFrame = pd.DataFrame(rows, columns=list(METRIC_TABLE_COLUMNS))
+        return table
+
+    def bias_spread_frame(self) -> pd.DataFrame:
+        """Return the spread of per-gap bias for this target, one row per gap class.
+
+        The within-site bias IQR of section 6.3: over the individual intervals of
+        one class at this site, not over sites - that is
+        :func:`rfrgapfill.uncertainty.bias_iqr`. Empty when the run was configured
+        with ``bias_iqr_by_gap_class=False``.
+        """
+        return _bias_spread_frame(_bias_spread_rows(self))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable summary for the run manifest."""
+        return {
+            "target": self.target,
+            "method": self.method,
+            "r2_definition": self.config.validation.r2.value,
+            "daytime_threshold": self.config.validation.daytime_threshold,
+            "metrics": {subset.value: scores.to_dict() for subset, scores in self.metrics.items()},
+            "metrics_by_gap_class": {
+                gap_class.value: {
+                    subset.value: scores.to_dict() for subset, scores in by_subset.items()
+                }
+                for gap_class, by_subset in self.metrics_by_gap_class.items()
+            },
+            "bias_spread_by_gap_class": {
+                gap_class.value: spread.to_dict() for gap_class, spread in self.bias_spread.items()
+            },
+            "energy_balance": (
+                None if self.energy_balance_check is None else self.energy_balance_check.to_dict()
+            ),
+            "rows": self.features.to_dict(),
+        }
+
+    def manifest(
+        self,
+        *,
+        extra: Mapping[str, Any] | None = None,
+        created_at: str | None = None,
+    ) -> RunManifest:
+        """Return the run manifest of this arm (method_spec.md section 7).
+
+        Assembled by :meth:`~rfrgapfill.provenance.RunManifest.from_validation`
+        from the objects that own each section, so the manifest describes the run
+        that happened rather than the configuration it was asked for.
+        """
+        return RunManifest.from_validation(
+            config=self.config,
+            model=self.model,
+            gaps=self.gaps,
+            features=self.features,
+            target=self.target,
+            column_map=self.column_map,
+            qc_column=self.qc_column,
+            time_axis=self.time_axis,
+            metrics=self.to_dict(),
+            extra=dict(extra) if extra else None,
+            created_at=created_at,
+        )
+
+    def summary(self) -> str:
+        """Return a short human-readable account of this target's result."""
+        lines = [
+            f"{self.method} {self.target}: {self.scored_rows} of {self.withheld_rows} "
+            "withheld row(s) scored"
+        ]
+        lines += [
+            f"  {subset.value:<10} {_format_metrics(scores)}"
+            for subset, scores in self.metrics.items()
+        ]
+        lines += [
+            f"  {gap_class.value:<10} {_format_metrics(by_subset[MetricSubset.ALL])}"
+            for gap_class, by_subset in self.metrics_by_gap_class.items()
+        ]
+        return "\n".join(lines)
+
+
+#: Column order of the tidy metric table, shared by every ``to_frame``.
+METRIC_TABLE_COLUMNS: tuple[str, ...] = (
+    "target",
+    "method",
+    "mode",
+    "gap_class",
+    "subset",
+    "n",
+    "n_offered",
+    "r2",
+    "slope",
+    "rmse",
+    "bias",
+)
+
+#: Column order of every ``bias_spread_frame``.
+BIAS_SPREAD_TABLE_COLUMNS: tuple[str, ...] = (
+    "target",
+    "method",
+    "mode",
+    "gap_class",
+    "n_gaps",
+    "n_gaps_offered",
+    "bias_q1",
+    "bias_median",
+    "bias_q3",
+    "bias_iqr",
+)
+
+
+def _bias_spread_rows(result: TargetValidation) -> list[dict[str, Any]]:
+    """Return one tidy row per gap class of ``result``'s bias spread."""
+    return [
+        {
+            "target": result.target,
+            "method": result.method,
+            "mode": result.config.rfr_mode.value,
+            "gap_class": gap_class.value,
+            "n_gaps": spread.n_gaps,
+            "n_gaps_offered": spread.n_gaps_offered,
+            "bias_q1": spread.q1,
+            "bias_median": spread.median,
+            "bias_q3": spread.q3,
+            "bias_iqr": spread.iqr,
+        }
+        for gap_class, spread in result.bias_spread.items()
+    ]
+
+
+def _bias_spread_frame(rows: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
+    """Return bias-spread rows as a frame whose quartile columns are always float."""
+    table: pd.DataFrame = pd.DataFrame(list(rows), columns=list(BIAS_SPREAD_TABLE_COLUMNS))
+    for column in ("bias_q1", "bias_median", "bias_q3", "bias_iqr"):
+        # A class with no scored gap gives a column of `None`, which would
+        # otherwise arrive as object dtype.
+        table[column] = pd.to_numeric(table[column], errors="coerce").astype("float64")
+    for column in ("n_gaps", "n_gaps_offered"):
+        table[column] = pd.to_numeric(table[column], errors="coerce").astype("Int64")
+    return table
+
+
+def _format_metrics(scores: CoreMetrics) -> str:
+    """Render one :class:`CoreMetrics` as a fixed-width line."""
+
+    def show(value: float | None) -> str:
+        return "       -" if value is None else f"{value:8.3f}"
+
+    return (
+        f"n={scores.n:<6d} R2={show(scores.r2)} slope={show(scores.slope)} "
+        f"RMSE={show(scores.rmse)} bias={show(scores.bias)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The whole run
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, eq=False)
+class ValidationReport:
+    """One artificial-gap experiment: every target, scored on one shared gap mask.
+
+    Equality is identity-based (``eq=False``): the record holds pandas objects.
+
+    The report is a type rather than a dictionary because the targets of a joint
+    run are not independent results - they share :attr:`gaps`, which is what makes
+    them comparable and what the energy-balance comparison of section 6.4 needs.
+    """
+
+    #: The configuration every target was validated under.
+    config: RFRConfig
+    #: The artificial intervals, shared by every target (method_spec.md 4.4).
+    gaps: GapManifest
+    #: The validated time axis the run ran on.
+    time_axis: TimeAxis
+    #: One :class:`TargetValidation` per target, in the order they were requested.
+    results: Mapping[str, TargetValidation]
+    #: Canonical-to-column mapping the run resolved.
+    column_map: ColumnMap
+    #: QC column per target, where one was supplied.
+    qc_columns: Mapping[str, str]
+    #: The energy-balance check of section 6.4, when H and LE were both run.
+    energy_balance_check: EnergyBalanceCheck | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "results", MappingProxyType(dict(self.results)))
+        object.__setattr__(self, "qc_columns", MappingProxyType(dict(self.qc_columns)))
+
+    @property
+    def energy_balance(self) -> EnergyBalanceComparison | None:
+        """The measured-against-filled comparison over every withheld row, if checked."""
+        return None if self.energy_balance_check is None else self.energy_balance_check.overall
 
     # -- access --------------------------------------------------------------
 
@@ -297,94 +695,144 @@ class ValidationReport:
         try:
             return self.results[target]
         except KeyError:
-            raise KeyError(
-                f"{target!r} was not validated; this run scored: {', '.join(self.targets)}"
+            raise ValidationError(
+                f"no result for target {target!r}; this run validated "
+                f"{', '.join(self.results) or 'nothing'}"
             ) from None
 
-    def __iter__(self) -> Iterable[str]:
-        return iter(self.results)
+    def __iter__(self) -> Iterator[TargetValidation]:
+        return iter(self.results.values())
+
+    def __len__(self) -> int:
+        return len(self.results)
 
     @property
     def targets(self) -> tuple[str, ...]:
-        """The validated targets, in request order."""
+        """The validated targets, in the order they were requested."""
         return tuple(self.results)
 
     @property
-    def gap_manifest(self) -> pd.DataFrame:
-        """The artificial-gap manifest.
-
-        One manifest when the gaps are shared, otherwise the per-target manifests
-        stacked with a ``target`` column.
-        """
-        if self.shared_gaps:
-            return next(iter(self.gaps.values())).manifest
-        stacked: pd.DataFrame = pd.concat(
-            [gaps.manifest.assign(target=target) for target, gaps in self.gaps.items()]
-        )
-        return stacked
-
-    @property
-    def satisfied(self) -> bool:
-        """Whether every target's gap scenario met its requested design (A7)."""
-        return all(gaps.satisfied for gaps in self.gaps.values())
-
-    @property
-    def warnings(self) -> tuple[str, ...]:
-        """Every reason a gap scenario missed its requested design, deduplicated.
-
-        Empty exactly when :attr:`satisfied` is true, so a report never says the
-        design was not achieved without saying why.
-        """
-        seen: list[str] = []
-        for gaps in self.gaps.values():
-            for reason in gaps.shortfalls:
-                if reason not in seen:
-                    seen.append(reason)
-        return tuple(seen)
-
-    # -- tables --------------------------------------------------------------
-
-    def metrics_frame(self) -> pd.DataFrame:
-        """Return every metric as one tidy frame: target x gap class x subset."""
-        combined: pd.DataFrame = pd.concat(
-            [result.metrics_frame() for result in self.results.values()], ignore_index=True
-        )
-        return combined
+    def method(self) -> str:
+        """The arm this run is: ``RFR3``, ``RFR10``, ``ORF3`` or ``ORF10``."""
+        return method_label(self.config)
 
     def predictions(self) -> pd.DataFrame:
-        """Return every withheld observation and its prediction, stacked by target."""
-        stacked: pd.DataFrame = pd.concat(
-            [result.predictions.assign(target=target) for target, result in self.results.items()]
+        """Return every target's predictions on the run's time axis, side by side."""
+        frame: pd.DataFrame = pd.DataFrame(
+            {str(result.predictions.name): result.predictions for result in self.results.values()},
+            index=self.time_axis.index,
         )
-        return stacked
+        return frame
 
-    # -- provenance ----------------------------------------------------------
+    # -- tables and export ---------------------------------------------------
 
-    def manifest(self) -> dict[str, Any]:
-        """Return the full run manifest (method_spec.md section 7)."""
-        return run_manifest(
-            self.config,
-            targets=list(self.targets),
-            time_axis=self.time_axis.to_dict(),
-            gaps={
-                "shared": self.shared_gaps,
-                "by_target": {target: gaps.to_dict() for target, gaps in self.gaps.items()},
-            },
-            features={target: result.features.to_dict() for target, result in self.results.items()},
-            training={target: result.training.to_dict() for target, result in self.results.items()},
+    def to_frame(self) -> pd.DataFrame:
+        """Return the tidy metric table for every target of this run."""
+        frames = [result.to_frame() for result in self.results.values()]
+        if not frames:
+            empty: pd.DataFrame = pd.DataFrame(columns=list(METRIC_TABLE_COLUMNS))
+            return empty
+        table: pd.DataFrame = pd.concat(frames, ignore_index=True)
+        return table
+
+    def bias_spread_frame(self) -> pd.DataFrame:
+        """Return the per-gap bias spread of every target of this run."""
+        return _bias_spread_frame(
+            [row for result in self.results.values() for row in _bias_spread_rows(result)]
         )
+
+    def energy_balance_frame(self) -> pd.DataFrame:
+        """Return the energy-balance check as a table: ``all``, then each gap class.
+
+        Empty, with the same columns, when the run had no H/LE pair to check.
+        """
+        check = self.energy_balance_check
+        rows: list[dict[str, Any]] = []
+        if check is not None:
+            scopes = [("all", check.overall)] + [
+                (gap_class.value, comparison)
+                for gap_class, comparison in check.by_gap_class.items()
+            ]
+            rows = [
+                {
+                    "method": self.method,
+                    "mode": self.config.rfr_mode.value,
+                    "sensible_heat": check.sensible_heat,
+                    "latent_heat": check.latent_heat,
+                    "gap_class": label,
+                    **comparison.to_dict(),
+                }
+                for label, comparison in scopes
+            ]
+        table: pd.DataFrame = pd.DataFrame(rows, columns=list(ENERGY_BALANCE_TABLE_COLUMNS))
+        for column in ("available_energy", "measured_ebr", "filled_ebr", "difference"):
+            # An undefined ratio is `None`, which would otherwise arrive as object dtype.
+            table[column] = pd.to_numeric(table[column], errors="coerce").astype("float64")
+        for column in ("n", "n_offered", *(c for c in table.columns if c.startswith("n_missing"))):
+            table[column] = pd.to_numeric(table[column], errors="coerce").astype("Int64")
+        return table
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-serialisable representation of the whole run."""
+        """Return a JSON-serialisable summary of the whole run."""
         return {
-            "manifest": self.manifest(),
-            "satisfied": self.satisfied,
-            "warnings": list(self.warnings),
+            "method": self.method,
+            "mode": self.config.rfr_mode.value,
+            "targets": list(self.targets),
+            "qc_columns": dict(self.qc_columns),
+            "gaps": self.gaps.to_dict(),
+            "time_axis": self.time_axis.to_dict(),
             "results": {target: result.to_dict() for target, result in self.results.items()},
             "energy_balance": (
-                None if self.energy_balance is None else self.energy_balance.to_dict()
+                None if self.energy_balance_check is None else self.energy_balance_check.to_dict()
             ),
+            "config": self.config.to_dict(),
         }
+
+    def manifest(
+        self,
+        target: str,
+        *,
+        extra: Mapping[str, Any] | None = None,
+        created_at: str | None = None,
+    ) -> RunManifest:
+        """Return the run manifest of one target of this run.
+
+        One manifest per target, because a manifest describes one model: the
+        features, the grid's best parameters and the row accounting are all
+        target-specific, and a document claiming to describe three would have to
+        drop two of them.
+        """
+        return self[target].manifest(extra=extra, created_at=created_at)
+
+    def summary(self) -> str:
+        """Return a human-readable account of the scenario and every target."""
+        lines = [
+            f"{self.method} validation of {', '.join(self.targets) or 'nothing'}",
+            self.gaps.summary(),
+        ]
+        lines += [result.summary() for result in self.results.values()]
+        check = self.energy_balance_check
+        if check is not None:
+            scopes = [("all", check.overall)] + [
+                (gap_class.value, comparison)
+                for gap_class, comparison in check.by_gap_class.items()
+            ]
+            lines.append(
+                f"Energy balance of {check.sensible_heat} + {check.latent_heat} "
+                "over the withheld rows (method_spec.md 6.4):"
+            )
+            lines += [
+                f"  EBR {label:<10} {balance.n} of {balance.n_offered} row(s): "
+                f"measured={_show(balance.measured)} filled={_show(balance.filled)} "
+                f"difference={_show(balance.difference)}"
+                for label, balance in scopes
+            ]
+        return "\n".join(lines)
+
+
+def _show(value: float | None) -> str:
+    """Render an optionally undefined metric for :meth:`ValidationReport.summary`."""
+    return "undefined" if value is None else f"{value:.4f}"
 
 
 # ---------------------------------------------------------------------------
@@ -395,516 +843,481 @@ class ValidationReport:
 def validate_rfr(
     data: pd.DataFrame,
     *,
+    config: RFRConfig,
     targets: str | Sequence[str],
     mode: Mode | str | None = None,
-    config: RFRConfig | None = None,
     column_map: ColumnMap | Mapping[str, str] | None = None,
-    qc_columns: Mapping[str, str | None] | None = None,
-    scenario: str | GapScenarioConfig | None = None,
-    gaps: ArtificialGaps | None = None,
-    hemisphere: str | None = None,
-    latitude: float | None = None,
-    frequency: str | None = None,
-    site_id: str | None = None,
-    random_state: int = 42,
-    use_receptive_limiter: bool | None = None,
+    qc_columns: str | Mapping[str, str] | None = None,
+    gaps: GapManifest | None = None,
     timestamp: str | None = None,
     on_duplicates: DuplicatePolicy | str = DuplicatePolicy.ERROR,
+    on_shortfall: Shortfall = "raise",
+    on_incomplete: IncompletePolicy | str = IncompletePolicy.MISSING,
+    min_training_rows: int | None = None,
+    check_leakage: bool = False,
     energy_balance_targets: tuple[str, str] | None = None,
 ) -> ValidationReport:
-    """Run the paper's artificial-gap experiment and return everything it produced.
+    """Run the paper's artificial-gap experiment and return the scored report.
 
-    >>> report = validate_rfr(                                   # doctest: +SKIP
-    ...     df,
-    ...     targets=["NEE", "H", "LE"],
-    ...     mode="RFR10",
-    ...     scenario="zhu2022",
-    ...     latitude=51.5,
-    ...     column_map=ColumnMap.fluxnet2015("RFR10"),
-    ...     qc_columns={"NEE": "NEE_VUT_REF_QC", "H": "H_F_MDS_QC", "LE": "LE_F_MDS_QC"},
-    ... )
-    >>> report["NEE"].metrics.nighttime.r2                       # doctest: +SKIP
+    The whole of Step 13 in one call: place the gaps, hide the truth, build
+    leakage-safe features, fit on what remains, predict the withheld intervals and
+    score them by subset and by gap class. The withheld observations **are** the
+    test set - there is no random row-wise split anywhere in this module, because
+    that would destroy the temporal gap structure the paper is about.
 
-    ``targets`` names the flux columns to validate. Given several, they are
-    scored on **identical** gap locations by default, as the paper's joint
-    NEE/H/LE validation was (method_spec.md 4.4); a row must be genuinely
-    measured for every target to be eligible for withholding, so the shared test
-    set is the same set of half-hours for each.
+    ``data`` is not modified. It is copied onto a validated time axis first, and
+    its observed values are read but never written.
 
-    ``qc_columns`` maps a target to its quality flag. Without one, every finite
-    value counts as a measurement - acceptable for cleaned data, wrong for a raw
-    FLUXNET file, where it would hide already-filled values inside artificial
-    gaps and then score predictions against them.
+    :param config: the run's settings. Required rather than derived from a mode
+        string, because a validation run needs what a mode alone cannot supply -
+        the cadence, the hemisphere or latitude behind the season feature, the
+        column mapping, the scenario, the seed - and each of those is validated
+        as the configuration is built.
+    :param targets: the target flux column, or several for the paper's joint
+        NEE/H/LE run. Several targets share **one** set of gap locations
+        (method_spec.md section 4.4).
+    :param mode: overrides ``config.mode`` for this run, for the common case of
+        scoring RFR3 and RFR10 against one another. Everything else - seed,
+        scenario, grid - stays as configured, so the two arms differ only in
+        their driver set.
+    :param qc_columns: the QC/provenance column of each target, as one name for a
+        single target or a mapping. Strongly recommended: without it every present
+        value counts as a genuine measurement, so values that arrived already
+        gap-filled would be trained on and scored against.
+    :param gaps: a :class:`~rfrgapfill.gaps.GapManifest` to reuse instead of
+        generating one - the way to score two arms, or an RFR/ORF pair, on exactly
+        the same intervals.
+    :param on_shortfall: what the generator does when it cannot place the
+        requested design: ``"raise"`` (the default) or ``"warn"``.
+    :param on_incomplete: ``"missing"`` (the default) leaves a withheld row whose
+        predictors are incomplete unpredicted and therefore unscored; ``"raise"``
+        fails instead. Nothing is ever imputed (method_spec.md section 7).
+    :param check_leakage: run
+        :func:`~rfrgapfill.leakage.require_no_target_leakage` on this
+        configuration before fitting. Off by default because it rebuilds the
+        feature matrix four times per target; worth paying for on a configuration
+        that has not been checked before.
+    :param energy_balance_targets: the ``(H, LE)`` target columns for the
+        energy-balance comparison, when they are not called ``H`` and ``LE``.
 
-    Give either ``config`` or the individual settings (``mode``, ``hemisphere``
-    or ``latitude``, ``frequency``, ``site_id``, ``random_state``,
-    ``use_receptive_limiter``); mixing the two is rejected rather than silently
-    resolved. ``scenario`` names an entry in :data:`SCENARIOS` or supplies a
-    :class:`~rfrgapfill.config.GapScenarioConfig` directly. ``gaps`` reuses an
-    already-generated scenario, which is how a paired RFR/ORF comparison puts
-    both models on exactly the same gaps - see :func:`compare_receptive_limiter`.
-
-    Raises :class:`ValidationError` for a run that cannot proceed. A run that
-    completes but could not place the requested gap design is *not* an error: it
-    returns with :attr:`ValidationReport.satisfied` false and the reasons in
-    :attr:`ValidationReport.warnings` (ambiguity A7).
+    :raises ValidationError: when the request itself cannot be honoured - an
+        unknown target column, a missing QC column, or an energy-balance
+        comparison asked for without the mapping it needs.
     """
-    requested = _requested_targets(targets)
-    settings = _resolve_config(
-        config,
-        mode=mode,
-        column_map=column_map,
-        scenario=scenario,
-        hemisphere=hemisphere,
-        latitude=latitude,
-        frequency=frequency,
-        site_id=site_id,
-        random_state=random_state,
-        use_receptive_limiter=use_receptive_limiter,
-    )
-    heat = _resolve_heat_targets(energy_balance_targets, requested, settings.validation)
-    mapping = settings.require_column_map(column_map, include_ebr=heat is not None)
+    if not isinstance(config, RFRConfig):
+        raise ConfigError(f"config must be an RFRConfig, got {type(config).__name__}")
+    if not isinstance(data, pd.DataFrame):
+        raise ValidationError(f"data must be a pandas DataFrame, got {type(data).__name__}")
+    if mode is not None:
+        config = config.replace(mode=Mode.coerce(mode))
+
+    names = _resolve_targets(targets)
+    qc_map = _resolve_qc_columns(qc_columns, names)
+    columns = config.require_column_map(column_map)
+    settings = config.validation
 
     frame, axis = prepare_time_index(
         data,
-        timestamp=timestamp if timestamp is not None else mapping.timestamp,
-        frequency=settings.time_step,
+        timestamp=timestamp if timestamp is not None else columns.timestamp,
+        frequency=config.time_step,
         on_duplicates=on_duplicates,
     )
-    missing_targets = [name for name in requested if name not in frame.columns]
-    if missing_targets:
-        raise ValidationError(
-            f"the data does not carry target column(s): {', '.join(missing_targets)}"
-        )
-
-    flags = dict(qc_columns or {})
-    observed = {
-        target: observed_mask(
-            frame,
-            target,
-            qc_column=flags.get(target),
-            observed_qc_values=settings.observed_qc_values,
-        )
-        for target in requested
-    }
-
-    scenarios, shared = _scenarios(
-        gaps, axis=axis, observed=observed, config=settings, targets=requested
+    _require_columns(frame, targets=names, qc_columns=qc_map, columns=columns)
+    balance_pair = _resolve_energy_balance_targets(
+        energy_balance_targets, targets=names, config=config, columns=columns, frame=frame
     )
-    shortwave = pd.to_numeric(frame[mapping.column(SHORTWAVE)], errors="coerce")
+
+    # Step 1: the intervals, and the mask they imply, before any target-derived
+    # feature exists. One manifest for every target (method_spec.md 4.4).
+    manifest = (
+        GapScenarioGenerator(config).generate(
+            frame,
+            target=names,
+            qc_column=dict(qc_map) if qc_map else None,
+            on_shortfall=on_shortfall,
+        )
+        if gaps is None
+        else _check_manifest(gaps)
+    )
+    holdout = manifest.mask(frame.index)
+    if gaps is not None and not bool(holdout.any()):
+        # A generated scenario that withholds nothing has already been reported by
+        # the generator (or deliberately allowed through on_shortfall="warn"); a
+        # handed-in manifest that withholds nothing is almost always one built for
+        # another record, and would otherwise "validate" against an empty test set.
+        where = (
+            f"its intervals run {min(gap.start for gap in manifest)} to "
+            f"{max(gap.end for gap in manifest)} and the data runs "
+            f"{frame.index.min()} to {frame.index.max()}"
+            if len(manifest)
+            else "it places no interval at all"
+        )
+        raise ValidationError(f"the gap manifest withholds no row of this data: {where}")
+    origin = frame.index.min()
+    policy = IncompletePolicy.coerce(on_incomplete)
+    subsets = subset_masks(frame[columns.column(SHORTWAVE)], threshold=settings.daytime_threshold)
+    labels = gap_class_labels(manifest, frame.index)
 
     results: dict[str, TargetValidation] = {}
-    for target in requested:
-        results[target] = _validate_target(
-            frame,
-            target=target,
-            config=settings,
-            column_map=mapping,
-            axis=axis,
-            observed=observed[target],
-            gaps=scenarios[target],
-            shortwave=shortwave,
-        )
+    for target in names:
+        qc_column = qc_map.get(target)
+        if check_leakage:
+            require_no_target_leakage(
+                frame,
+                config=config,
+                target=target,
+                holdout=holdout,
+                qc_column=qc_column,
+                column_map=columns,
+                origin=origin,
+            )
 
+        # Steps 2-5: hide the withheld values, compute the daily statistics from
+        # what is still visible, assemble the matrix, keep the truth aside.
+        features = build_validation_features(
+            frame,
+            config=config,
+            target=target,
+            holdout=holdout,
+            qc_column=qc_column,
+            column_map=columns,
+            origin=origin,
+        )
+        model = RFRModel(config, target=target).fit(
+            features.training_features(),
+            features.training_target(),
+            min_training_rows=min_training_rows,
+        )
+        predictions = _predict_holdout(model, features, policy=policy, index=axis.index)
+        result = _score_target(
+            target=target,
+            config=config,
+            model=model,
+            features=features,
+            predictions=predictions,
+            gaps=manifest,
+            axis=axis,
+            columns=columns,
+            qc_column=qc_column,
+            subsets=subsets,
+            labels=labels,
+        )
+        _warn_on_unscored(result)
+        results[target] = result
+
+    check: EnergyBalanceCheck | None = None
+    if balance_pair is not None:
+        check = _energy_balance(
+            results,
+            pair=balance_pair,
+            frame=frame,
+            columns=columns,
+            labels=labels,
+            by_gap_class=settings.report_by_gap_class,
+        )
+        # A manifest is written per target, so the one result H and LE share is
+        # attached to both - otherwise it would be in neither manifest.
+        for name in balance_pair:
+            results[name] = replace(results[name], energy_balance_check=check)
     return ValidationReport(
-        results=MappingProxyType(results),
-        gaps=MappingProxyType(scenarios),
-        energy_balance=_energy_balance(frame, results, column_map=mapping, heat=heat),
-        config=settings,
+        config=config,
+        gaps=manifest,
         time_axis=axis,
-        shared_gaps=shared,
+        results=results,
+        column_map=columns,
+        qc_columns=qc_map,
+        energy_balance_check=check,
     )
 
 
-def _validate_target(
+# ---------------------------------------------------------------------------
+# Internals
+# ---------------------------------------------------------------------------
+
+
+def _resolve_targets(targets: str | Sequence[str]) -> tuple[str, ...]:
+    """Return the requested targets, in order, rejecting duplicates and blanks."""
+    if isinstance(targets, str):
+        names: tuple[str, ...] = (targets,)
+    elif isinstance(targets, Sequence):
+        names = tuple(targets)
+    else:
+        raise ValidationError(
+            f"targets must be a column name or a sequence of them, got {type(targets).__name__}"
+        )
+    if not names:
+        raise ValidationError("name at least one target to validate")
+    for name in names:
+        if not isinstance(name, str) or not name.strip():
+            raise ValidationError(f"every target must be a non-empty string, got {name!r}")
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValidationError(f"target(s) requested more than once: {', '.join(duplicates)}")
+    return names
+
+
+def _resolve_qc_columns(
+    qc_columns: str | Mapping[str, str] | None,
+    targets: tuple[str, ...],
+) -> Mapping[str, str]:
+    """Return the QC column of each target that has one."""
+    if qc_columns is None:
+        return MappingProxyType({})
+    if isinstance(qc_columns, str):
+        if len(targets) != 1:
+            raise ValidationError(
+                f"a single QC column {qc_columns!r} is ambiguous for {len(targets)} targets; "
+                "pass a mapping from target to QC column"
+            )
+        return MappingProxyType({targets[0]: qc_columns})
+    if not isinstance(qc_columns, Mapping):
+        raise ValidationError(
+            f"qc_columns must be a column name or a mapping, got {type(qc_columns).__name__}"
+        )
+    unknown = sorted(set(qc_columns) - set(targets))
+    if unknown:
+        raise ValidationError(
+            f"qc_columns names target(s) this run does not validate: {', '.join(unknown)}"
+        )
+    return MappingProxyType(
+        {target: qc_columns[target] for target in targets if target in qc_columns}
+    )
+
+
+def _require_columns(
     frame: pd.DataFrame,
+    *,
+    targets: tuple[str, ...],
+    qc_columns: Mapping[str, str],
+    columns: ColumnMap,
+) -> None:
+    """Raise unless every column this run reads is present in the frame.
+
+    Checked here rather than left to the feature layer because the day/night
+    split reads the radiation column before any feature is built, and a mistyped
+    driver name should fail as a named column rather than as a ``KeyError``.
+    """
+    missing = [name for name in targets if name not in frame.columns]
+    if missing:
+        raise ValidationError(f"target column(s) not in the data: {', '.join(missing)}")
+    absent = sorted({column for column in qc_columns.values() if column not in frame.columns})
+    if absent:
+        raise ValidationError(f"QC column(s) not in the data: {', '.join(absent)}")
+    unmapped = columns.missing_columns(frame.columns)
+    if unmapped:
+        raise ValidationError(
+            f"mapped driver column(s) not in the data: {', '.join(sorted(unmapped))}"
+        )
+
+
+def _check_manifest(gaps: GapManifest) -> GapManifest:
+    """Return ``gaps`` after checking it is a manifest at all."""
+    if not isinstance(gaps, GapManifest):
+        raise ValidationError(
+            f"gaps must be a GapManifest from GapScenarioGenerator, got {type(gaps).__name__}"
+        )
+    return gaps
+
+
+def _resolve_energy_balance_targets(
+    requested: tuple[str, str] | None,
+    *,
+    targets: tuple[str, ...],
+    config: RFRConfig,
+    columns: ColumnMap,
+    frame: pd.DataFrame,
+) -> tuple[str, str] | None:
+    """Return the ``(H, LE)`` targets the EBR comparison will use, or ``None``.
+
+    ``None`` whenever the comparison is switched off or the run simply has no H/LE
+    pair to compare - a NEE-only run is not an incomplete energy-balance run.
+    Asking for the comparison without the radiation and soil-heat-flux mapping it
+    needs *is* an error: section 6.4 requires those two variables regardless of
+    the driver mode, so skipping quietly would drop a required metric.
+    """
+    if requested is None:
+        if not config.validation.compute_energy_balance_ratio:
+            return None
+        if not {SENSIBLE_HEAT, LATENT_HEAT} <= set(targets):
+            return None
+        pair = (SENSIBLE_HEAT, LATENT_HEAT)
+    else:
+        pair = (str(requested[0]), str(requested[1]))
+        unknown = [name for name in pair if name not in targets]
+        if unknown:
+            raise ValidationError(
+                "energy_balance_targets names target(s) this run does not validate: "
+                f"{', '.join(unknown)}"
+            )
+    unmapped = columns.missing(EBR_VARIABLES)
+    if unmapped:
+        raise ValidationError(
+            f"the energy-balance ratio needs {' and '.join(EBR_VARIABLES)} mapped regardless "
+            f"of the driver mode (docs/method_spec.md 6.4), and {', '.join(unmapped)} is not. "
+            "Map it, or set ValidationConfig(compute_energy_balance_ratio=False)."
+        )
+    absent = sorted(
+        columns.column(name) for name in EBR_VARIABLES if columns.column(name) not in frame.columns
+    )
+    if absent:
+        raise ValidationError(
+            f"the energy-balance ratio needs column(s) absent from the data: {', '.join(absent)}"
+        )
+    return pair
+
+
+def _predict_holdout(
+    model: RFRModel,
+    features: ValidationFeatureSet,
+    *,
+    policy: IncompletePolicy,
+    index: pd.DatetimeIndex,
+) -> pd.Series:
+    """Predict the withheld rows and return them on the run's full time axis.
+
+    Rows outside the artificial gaps are left missing rather than predicted:
+    nothing the model produces goes anywhere near a value that was never
+    withheld, which is what makes "the observed values are unchanged" checkable
+    rather than merely intended.
+    """
+    predicted = model.predict(features.holdout_features(), on_incomplete=policy)
+    series: pd.Series = pd.Series(np.nan, index=index, name=f"{features.target}_predicted")
+    if len(predicted):
+        series.loc[predicted.index] = predicted.to_numpy(dtype=float)
+    return series
+
+
+def _score_target(
     *,
     target: str,
     config: RFRConfig,
-    column_map: ColumnMap,
+    model: RFRModel,
+    features: ValidationFeatureSet,
+    predictions: pd.Series,
+    gaps: GapManifest,
     axis: TimeAxis,
-    observed: pd.Series,
-    gaps: ArtificialGaps,
-    shortwave: pd.Series,
+    columns: ColumnMap,
+    qc_column: str | None,
+    subsets: Mapping[MetricSubset, pd.Series],
+    labels: pd.Series,
 ) -> TargetValidation:
-    """Withhold, refit, predict and score one target. The core of the experiment."""
-    truth = pd.to_numeric(frame[target], errors="coerce")
-    withheld = observed & gaps.mask
-    available = observed & ~gaps.mask
+    """Score one target's predictions by subset and by gap class."""
+    settings = config.validation
+    scored = features.scoring_mask
+    measured = features.truth
 
-    if not withheld.any():
-        raise ValidationError(
-            f"the artificial gaps withhold no observed value of {target!r}; there is nothing "
-            "to score. Check the QC column and the observation mask."
-        )
-    if not available.any():
-        raise ValidationError(
-            f"the artificial gaps withhold every observed value of {target!r}, leaving no "
-            "training data. Lower missing_fraction."
-        )
+    def score(rows: np.ndarray) -> CoreMetrics:
+        return core_metrics(measured.loc[rows], predictions.loc[rows], definition=settings.r2)
 
-    # The hidden truth leaves the frame entirely before features are built. The
-    # `available` mask already excludes it from the daily statistics; removing the
-    # values as well means no feature added later can reintroduce the leak.
-    masked = frame.copy()
-    masked.loc[gaps.mask, target] = np.nan
-
-    features = build_feature_matrix(
-        masked,
-        target=target,
-        config=config,
-        column_map=column_map,
-        available=available,
-        origin=axis.start,
-    )
-
-    training_rows = available & features.complete
-    model = RFRModel(config).fit(
-        cast("pd.DataFrame", features.frame.loc[training_rows]), truth.loc[training_rows]
-    )
-    predicted = model.predict(cast("pd.DataFrame", features.frame.loc[withheld]))
-
-    predictions = pd.DataFrame(
-        {
-            "measured": truth.loc[withheld],
-            "predicted": predicted,
-            "shortwave": shortwave.loc[withheld],
-            "gap_id": gaps.gap_id.loc[withheld],
-            "gap_class": gaps.gap_class.loc[withheld],
-        }
-    )
-
+    metrics = {
+        subset: score((scored & subsets[subset]).to_numpy()) for subset in settings.metric_subsets
+    }
+    by_class: dict[GapClass, Mapping[MetricSubset, CoreMetrics]] = {}
+    spread: dict[GapClass, BiasSpread] = {}
+    if settings.report_by_gap_class or settings.bias_iqr_by_gap_class:
+        for gap_class in GapClass:
+            in_class = scored.to_numpy() & (labels == gap_class.value).to_numpy()
+            if settings.report_by_gap_class:
+                by_class[gap_class] = MappingProxyType(
+                    {
+                        subset: score(in_class & subsets[subset].to_numpy())
+                        for subset in settings.metric_subsets
+                    }
+                )
+            if settings.bias_iqr_by_gap_class:
+                spread[gap_class] = _bias_spread(
+                    gaps,
+                    gap_class,
+                    measured=measured,
+                    predicted=predictions,
+                    scored=in_class,
+                )
     return TargetValidation(
         target=target,
-        metrics=metrics_from_config(
-            predictions["measured"],
-            predictions["predicted"],
-            predictions["shortwave"],
-            config=config.validation,
-        ),
-        by_gap_class=_metrics_by_gap_class(predictions, config=config.validation, gaps=gaps),
-        predictions=predictions,
-        gaps=gaps,
-        training=model.report,
-        features=features,
+        method=method_label(config),
+        config=config,
         model=model,
-        n_withheld=int(withheld.sum()),
-        n_predicted=int(predicted.notna().sum()),
+        features=features,
+        predictions=predictions,
+        metrics=metrics,
+        metrics_by_gap_class=by_class,
+        bias_spread=spread,
+        gaps=gaps,
+        time_axis=axis,
+        column_map=columns,
+        qc_column=qc_column,
     )
 
 
-def _metrics_by_gap_class(
-    predictions: pd.DataFrame,
-    *,
-    config: ValidationConfig,
-    gaps: ArtificialGaps,
-) -> Mapping[GapClass, GapClassMetrics]:
-    """Return per-class metrics and per-gap biases (method_spec.md 6.3)."""
-    if not config.report_by_gap_class:
-        return MappingProxyType({})
-
-    results: dict[GapClass, GapClassMetrics] = {}
-    for gap_class in gaps.config.active_classes:
-        rows = predictions["gap_class"] == gap_class.value
-        if not rows.any():
-            continue
-        selected = predictions.loc[rows]
-        biases = [
-            bias(group["measured"], group["predicted"])
-            for _, group in selected.groupby("gap_id", sort=True)
-        ]
-        results[gap_class] = GapClassMetrics(
-            gap_class=gap_class,
-            metrics=metrics_from_config(
-                selected["measured"],
-                selected["predicted"],
-                selected["shortwave"],
-                config=config,
-            ),
-            n_gaps=int(selected["gap_id"].nunique()),
-            bias_by_gap=tuple(biases) if config.bias_iqr_by_gap_class else (),
-        )
-    return MappingProxyType(results)
+def _warn_on_unscored(result: TargetValidation) -> None:
+    """Warn when a run withheld rows but scored none of them (ambiguity A4)."""
+    withheld = result.withheld_rows
+    if not withheld or result.scored_rows:
+        return
+    strategy = result.config.features.statistic_strategy.value
+    warnings.warn(
+        f"{result.method} {result.target}: none of the {withheld} withheld row(s) could be "
+        f"scored. Under daily_statistic_strategy={strategy!r} a gap covering a whole calendar "
+        "day has no daily target statistics, so no row of it has a complete feature vector "
+        "(docs/method_spec.md 3.4, ambiguity A4); a long-gap run needs a reaching strategy - "
+        "'rolling_available' or 'neighbor_day_fallback' - chosen deliberately and recorded in "
+        "the manifest.",
+        ValidationWarning,
+        stacklevel=3,
+    )
 
 
 def _energy_balance(
-    frame: pd.DataFrame,
     results: Mapping[str, TargetValidation],
     *,
-    column_map: ColumnMap,
-    heat: tuple[str, str] | None,
-) -> EnergyBalance | None:
-    """Return measured and filled EBR over the shared artificial gaps (6.4).
+    pair: tuple[str, str],
+    frame: pd.DataFrame,
+    columns: ColumnMap,
+    labels: pd.Series,
+    by_gap_class: bool,
+) -> EnergyBalanceCheck:
+    """Return the measured-against-filled energy-balance check (section 6.4; Step 19).
 
-    Computed only over rows where **both** heat fluxes were withheld and both
-    were predicted, so the numerator's two terms always cover the same
-    half-hours as each other and as the available-energy denominator.
+    Every withheld row is offered, and
+    :func:`~rfrgapfill.metrics.compare_energy_balance` keeps only the rows where
+    all six components are present, so the two ratios describe the same half
+    hours and their difference is the effect of the fill rather than of a
+    different row set. What it drops it counts, by component.
+
+    A measured value must be a *genuine* one: a withheld value that arrived
+    pre-filled is never scored against, and is no more closure evidence than it
+    is scoring truth, so it enters as missing.
     """
-    if heat is None:
-        return None
-    sensible, latent = heat
-    h = results[sensible].predictions
-    le = results[latent].predictions
+    heat, latent = (results[name] for name in pair)
+    # One mask for every target (section 4.4); intersected only so a mismatch
+    # could never offer a row one of the fluxes was not withheld at.
+    withheld = (heat.features.holdout_mask & latent.features.holdout_mask).to_numpy()
+    measured_heat = heat.features.truth.where(heat.features.scoring_mask)
+    measured_latent = latent.features.truth.where(latent.features.scoring_mask)
+    radiation = frame[columns.column(NET_RADIATION)]
+    soil = frame[columns.column(SOIL_HEAT_FLUX)]
 
-    rows = h.index.intersection(le.index)
-    if len(rows) == 0:
-        return None
-    h = h.loc[rows]
-    le = le.loc[rows]
-    usable = (
-        h["measured"].notna()
-        & h["predicted"].notna()
-        & le["measured"].notna()
-        & le["predicted"].notna()
-    )
-    rows = rows[usable.to_numpy()]
-    if len(rows) == 0:
-        return None
-
-    available_energy = frame.loc[rows]
-    net_radiation = pd.to_numeric(
-        available_energy[column_map.column(NET_RADIATION)], errors="coerce"
-    )
-    soil_heat = pd.to_numeric(available_energy[column_map.column(SOIL_HEAT_FLUX)], errors="coerce")
-
-    return EnergyBalance(
-        measured=energy_balance_ratio(
-            h.loc[rows, "measured"], le.loc[rows, "measured"], net_radiation, soil_heat
-        ),
-        filled=energy_balance_ratio(
-            h.loc[rows, "predicted"], le.loc[rows, "predicted"], net_radiation, soil_heat
-        ),
-        n_rows=len(rows),
-        sensible_heat=sensible,
-        latent_heat=latent,
-    )
-
-
-# ---------------------------------------------------------------------------
-# The ORF benchmark (Supplementary Figure S1)
-# ---------------------------------------------------------------------------
-
-
-def compare_receptive_limiter(
-    data: pd.DataFrame,
-    *,
-    targets: str | Sequence[str],
-    **kwargs: Any,
-) -> tuple[ValidationReport, ValidationReport, pd.DataFrame]:
-    """Validate RFR against ORF on identical artificial gaps.
-
-    Returns ``(rfr, orf, comparison)``. The two runs share the gap scenario, the
-    seed, the driver set, the estimator family and the hyperparameter grid, and
-    differ only in whether the receptive-limiter features are built - which is
-    exactly the contrast Supplementary Figure S1 draws.
-
-    ``comparison`` is the paired metrics table with an ``orf`` and an ``rfr``
-    column per metric and their difference. Read it as a record, not a test: the
-    supplement does not claim RFR improves every metric at every site, and
-    neither does this function.
-    """
-    kwargs.pop("use_receptive_limiter", None)
-    kwargs.pop("gaps", None)
-    with_limiter, without_limiter = _paired_settings(kwargs)
-
-    rfr = validate_rfr(data, targets=targets, **with_limiter)
-    # The ORF run is handed the RFR run's own scenario rather than redrawing one,
-    # so the paired metrics differ by the receptive limiter and nothing else.
-    shared = next(iter(rfr.gaps.values())) if rfr.shared_gaps else None
-    orf = validate_rfr(data, targets=targets, gaps=shared, **without_limiter)
-
-    keys = ["target", "gap_class", "subset"]
-    merged = rfr.metrics_frame().merge(orf.metrics_frame(), on=keys, suffixes=("_rfr", "_orf"))
-    for metric in ("r2", "slope", "rmse", "bias"):
-        merged[f"{metric}_difference"] = merged[f"{metric}_rfr"] - merged[f"{metric}_orf"]
-    return rfr, orf, merged
-
-
-def _paired_settings(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Return the RFR and ORF argument sets, differing only in the limiter switch.
-
-    A prepared ``config=`` and the loose ``use_receptive_limiter=`` keyword are
-    mutually exclusive in :func:`validate_rfr`, so the switch is flipped wherever
-    the caller put the configuration rather than added alongside it.
-    """
-    base = kwargs.pop("config", None)
-    if base is None:
-        return (
-            {**kwargs, "use_receptive_limiter": True},
-            {**kwargs, "use_receptive_limiter": False},
+    def compare(rows: np.ndarray) -> EnergyBalanceComparison:
+        return compare_energy_balance(
+            measured_sensible_heat=measured_heat.loc[rows],
+            measured_latent_heat=measured_latent.loc[rows],
+            filled_sensible_heat=heat.predictions.loc[rows],
+            filled_latent_heat=latent.predictions.loc[rows],
+            net_radiation=radiation.loc[rows],
+            soil_heat_flux=soil.loc[rows],
         )
-    return (
+
+    classes = (
         {
-            **kwargs,
-            "config": base.replace(features=base.features.replace(use_receptive_limiter=True)),
-        },
-        {
-            **kwargs,
-            "config": base.replace(features=base.features.replace(use_receptive_limiter=False)),
-        },
+            gap_class: compare(withheld & (labels == gap_class.value).to_numpy())
+            for gap_class in GapClass
+        }
+        if by_gap_class
+        else {}
     )
-
-
-# ---------------------------------------------------------------------------
-# Resolution helpers
-# ---------------------------------------------------------------------------
-
-
-def _requested_targets(targets: str | Sequence[str]) -> tuple[str, ...]:
-    """Return ``targets`` as a deduplicated tuple in request order."""
-    names = [targets] if isinstance(targets, str) else list(targets)
-    if not names:
-        raise ValidationError("name at least one target to validate")
-    ordered: list[str] = []
-    for name in names:
-        if not isinstance(name, str) or not name.strip():
-            raise ValidationError(f"target names must be non-empty strings, got {name!r}")
-        if name not in ordered:
-            ordered.append(name)
-    return tuple(ordered)
-
-
-def _resolve_config(
-    config: RFRConfig | None,
-    *,
-    mode: Mode | str | None,
-    column_map: ColumnMap | Mapping[str, str] | None,
-    scenario: str | GapScenarioConfig | None,
-    hemisphere: str | None,
-    latitude: float | None,
-    frequency: str | None,
-    site_id: str | None,
-    random_state: int,
-    use_receptive_limiter: bool | None,
-) -> RFRConfig:
-    """Return the run configuration, from ``config`` or from the loose settings."""
-    supplied = {
-        "mode": mode,
-        "hemisphere": hemisphere,
-        "latitude": latitude,
-        "frequency": frequency,
-        "site_id": site_id,
-        "use_receptive_limiter": use_receptive_limiter,
-    }
-    given = sorted(name for name, value in supplied.items() if value is not None)
-
-    if config is not None:
-        if given:
-            raise ConfigError(
-                f"pass either config= or the individual setting(s) {', '.join(given)}, not "
-                "both: two sources for the same field would leave the run manifest ambiguous"
-            )
-        settings = config
-    else:
-        if mode is None:
-            raise ConfigError(
-                "validate_rfr needs a driver set: pass mode='RFR3' or mode='RFR10', or a "
-                "prepared config=RFRConfig(...). There is no default driver set."
-            )
-        features = FeatureConfig()
-        if use_receptive_limiter is not None:
-            features = features.replace(use_receptive_limiter=use_receptive_limiter)
-        settings = RFRConfig(
-            mode=mode,
-            frequency=frequency,
-            hemisphere=hemisphere,
-            latitude=latitude,
-            site_id=site_id,
-            random_state=random_state,
-            features=features,
-            column_map=column_map,
-        )
-
-    if scenario is not None:
-        settings = settings.replace(
-            validation=settings.validation.replace(gaps=_scenario_config(scenario))
-        )
-    return settings
-
-
-def _scenario_config(scenario: str | GapScenarioConfig) -> GapScenarioConfig:
-    """Return the named or supplied artificial-gap scenario."""
-    if isinstance(scenario, GapScenarioConfig):
-        return scenario
-    if isinstance(scenario, str):
-        try:
-            return SCENARIOS[scenario]
-        except KeyError:
-            raise ValidationError(
-                f"unknown scenario {scenario!r}; registered scenarios are: "
-                f"{', '.join(sorted(SCENARIOS))}. Pass a GapScenarioConfig for anything else."
-            ) from None
-    raise ValidationError(
-        f"scenario must be a name or a GapScenarioConfig, got {type(scenario).__name__}"
+    return EnergyBalanceCheck(
+        sensible_heat=pair[0],
+        latent_heat=pair[1],
+        overall=compare(withheld),
+        by_gap_class=classes,
     )
-
-
-def _scenarios(
-    gaps: ArtificialGaps | None,
-    *,
-    axis: TimeAxis,
-    observed: Mapping[str, pd.Series],
-    config: RFRConfig,
-    targets: Sequence[str],
-) -> tuple[dict[str, ArtificialGaps], bool]:
-    """Return the artificial gaps each target is scored on, and whether they are shared.
-
-    Shared by default, as the paper's joint validation was: one scenario drawn
-    from the rows where **every** target is genuinely measured, so the same
-    half-hours are withheld from each and the three results are comparable
-    (method_spec.md 4.4).
-    """
-    if gaps is not None:
-        return {target: gaps for target in targets}, True
-
-    generator = GapScenarioGenerator(config.validation.gaps, random_state=config.random_state)
-    if config.validation.gaps.shared_gaps_across_targets or len(targets) == 1:
-        joint = observed[targets[0]].copy()
-        for target in targets[1:]:
-            joint &= observed[target]
-        if not joint.any():
-            raise ValidationError(
-                "no timestamp carries a genuine measurement of every target, so no shared "
-                f"gap scenario exists for {', '.join(targets)}. Validate the targets "
-                "separately, or set shared_gaps_across_targets=False."
-            )
-        return {target: generator.generate(axis, joint) for target in targets}, True
-
-    # Distinct scenarios: each target gets its own seed so the runs are not
-    # accidentally identical where the observation masks happen to agree.
-    scenarios = {}
-    for offset, target in enumerate(targets):
-        per_target = GapScenarioGenerator(
-            config.validation.gaps, random_state=config.random_state + offset
-        )
-        scenarios[target] = per_target.generate(axis, observed[target])
-    return scenarios, False
-
-
-def _resolve_heat_targets(
-    requested: tuple[str, str] | None,
-    targets: Sequence[str],
-    config: ValidationConfig,
-) -> tuple[str, str] | None:
-    """Return the (H, LE) target pair the EBR is computed for, or ``None``.
-
-    Defaults to ``("H", "LE")`` when both were validated. An explicit pair names
-    the columns at a site that calls them something else; naming a target that
-    was not validated is an error rather than a silently skipped metric.
-    """
-    if not config.compute_energy_balance_ratio:
-        return None
-    if requested is None:
-        pair = _DEFAULT_HEAT_TARGETS
-        return pair if all(name in targets for name in pair) else None
-    if len(requested) != 2:
-        raise ValidationError(
-            f"energy_balance_targets must name the sensible and latent heat targets, "
-            f"got {requested!r}"
-        )
-    absent = [name for name in requested if name not in targets]
-    if absent:
-        raise ValidationError(
-            f"energy_balance_targets names target(s) this run did not validate: {', '.join(absent)}"
-        )
-    return requested[0], requested[1]

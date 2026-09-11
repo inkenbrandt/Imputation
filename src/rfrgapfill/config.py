@@ -2,11 +2,12 @@
 
 Implements :class:`RFRConfig`, :class:`FeatureConfig`, :class:`GapScenarioConfig`
 and :class:`ValidationConfig`. Every ambiguity recorded in ``docs/method_spec.md``
-(A1-A10) is reachable through a configuration field here, and incompatible options
+(A1-A12) is reachable through a configuration field here, and incompatible options
 are rejected at construction rather than in the middle of a fit.
 
 All configuration objects are frozen dataclasses. They validate and normalise in
-``__post_init__``, expose ``to_dict()`` for the run manifest, and are the only
+``__post_init__``, expose ``to_dict()`` for the run manifest and ``from_dict()`` to
+read that form back (:func:`load_config` reads it from a file), and are the only
 place scientific constants live: no science module may define its own thresholds,
 durations, or driver lists.
 
@@ -18,11 +19,13 @@ documented choice, cross-referenced to the ambiguity table in
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from datetime import timedelta
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, cast
 
@@ -32,6 +35,7 @@ from rfrgapfill.schema import (
     ColumnMap,
     ColumnMapError,
     ConfigError,
+    FrozenRecord,
     GapClass,
     Hemisphere,
     Mode,
@@ -41,10 +45,15 @@ from rfrgapfill.time import iso_duration, to_timedelta
 
 __all__ = [
     "DEFAULT_DAYTIME_THRESHOLD",
+    "DEFAULT_FALLBACK_WINDOW_DAYS",
     "DEFAULT_GAP_DURATIONS",
     "DEFAULT_GAP_MIX",
     "DEFAULT_HYPERPARAMETER_GRID",
+    "DEFAULT_OBSERVED_QC_VALUES",
     "DEFAULT_RADIATION_THRESHOLDS",
+    "HYPERPARAMETER_PRESETS",
+    "LEGACY_FLUXLIB_FIXED_HYPERPARAMETERS",
+    "LEGACY_FLUXLIB_HYPERPARAMETER_GRID",
     "AllocationBasis",
     "BoundaryConvention",
     "CVStrategy",
@@ -57,10 +66,15 @@ __all__ = [
     "GapClass",
     "GapScenarioConfig",
     "Hemisphere",
+    "HyperparameterPreset",
     "MetricSubset",
     "Mode",
+    "R2Definition",
     "RFRConfig",
     "ValidationConfig",
+    "load_config",
+    "orf_pairing_differences",
+    "require_orf_pairing",
 ]
 
 
@@ -70,19 +84,83 @@ __all__ = [
 
 
 class FeatureMode(str, Enum):
-    """How target-derived daily statistics are computed (method_spec.md 3.5, A6)."""
+    """How the receptive-limiter features are derived (method_spec.md 3.5, A6)."""
 
     #: Leakage-safe default: daily statistics see only observations visible to the
     #: model, and the artificial-gap mask is built before features are computed.
     PAPER_SAFE = "paper_safe"
-    #: Reserved compatibility mode. Enabled only if implementation evidence for a
-    #: different derivation in the historical ``fluxlib`` code is found.
+    #: Historical compatibility: the feature derivation of ``fluxlib`` 0.0.23, the
+    #: implementation the paper cites - including its computation of the daily
+    #: statistics *before* the artificial gaps are hidden. Never paper faithful and
+    #: never a default; see :mod:`rfrgapfill.legacy` and ``docs/fluxlib_audit.md``.
     LEGACY_FLUXLIB = "legacy_fluxlib"
 
     @classmethod
     def coerce(cls, value: object) -> FeatureMode:
         """Return ``value`` as a :class:`FeatureMode`."""
         return coerce_enum(cls, value, field_name="feature_mode")
+
+
+class HyperparameterPreset(str, Enum):
+    """Named ``GridSearchCV`` grids (method_spec.md section 5, ambiguity A1).
+
+    The article states that ``GridSearchCV`` was used and enumerates no grid, so
+    none of these is the paper's search. The two ``fluxlib`` presets are what the
+    implementation the paper cites contains (``docs/fluxlib_audit.md``).
+    """
+
+    #: :data:`DEFAULT_HYPERPARAMETER_GRID`, this package's documented choice.
+    PACKAGE_DEFAULT = "package_default"
+    #: The grid of ``fluxlib``'s ``GFiller.auto_optimize`` (releases 0.0.13-0.0.29),
+    #: searched there with 3-fold cross-validation. No archived pipeline calls it.
+    LEGACY_FLUXLIB = "legacy_fluxlib"
+    #: The single parameter set every archived ``fluxlib`` pipeline actually
+    #: fitted, with no search at all. A one-point grid, so the search only refits it.
+    LEGACY_FLUXLIB_FIXED = "legacy_fluxlib_fixed"
+
+    @classmethod
+    def coerce(cls, value: object) -> HyperparameterPreset:
+        """Return ``value`` as a :class:`HyperparameterPreset`."""
+        return coerce_enum(cls, value, field_name="hyperparameter_preset")
+
+
+class DailyStatisticStrategy(str, Enum):
+    """What a day does when too few of its target observations are visible (A4).
+
+    Every strategy draws exclusively on observations the model is allowed to see,
+    so none of them can leak held-out truth; they differ only in how far they
+    reach for a substitute when a day is thinly observed. "Too few" means fewer
+    than ``FeatureConfig.min_daily_observations`` visible values.
+    """
+
+    #: Statistics stay missing for a day below the minimum. The documented
+    #: default: nothing is imputed, nothing is borrowed, and the affected rows are
+    #: excluded from training and flagged at prediction time.
+    MISSING = "missing"
+    #: Use whatever the day itself has, ignoring the minimum. Quartiles are
+    #: defined from a single visible value; the sample standard deviation still
+    #: needs two. Never reaches outside the calendar day.
+    WITHIN_DAY_AVAILABLE = "within_day_available"
+    #: A day below the minimum borrows the statistics of the nearest day that
+    #: meets it, within ``fallback_window_days``; ties resolve to the earlier day.
+    NEIGHBOR_DAY_FALLBACK = "neighbor_day_fallback"
+    #: A day below the minimum is computed from the visible observations in a
+    #: window of +/- ``fallback_window_days`` calendar days centred on it, and
+    #: stays missing if that pool is still below the minimum.
+    ROLLING_AVAILABLE = "rolling_available"
+
+    @property
+    def uses_other_days(self) -> bool:
+        """Whether the strategy may reach outside the calendar day it describes."""
+        return self in (
+            DailyStatisticStrategy.NEIGHBOR_DAY_FALLBACK,
+            DailyStatisticStrategy.ROLLING_AVAILABLE,
+        )
+
+    @classmethod
+    def coerce(cls, value: object) -> DailyStatisticStrategy:
+        """Return ``value`` as a :class:`DailyStatisticStrategy`."""
+        return coerce_enum(cls, value, field_name="daily_statistic_strategy")
 
 
 class BoundaryConvention(str, Enum):
@@ -175,6 +253,35 @@ class CVStrategy(str, Enum):
         return coerce_enum(cls, value, field_name="cv_strategy")
 
 
+class R2Definition(str, Enum):
+    """Which coefficient of determination ``R2`` names (method_spec.md 6.1, A12).
+
+    The article reports ``R2`` beside a regression slope but does not say which of
+    the two standard quantities it is, and they answer different questions.
+    """
+
+    #: ``1 - SS_res / SS_tot``: the share of the measured variance the predictions
+    #: actually account for, scikit-learn's ``r2_score``. The default, because it
+    #: is what "coefficient of determination" means unqualified and because it is
+    #: the only one of the two that a biased prediction cannot flatter.
+    RESIDUAL = "residual"
+    #: The squared Pearson correlation, equivalently the ``R2`` of the ordinary
+    #: least-squares fit the slope comes from. Invariant to any affine rescaling
+    #: of the predictions, so it scores a systematically offset series as
+    #: perfectly as an unbiased one.
+    SQUARED_CORRELATION = "squared_correlation"
+
+    @property
+    def is_bias_sensitive(self) -> bool:
+        """Whether a systematic offset in the predictions lowers this ``R2``."""
+        return self is R2Definition.RESIDUAL
+
+    @classmethod
+    def coerce(cls, value: object) -> R2Definition:
+        """Return ``value`` as a :class:`R2Definition`."""
+        return coerce_enum(cls, value, field_name="r2_definition")
+
+
 class MetricSubset(str, Enum):
     """Observation subsets metrics are reported over (method_spec.md 6.2)."""
 
@@ -207,6 +314,12 @@ _METRIC_SUBSET_ALIASES: Final[Mapping[str, MetricSubset]] = MappingProxyType(
 #: Radiation-category thresholds in W m-2 (paper: 10 and 100; boundaries are A2).
 DEFAULT_RADIATION_THRESHOLDS: Final[tuple[float, float]] = (10.0, 100.0)
 
+#: QC flag values counting as genuinely observed. FLUXNET2015 uses 0 for measured.
+DEFAULT_OBSERVED_QC_VALUES: Final[tuple[int, ...]] = (0,)
+
+#: Reach of the two fallback daily-statistic strategies, in calendar days (A4).
+DEFAULT_FALLBACK_WINDOW_DAYS: Final[int] = 7
+
 #: Daytime threshold on downward shortwave radiation, W m-2 (paper).
 DEFAULT_DAYTIME_THRESHOLD: Final[float] = 20.0
 
@@ -229,14 +342,57 @@ DEFAULT_GAP_MIX: Final[Mapping[GapClass, float]] = MappingProxyType(
 #: The article states that hyperparameters were optimised with ``GridSearchCV`` but
 #: does not enumerate the grid, so this is **our** default and must never be
 #: described as paper exact. It is deliberately small enough to run on a decade of
-#: half-hourly data. An archived ``fluxlib`` grid may be added later as a named
-#: preset alongside it.
+#: half-hourly data. The archived ``fluxlib`` grids sit beside it as named presets
+#: (:data:`HYPERPARAMETER_PRESETS`).
 DEFAULT_HYPERPARAMETER_GRID: Final[Mapping[str, tuple[Any, ...]]] = MappingProxyType(
     {
         "max_features": (1.0, "sqrt"),
         "min_samples_leaf": (1, 5),
         "n_estimators": (100, 300),
     }
+)
+
+#: ``fluxlib``'s ``GFiller.auto_optimize`` grid, verbatim (A1, docs/fluxlib_audit.md).
+#:
+#: 288 candidates, which ``fluxlib`` searched with ``cv=3`` - pair the preset with
+#: ``cv_folds=3`` to repeat that search. Present in every ``fluxlib`` release from
+#: 0.0.13 to 0.0.29 and called by none of the archived pipelines, which is why it is
+#: a named preset rather than a claim about the paper's runs.
+LEGACY_FLUXLIB_HYPERPARAMETER_GRID: Final[Mapping[str, tuple[Any, ...]]] = MappingProxyType(
+    {
+        "bootstrap": (True,),
+        "max_depth": (80, 90, 100, 110),
+        "max_features": (2, 3),
+        "min_samples_leaf": (3, 4, 5),
+        "min_samples_split": (8, 10, 12),
+        "n_estimators": (100, 200, 300, 1000),
+    }
+)
+
+#: The fixed parameters the archived ``fluxlib`` pipelines fitted (A1).
+#:
+#: From ``gapfill/config-examples/ggapfill.yaml`` (releases 0.0.16-0.0.23) and the
+#: artificial-gap notebooks' ``train_rfr(..., n_estimators=100)``. ``max_features``
+#: was left at scikit-learn's default, which for a regressor used every feature then
+#: and does now. The seed and ``n_jobs`` are the run configuration's, as for any grid.
+LEGACY_FLUXLIB_FIXED_HYPERPARAMETERS: Final[Mapping[str, tuple[Any, ...]]] = MappingProxyType(
+    {
+        "max_depth": (20,),
+        "min_samples_leaf": (3,),
+        "min_samples_split": (12,),
+        "n_estimators": (100,),
+    }
+)
+
+#: Every named grid, by preset (A1). None of them is the paper's search.
+HYPERPARAMETER_PRESETS: Final[Mapping[HyperparameterPreset, Mapping[str, tuple[Any, ...]]]] = (
+    MappingProxyType(
+        {
+            HyperparameterPreset.PACKAGE_DEFAULT: DEFAULT_HYPERPARAMETER_GRID,
+            HyperparameterPreset.LEGACY_FLUXLIB: LEGACY_FLUXLIB_HYPERPARAMETER_GRID,
+            HyperparameterPreset.LEGACY_FLUXLIB_FIXED: LEGACY_FLUXLIB_FIXED_HYPERPARAMETERS,
+        }
+    )
 )
 
 #: Estimator parameters the package controls itself; they may not appear in a grid.
@@ -316,13 +472,77 @@ def _normalise_gap_class_mapping(
     return {gap_class: normalised.get(gap_class, default[gap_class]) for gap_class in GapClass}
 
 
+#: Keys :meth:`RFRConfig.to_dict` computes from the other settings. Read back only
+#: to be checked against what the settings actually imply.
+_DERIVED_SETTINGS: Final[frozenset[str]] = frozenset(
+    {"resolved_hemisphere", "hemisphere_source", "is_paper_faithful"}
+)
+
+#: Settings :meth:`FeatureConfig.to_dict` reports as ``None`` under
+#: ``legacy_fluxlib``, meaning "not applicable" rather than a value.
+_LEGACY_NOT_APPLICABLE: Final[tuple[str, ...]] = (
+    "boundary_convention",
+    "min_daily_observations",
+    "daily_statistic_strategy",
+)
+
+
+def _settings_from(
+    document: object,
+    *,
+    owner: type[Any],
+    section: str,
+    derived: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Return ``document``'s entries as constructor arguments for dataclass ``owner``.
+
+    Keys ``owner`` does not accept are rejected rather than ignored, so a misspelt
+    setting fails instead of silently leaving its default in force. Keys in
+    ``derived`` are dropped; the caller checks them once the object exists.
+    """
+    if not isinstance(document, Mapping):
+        raise ConfigError(f"{section} must be a mapping of settings, got {type(document).__name__}")
+    accepted = {entry.name for entry in fields(owner)}
+    unknown = sorted(str(key) for key in document if key not in accepted and key not in derived)
+    if unknown:
+        raise ConfigError(
+            f"unknown {section} setting(s): {', '.join(unknown)}. "
+            f"Expected any of: {', '.join(sorted(accepted))}"
+        )
+    return {str(key): value for key, value in document.items() if key in accepted}
+
+
+def _column_map_from_dict(value: object) -> ColumnMap:
+    """Return a column mapping from its ``to_dict`` form or from a flat mapping.
+
+    ``{"variables": {...}, "timestamp": ...}`` is what a manifest records; a flat
+    ``{canonical name: column}`` mapping, optionally with a ``timestamp`` entry, is
+    the shorter form to write by hand.
+    """
+    if value is None or isinstance(value, ColumnMap):
+        return ColumnMap.coerce(value)
+    if not isinstance(value, Mapping):
+        raise ConfigError(f"column_map must be a mapping, got {type(value).__name__}")
+    entries = dict(value)
+    timestamp = entries.pop("timestamp", None)
+    variables = entries.pop("variables") if "variables" in entries else entries
+    if variables is not entries and entries:
+        raise ConfigError(
+            "column_map in its structured form takes only 'variables' and 'timestamp', "
+            f"not {', '.join(sorted(map(str, entries)))}"
+        )
+    if not isinstance(variables, Mapping):
+        raise ConfigError(f"column_map variables must be a mapping, got {type(variables).__name__}")
+    return ColumnMap(variables=dict(variables), timestamp=timestamp)
+
+
 # ---------------------------------------------------------------------------
 # FeatureConfig
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class FeatureConfig:
+class FeatureConfig(FrozenRecord):
     """Receptive-limiter feature configuration (method_spec.md section 3).
 
     ``use_receptive_limiter=False`` yields the supplement's ORF benchmark: the same
@@ -339,13 +559,18 @@ class FeatureConfig:
     #: How values exactly on a radiation threshold are binned (A2).
     boundary_convention: BoundaryConvention | str = BoundaryConvention.MEDIUM_INCLUSIVE
     #: Minimum visible target observations for a day's statistics to be computed (A4).
-    #: A day below this threshold has no statistics of its own; what happens next is
-    #: ``daily_statistics_strategy``. Values are never imputed from the target.
-    min_daily_observations: int = 2
-    #: What a day with too few visible target observations does instead (A4).
-    daily_statistics_strategy: DailyStatisticStrategy | str = (
-        DailyStatisticStrategy.NEAREST_VISIBLE_DAY
-    )
+    min_daily_observations: int = 1
+    #: What a day below that minimum does (A4). The default leaves it missing.
+    daily_statistic_strategy: DailyStatisticStrategy | str = DailyStatisticStrategy.MISSING
+    #: Reach of ``neighbor_day_fallback`` and ``rolling_available`` in calendar
+    #: days. ``None`` takes :data:`DEFAULT_FALLBACK_WINDOW_DAYS` for those two
+    #: strategies and is rejected for the strategies that never leave the day, so
+    #: a window can never be set where it would silently do nothing.
+    fallback_window_days: int | None = None
+    #: Delta degrees of freedom of the daily target standard deviation (A11). The
+    #: paper names the statistic but not the convention; 1 is the sample standard
+    #: deviation and the pandas default. 0 gives the population standard deviation.
+    daily_std_ddof: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.use_receptive_limiter, bool):
@@ -353,12 +578,6 @@ class FeatureConfig:
                 f"use_receptive_limiter must be a bool, got {self.use_receptive_limiter!r}"
             )
         mode = FeatureMode.coerce(self.feature_mode)
-        if mode is FeatureMode.LEGACY_FLUXLIB:
-            raise ConfigError(
-                "feature_mode='legacy_fluxlib' is reserved and not implemented: it may be "
-                "enabled only once implementation evidence for a different daily-statistic "
-                "derivation is found (docs/method_spec.md, ambiguity A6). Use 'paper_safe'."
-            )
         object.__setattr__(self, "feature_mode", mode)
         object.__setattr__(
             self, "boundary_convention", BoundaryConvention.coerce(self.boundary_convention)
@@ -389,6 +608,60 @@ class FeatureConfig:
             DailyStatisticStrategy.coerce(self.daily_statistics_strategy),
         )
 
+        strategy = DailyStatisticStrategy.coerce(self.daily_statistic_strategy)
+        object.__setattr__(self, "daily_statistic_strategy", strategy)
+        window = self.fallback_window_days
+        if strategy.uses_other_days:
+            if window is None:
+                window = DEFAULT_FALLBACK_WINDOW_DAYS
+            window = _check_positive_int(window, field_name="fallback_window_days")
+        elif window is not None:
+            raise ConfigError(
+                f"fallback_window_days is meaningful only for the strategies that reach "
+                f"outside a calendar day ('neighbor_day_fallback', 'rolling_available'), "
+                f"but daily_statistic_strategy={strategy.value!r} never does. Leave it None "
+                f"rather than recording a window that had no effect."
+            )
+        object.__setattr__(self, "fallback_window_days", window)
+        object.__setattr__(
+            self,
+            "daily_std_ddof",
+            _check_positive_int(self.daily_std_ddof, field_name="daily_std_ddof", minimum=0),
+        )
+        if mode is FeatureMode.LEGACY_FLUXLIB:
+            self._require_legacy_defaults()
+
+    def _require_legacy_defaults(self) -> None:
+        """Reject the settings ``legacy_fluxlib`` replaces with ``fluxlib``'s own rules.
+
+        ``fluxlib`` hard-codes the 10 and 100 W m-2 thresholds and its own boundary
+        handling, never leaves a day without statistics (it interpolates the target
+        first, so no A4 strategy applies) and uses pandas' sample standard
+        deviation. Accepting another value here would record a setting that had no
+        effect, which a manifest must never do - the same rule that refuses a
+        ``fallback_window_days`` for a strategy that never leaves the day.
+        """
+        defaults = FeatureConfig()
+        superseded = [
+            name
+            for name in (
+                "radiation_thresholds",
+                "boundary_convention",
+                "min_daily_observations",
+                "daily_statistic_strategy",
+                "fallback_window_days",
+                "daily_std_ddof",
+            )
+            if getattr(self, name) != getattr(defaults, name)
+        ]
+        if superseded:
+            raise ConfigError(
+                "feature_mode='legacy_fluxlib' reproduces fluxlib's own radiation, "
+                "daily-statistic and standard-deviation rules, so these settings would "
+                f"have no effect and cannot be set: {', '.join(superseded)} "
+                "(docs/fluxlib_audit.md)"
+            )
+
     @property
     def mode(self) -> FeatureMode:
         """The validated :class:`FeatureMode` (narrowed from the input union)."""
@@ -402,10 +675,16 @@ class FeatureConfig:
         return self.boundary_convention
 
     @property
-    def daily_strategy(self) -> DailyStatisticStrategy:
+    def statistic_strategy(self) -> DailyStatisticStrategy:
         """The validated :class:`DailyStatisticStrategy` (narrowed from the input union)."""
-        assert isinstance(self.daily_statistics_strategy, DailyStatisticStrategy)
-        return self.daily_statistics_strategy
+        assert isinstance(self.daily_statistic_strategy, DailyStatisticStrategy)
+        return self.daily_statistic_strategy
+
+    @property
+    def fallback_window(self) -> int | None:
+        """Fallback reach in days: an integer for the reaching strategies, else ``None``."""
+        assert self.fallback_window_days is None or isinstance(self.fallback_window_days, int)
+        return self.fallback_window_days
 
     @property
     def requires_hemisphere(self) -> bool:
@@ -423,15 +702,38 @@ class FeatureConfig:
         """Return a revalidated copy with ``changes`` applied."""
         return replace(self, **changes)
 
+    @classmethod
+    def from_dict(cls, document: Mapping[str, Any]) -> FeatureConfig:
+        """Return the configuration a :meth:`to_dict`-shaped mapping describes.
+
+        Under ``legacy_fluxlib`` the settings :meth:`to_dict` reports as ``None``
+        (not applicable) are read back as absent. Anywhere else ``None`` is passed
+        through and validated, so it can never quietly stand for the default.
+        """
+        settings = _settings_from(document, owner=cls, section="features")
+        mode = FeatureMode.coerce(settings.get("feature_mode", FeatureMode.PAPER_SAFE))
+        if mode is FeatureMode.LEGACY_FLUXLIB:
+            for name in _LEGACY_NOT_APPLICABLE:
+                if name in settings and settings[name] is None:
+                    del settings[name]
+        return cls(**settings)
+
     def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-serialisable representation for the run manifest."""
+        """Return a JSON-serialisable representation for the run manifest.
+
+        Under ``legacy_fluxlib`` the settings ``fluxlib``'s own rules replace are
+        reported as ``None`` - not applicable - rather than as values nothing used.
+        """
+        legacy = self.mode is FeatureMode.LEGACY_FLUXLIB
         return {
             "use_receptive_limiter": self.use_receptive_limiter,
             "feature_mode": self.mode.value,
             "radiation_thresholds": list(self.radiation_thresholds),
-            "boundary_convention": self.convention.value,
-            "min_daily_observations": self.min_daily_observations,
-            "daily_statistics_strategy": self.daily_strategy.value,
+            "boundary_convention": None if legacy else self.convention.value,
+            "min_daily_observations": None if legacy else self.min_daily_observations,
+            "daily_statistic_strategy": None if legacy else self.statistic_strategy.value,
+            "fallback_window_days": self.fallback_window,
+            "daily_std_ddof": self.daily_std_ddof,
         }
 
 
@@ -441,7 +743,7 @@ class FeatureConfig:
 
 
 @dataclass(frozen=True)
-class GapScenarioConfig:
+class GapScenarioConfig(FrozenRecord):
     """Artificial-gap scenario configuration (method_spec.md section 4).
 
     Defaults reproduce the paper's scenario: 25% of available observations withheld
@@ -565,6 +867,11 @@ class GapScenarioConfig:
         """Return a revalidated copy with ``changes`` applied."""
         return replace(self, **changes)
 
+    @classmethod
+    def from_dict(cls, document: Mapping[str, Any]) -> GapScenarioConfig:
+        """Return the scenario a :meth:`to_dict`-shaped mapping describes."""
+        return cls(**_settings_from(document, owner=cls, section="validation.gaps"))
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable representation for the run manifest."""
         return {
@@ -587,7 +894,7 @@ class GapScenarioConfig:
 
 
 @dataclass(frozen=True)
-class ValidationConfig:
+class ValidationConfig(FrozenRecord):
     """Artificial-gap validation and metric reporting (method_spec.md sections 4, 6)."""
 
     #: The artificial-gap scenario the test set is drawn from.
@@ -601,6 +908,8 @@ class ValidationConfig:
         MetricSubset.DAYTIME,
         MetricSubset.NIGHTTIME,
     )
+    #: Which quantity ``R2`` names (A12). The default is bias sensitive.
+    r2_definition: R2Definition | str = R2Definition.RESIDUAL
     #: Whether core metrics are also reported per gap class.
     report_by_gap_class: bool = True
     #: Whether bias IQR is reported per gap class (method_spec.md 6.3).
@@ -626,6 +935,7 @@ class ValidationConfig:
             if subset not in seen:
                 seen.append(subset)
         object.__setattr__(self, "subsets", tuple(seen))
+        object.__setattr__(self, "r2_definition", R2Definition.coerce(self.r2_definition))
         for name in (
             "report_by_gap_class",
             "bias_iqr_by_gap_class",
@@ -641,16 +951,24 @@ class ValidationConfig:
         assert isinstance(subsets, tuple)
         return subsets
 
-    def __reduce__(self) -> tuple[Any, ...]:
-        """Rebuild through the constructor so pickling revalidates.
-
-        See :func:`_picklable_fields`.
-        """
-        return (_rebuild_config, (type(self), _picklable_fields(self)))
+    @property
+    def r2(self) -> R2Definition:
+        """The validated ``R2`` definition (narrowed from the input union)."""
+        definition = self.r2_definition
+        assert isinstance(definition, R2Definition)
+        return definition
 
     def replace(self, **changes: Any) -> ValidationConfig:
         """Return a revalidated copy with ``changes`` applied."""
         return replace(self, **changes)
+
+    @classmethod
+    def from_dict(cls, document: Mapping[str, Any]) -> ValidationConfig:
+        """Return the configuration a :meth:`to_dict`-shaped mapping describes."""
+        settings = _settings_from(document, owner=cls, section="validation")
+        if isinstance(settings.get("gaps"), Mapping):
+            settings["gaps"] = GapScenarioConfig.from_dict(settings["gaps"])
+        return cls(**settings)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable representation for the run manifest."""
@@ -658,6 +976,7 @@ class ValidationConfig:
             "gaps": self.gaps.to_dict(),
             "daytime_threshold": self.daytime_threshold,
             "subsets": [subset.value for subset in self.metric_subsets],
+            "r2_definition": self.r2.value,
             "report_by_gap_class": self.report_by_gap_class,
             "bias_iqr_by_gap_class": self.bias_iqr_by_gap_class,
             "compute_energy_balance_ratio": self.compute_energy_balance_ratio,
@@ -670,7 +989,7 @@ class ValidationConfig:
 
 
 @dataclass(frozen=True)
-class RFRConfig:
+class RFRConfig(FrozenRecord):
     """Top-level run configuration for one site.
 
     Holds the driver mode, the site's time and location metadata, the estimator
@@ -693,8 +1012,14 @@ class RFRConfig:
     random_state: int = 42
     #: ``n_jobs`` passed to the estimator and the grid search. ``None`` means 1.
     n_jobs: int | None = None
-    #: ``GridSearchCV`` grid. Our documented default, never "paper exact" (A1).
-    hyperparameter_grid: Mapping[str, Sequence[Any]] = DEFAULT_HYPERPARAMETER_GRID
+    #: ``GridSearchCV`` grid. ``None`` takes the grid of ``hyperparameter_preset``.
+    #: However it is given, it is never "paper exact" (A1).
+    hyperparameter_grid: Mapping[str, Sequence[Any]] | None = None
+    #: Named grid to search (:class:`HyperparameterPreset`) - an *input*: it chooses
+    #: the grid when ``hyperparameter_grid`` is ``None`` (``package_default`` when
+    #: both are), must agree with an explicit grid, and is then cleared so the grid
+    #: alone is the source of truth. Read :attr:`preset` for the preset a grid is.
+    hyperparameter_preset: HyperparameterPreset | str | None = None
     #: Cross-validation strategy inside the grid search (A5).
     cv_strategy: CVStrategy | str = CVStrategy.KFOLD
     #: Number of cross-validation folds.
@@ -703,7 +1028,7 @@ class RFRConfig:
     cv_shuffle: bool = False
     #: QC flag values that count as genuinely observed target measurements. FLUXNET
     #: uses 0 for measured; anything else was already gap-filled before ingestion.
-    observed_qc_values: Sequence[int] = (0,)
+    observed_qc_values: Sequence[int] = DEFAULT_OBSERVED_QC_VALUES
     #: Receptive-limiter configuration.
     features: FeatureConfig = field(default_factory=FeatureConfig)
     #: Artificial-gap validation configuration.
@@ -767,8 +1092,13 @@ class RFRConfig:
             )
 
         object.__setattr__(
-            self, "hyperparameter_grid", _validate_hyperparameter_grid(self.hyperparameter_grid)
+            self,
+            "hyperparameter_grid",
+            _resolve_hyperparameter_grid(self.hyperparameter_grid, self.hyperparameter_preset),
         )
+        # Cleared once it has chosen the grid, so replace(hyperparameter_grid=...)
+        # never collides with a preset carried over from before (see `preset`).
+        object.__setattr__(self, "hyperparameter_preset", None)
 
         qc_values = self.observed_qc_values
         if isinstance(qc_values, (str, bytes)) or not isinstance(qc_values, Sequence):
@@ -834,11 +1164,32 @@ class RFRConfig:
         return self.rfr_mode.drivers
 
     @property
+    def grid(self) -> Mapping[str, tuple[Any, ...]]:
+        """The validated ``GridSearchCV`` grid (narrowed from the input union)."""
+        grid = self.hyperparameter_grid
+        assert grid is not None
+        return cast("Mapping[str, tuple[Any, ...]]", grid)
+
+    @property
+    def preset(self) -> HyperparameterPreset | None:
+        """The named preset the grid equals, or ``None`` for a custom grid (A1)."""
+        return _matching_preset(self.grid)
+
+    def with_hyperparameter_preset(self, preset: HyperparameterPreset | str) -> RFRConfig:
+        """Return a copy that searches ``preset``'s grid instead of the current one.
+
+        :meth:`replace` carries the current grid along, so naming a preset alone
+        would be rejected as a disagreement with it; this clears the grid as well.
+        """
+        return self.replace(hyperparameter_preset=preset, hyperparameter_grid=None)
+
+    @property
     def is_paper_faithful(self) -> bool:
         """Whether every option is the paper-faithful default rather than an enhancement.
 
         False as soon as a labelled enhancement is enabled (time-aware CV, shuffled
-        folds) or the receptive limiter is switched off for the ORF benchmark.
+        folds), the receptive limiter is switched off for the ORF benchmark, or the
+        ``legacy_fluxlib`` historical-compatibility feature mode is chosen.
         """
         return (
             self.features.use_receptive_limiter
@@ -846,6 +1197,32 @@ class RFRConfig:
             and self.cv.is_paper_default
             and not self.cv_shuffle
         )
+
+    @property
+    def is_orf(self) -> bool:
+        """Whether this is the ORF benchmark rather than an RFR run (Fig. S1)."""
+        return not self.features.use_receptive_limiter
+
+    def as_orf(self) -> RFRConfig:
+        """Return this run's ORF benchmark counterpart (method_spec.md 3.6).
+
+        Switches the receptive limiter off and changes **nothing else**: the same
+        mode and driver set, seed, hyperparameter grid, CV policy, column mapping,
+        QC rules and hemisphere are all carried over. That is the entire
+        definition of ORF in Supplementary Figure S1 - the same Random Forest, on
+        the same rows, with the same drivers, minus the feature engineering - so
+        the paired comparison measures the receptive limiter and nothing else.
+
+        Deriving the benchmark this way rather than hand-building a second
+        configuration is what keeps that guarantee: see :func:`require_orf_pairing`,
+        which the validation workflow uses to reject a mismatched pair.
+
+        Idempotent - calling it on a configuration that is already ORF returns an
+        equal configuration.
+        """
+        if self.is_orf:
+            return self
+        return self.replace(features=self.features.replace(use_receptive_limiter=False))
 
     def resolve_hemisphere(self) -> Hemisphere:
         """Return the hemisphere, preferring an explicit value over ``latitude`` (A9)."""
@@ -907,6 +1284,49 @@ class RFRConfig:
         """Return a revalidated copy with ``changes`` applied."""
         return replace(self, **changes)
 
+    @classmethod
+    def from_dict(cls, document: Mapping[str, Any]) -> RFRConfig:
+        """Return the configuration a :meth:`to_dict`-shaped mapping describes.
+
+        The inverse of :meth:`to_dict`, so the ``config`` section of a run manifest
+        rebuilds the configuration it records - through the constructors, which
+        revalidate every setting rather than trusting the document. Nested sections
+        may be given as mappings; ``column_map`` also accepts the flat
+        ``{canonical name: column}`` form, with an optional ``timestamp`` entry.
+
+        Unknown keys are rejected at every level. The keys :meth:`to_dict` derives
+        (``resolved_hemisphere``, ``hemisphere_source``, ``is_paper_faithful``) are
+        accepted only when they agree with what the other settings imply: a file
+        claiming ``is_paper_faithful: true`` for a run that is not must not load.
+        """
+        settings = _settings_from(
+            document, owner=cls, section="configuration", derived=_DERIVED_SETTINGS
+        )
+        if "mode" not in settings:
+            raise ConfigError(
+                "the configuration must name a mode ('RFR3' or 'RFR10'): there is no "
+                "silent default driver set"
+            )
+        if isinstance(settings.get("features"), Mapping):
+            settings["features"] = FeatureConfig.from_dict(settings["features"])
+        if isinstance(settings.get("validation"), Mapping):
+            settings["validation"] = ValidationConfig.from_dict(settings["validation"])
+        if "column_map" in settings:
+            settings["column_map"] = _column_map_from_dict(settings["column_map"])
+        config = cls(**settings)
+
+        rendered = config.to_dict()
+        stale = sorted(
+            key for key in _DERIVED_SETTINGS if key in document and document[key] != rendered[key]
+        )
+        if stale:
+            raise ConfigError(
+                f"derived setting(s) {', '.join(stale)} disagree with the settings they are "
+                "computed from. They are recorded for readers and never read as settings: "
+                "remove them, or correct the settings they describe."
+            )
+        return config
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable representation for the run manifest."""
         hemisphere = self.hemisphere
@@ -922,9 +1342,8 @@ class RFRConfig:
             "site_id": self.site_id,
             "random_state": self.random_state,
             "n_jobs": self.n_jobs,
-            "hyperparameter_grid": {
-                key: list(values) for key, values in self.hyperparameter_grid.items()
-            },
+            "hyperparameter_grid": {key: list(values) for key, values in self.grid.items()},
+            "hyperparameter_preset": None if self.preset is None else self.preset.value,
             "cv_strategy": self.cv.value,
             "cv_folds": self.cv_folds,
             "cv_shuffle": self.cv_shuffle,
@@ -934,6 +1353,169 @@ class RFRConfig:
             "column_map": self.columns.to_dict(),
             "is_paper_faithful": self.is_paper_faithful,
         }
+
+
+# ---------------------------------------------------------------------------
+# Configuration files
+# ---------------------------------------------------------------------------
+
+
+def load_config(path: str | Path, **overrides: Any) -> RFRConfig:
+    """Return the :class:`RFRConfig` a JSON or YAML file describes.
+
+    The file holds the mapping :meth:`RFRConfig.from_dict` reads - the shape of
+    :meth:`RFRConfig.to_dict` - so the ``config`` section of a run manifest is a
+    valid configuration file as it stands. ``overrides`` replace top-level
+    settings before anything is validated; the command line's ``--mode`` reaches
+    the configuration this way.
+
+    ``.json`` needs nothing extra. ``.yaml`` and ``.yml`` need PyYAML
+    (``pip install "rfr-gapfill[yaml]"``), which is not a core dependency.
+    """
+    source = Path(path)
+    try:
+        text = source.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise ConfigError(f"configuration file {source} does not exist") from None
+    except OSError as exc:
+        raise ConfigError(f"cannot read configuration file {source}: {exc}") from exc
+
+    document: object
+    suffix = source.suffix.lower()
+    if suffix == ".json":
+        try:
+            document = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"{source} is not valid JSON: {exc}") from None
+    elif suffix in (".yaml", ".yml"):
+        document = _parse_yaml(text, source=source)
+    else:
+        raise ConfigError(
+            f"cannot tell the format of {source}: name the file *.json, *.yaml or *.yml"
+        )
+    if not isinstance(document, Mapping):
+        raise ConfigError(
+            f"{source} must hold a mapping of settings at the top level, "
+            f"got {type(document).__name__}"
+        )
+    return RFRConfig.from_dict({**document, **overrides})
+
+
+def _parse_yaml(text: str, *, source: Path) -> object:
+    """Return the document in YAML ``text``, or explain that PyYAML is needed."""
+    try:
+        import yaml
+    except ImportError:
+        raise ConfigError(
+            f"{source} is YAML, which needs PyYAML: install it with "
+            "'pip install \"rfr-gapfill[yaml]\"', or write the configuration as JSON"
+        ) from None
+    try:
+        document: object = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{source} is not valid YAML: {exc}") from None
+    return document
+
+
+# ---------------------------------------------------------------------------
+# ORF benchmark pairing (method_spec.md 3.6, Supplementary Figure S1)
+# ---------------------------------------------------------------------------
+
+#: Sentinel distinguishing "absent" from a legitimately ``None`` setting.
+_ABSENT: Final = object()
+
+
+def _flatten_settings(value: Any, prefix: str = "") -> dict[str, Any]:
+    """Return nested manifest settings as a flat ``dotted.key -> value`` mapping."""
+    if isinstance(value, Mapping):
+        flattened: dict[str, Any] = {}
+        for key, item in value.items():
+            flattened.update(_flatten_settings(item, f"{prefix}{key}."))
+        return flattened
+    return {prefix.rstrip("."): value}
+
+
+def orf_pairing_differences(rfr: RFRConfig, orf: RFRConfig) -> tuple[str, ...]:
+    """Return the settings that differ between an RFR run and its ORF benchmark.
+
+    The receptive limiter itself is excluded by construction: ``rfr`` is compared
+    through :meth:`RFRConfig.as_orf`, so both sides of the comparison have the
+    limiter off and only *other* divergences are reported, as dotted manifest
+    keys such as ``random_state`` or ``features.radiation_thresholds``.
+
+    An empty result means the pair is a valid ORF-versus-RFR comparison.
+    """
+    expected = _flatten_settings(rfr.as_orf().to_dict())
+    actual = _flatten_settings(orf.to_dict())
+    return tuple(
+        key
+        for key in sorted(set(expected) | set(actual))
+        if expected.get(key, _ABSENT) != actual.get(key, _ABSENT)
+    )
+
+
+def require_orf_pairing(rfr: RFRConfig, orf: RFRConfig) -> None:
+    """Raise unless ``orf`` differs from ``rfr`` only by the receptive limiter.
+
+    The supplement's ORF is defined *relative to* the RFR run it is compared
+    against: same estimator family, same driver set, same training rows, same
+    seed and hyperparameter-search policy, with sections 3.1-3.4 omitted. A
+    benchmark that also changed the grid or the seed would measure that instead,
+    which is why ``ORF is not redefined in any other way`` is a checked
+    precondition of the paired comparison rather than a comment.
+
+    Note that this checks the two *configurations*. Running them on the same
+    artificial gap mask is a property of the validation workflow that consumes
+    them, and is enforced there.
+    """
+    if rfr.is_orf:
+        raise ConfigError(
+            "the RFR arm of an ORF comparison must have the receptive limiter enabled; "
+            "got use_receptive_limiter=False for both arms, which compares ORF with itself"
+        )
+    if not orf.is_orf:
+        raise ConfigError(
+            "the ORF arm of the comparison must have use_receptive_limiter=False "
+            "(docs/method_spec.md 3.6); derive it with RFRConfig.as_orf()"
+        )
+    differences = orf_pairing_differences(rfr, orf)
+    if differences:
+        raise ConfigError(
+            "ORF must differ from the RFR run it is compared against only by the "
+            f"receptive limiter, but these settings also differ: {', '.join(differences)}. "
+            "Derive the benchmark with RFRConfig.as_orf() so the comparison measures the "
+            "feature engineering and nothing else (docs/method_spec.md 3.6)."
+        )
+
+
+def _resolve_hyperparameter_grid(grid: object, preset: object) -> Mapping[str, tuple[Any, ...]]:
+    """Return the validated grid a configuration searches (A1).
+
+    ``grid=None`` takes the named preset's grid - ``package_default`` when no
+    preset is named either. An explicit grid is rejected when it disagrees with the
+    preset named beside it.
+    """
+    named = None if preset is None else HyperparameterPreset.coerce(preset)
+    if grid is None:
+        chosen = HyperparameterPreset.PACKAGE_DEFAULT if named is None else named
+        return _validate_hyperparameter_grid(HYPERPARAMETER_PRESETS[chosen])
+    validated = _validate_hyperparameter_grid(grid)
+    if named is not None and _matching_preset(validated) is not named:
+        raise ConfigError(
+            f"hyperparameter_grid does not match hyperparameter_preset={named.value!r}: "
+            "pass one or the other. To switch the preset of an existing configuration "
+            "use with_hyperparameter_preset(), which also clears the grid it carries."
+        )
+    return validated
+
+
+def _matching_preset(grid: Mapping[str, Sequence[Any]]) -> HyperparameterPreset | None:
+    """Return the preset ``grid`` equals, or ``None`` for a custom grid (A1)."""
+    candidate = {key: tuple(values) for key, values in sorted(grid.items())}
+    for preset, entries in HYPERPARAMETER_PRESETS.items():
+        if candidate == {key: tuple(values) for key, values in sorted(entries.items())}:
+            return preset
+    return None
 
 
 def _validate_hyperparameter_grid(grid: object) -> Mapping[str, tuple[Any, ...]]:

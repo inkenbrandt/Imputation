@@ -1,79 +1,58 @@
 """Receptive-limiter feature transformers.
 
-The paper's feature-engineering stage (``docs/method_spec.md`` section 3) and the
-distinguishing component of RFR against the ORF benchmark. Each of the four
-groups is a small pure function that takes array-likes and returns a pandas
-object, so every one of them can be hand-checked against a fixture without a
-Random Forest anywhere in sight:
+The receptive limiter is the paper's feature-engineering stage and the only thing
+that distinguishes RFR from the ORF benchmark (``docs/method_spec.md`` section 3,
+Supplementary Figure S1). It is implemented here as four independent, pure
+transformers plus one assembler:
 
-* :func:`radiation_tag` - the weak/medium/strong shortwave category (3.1);
-* :func:`time_distance_hours` - elapsed hours since the series origin (3.2);
-* :func:`season_tag` - hemisphere-aware season (3.3);
-* :func:`daily_flux_statistics` - daily target quartiles and standard deviation (3.4).
-
-:func:`build_feature_matrix` assembles them into the model's design matrix in a
-fixed, documented column order.
-
-**The leakage rule (3.5) lives here.** The daily statistics are derived from the
-target, so they are the one feature group that can smuggle held-out truth into
-the predictors built to predict it. Every entry point that touches the target
-therefore takes an explicit ``available`` mask naming the observations the model
-is allowed to see, and nothing in this module ever reads a target value outside
-it. In the artificial-gap workflow the mask is built *before* the features are,
-which is what makes the ordering in :mod:`rfrgapfill.validation` load-bearing
-rather than stylistic.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any, Final, cast
+from enum import Enum
+from typing import Any, Final
 
 import numpy as np
 import pandas as pd
 
 from rfrgapfill.config import (
-    DEFAULT_RADIATION_THRESHOLDS,
     BoundaryConvention,
-    ColumnMap,
     DailyStatisticStrategy,
     FeatureConfig,
-    Hemisphere,
-    Mode,
+    FeatureMode,
     RFRConfig,
 )
-from rfrgapfill.schema import CANONICAL_VARIABLES, SHORTWAVE
+from rfrgapfill.schema import SHORTWAVE, ColumnMap, ConfigError, Hemisphere
 from rfrgapfill.time import TIME_DISTANCE_HOURS, as_datetime_index, elapsed_hours
 
 __all__ = [
     "DAILY_STATISTIC_SUFFIXES",
-    "RADIATION_CATEGORIES",
-    "RADIATION_CLASS",
-    "SEASONS",
-    "SEASON_PREFIX",
+    "RADIATION_CATEGORY",
+    "SEASON",
+    "SEASONS_BY_HEMISPHERE",
     "TIME_DISTANCE_HOURS",
-    "DailyStatistics",
     "FeatureError",
-    "FeatureMatrix",
+    "RadiationClass",
+    "Season",
     "build_feature_matrix",
     "daily_flux_statistics",
     "daily_statistic_names",
+    "describe_features",
     "feature_names",
     "radiation_tag",
-    "season_names",
+    "receptive_limiter_features",
     "season_tag",
     "time_distance_hours",
 ]
 
 
 class FeatureError(ValueError):
-    """Raised when features cannot be built from the data as given.
+    """Raised when input data cannot support a feature transformation.
 
-    Reports invalid *data* or an impossible request - an unmapped driver column, a
-    hemisphere that is needed but absent, a target the frame does not carry -
-    rather than an invalid configuration, which is
-    :class:`~rfrgapfill.schema.ConfigError`. Both subclass :class:`ValueError`.
+    Reports invalid *data* - a non-numeric driver column, a target that is not on
+    a time axis, a mask that does not line up with its series. An invalid
+    *configuration* raises :class:`~rfrgapfill.schema.ConfigError` instead.
     """
 
 
@@ -81,88 +60,164 @@ class FeatureError(ValueError):
 # Feature vocabulary
 # ---------------------------------------------------------------------------
 
-#: Name of the radiation-category feature (method_spec.md 3.1).
-RADIATION_CLASS: Final = "radiation_class"
+#: Column name of the radiation-category feature (method_spec.md 3.1).
+RADIATION_CATEGORY: Final = "radiation_category"
 
-#: Radiation categories in increasing order of radiation. The order is the
-#: encoding: ``weak`` -> 0, ``medium`` -> 1, ``strong`` -> 2.
-RADIATION_CATEGORIES: Final[tuple[str, ...]] = ("weak", "medium", "strong")
+#: Column name of the hemisphere-aware season feature (method_spec.md 3.3).
+SEASON: Final = "season"
 
-#: Prefix of the one-hot season indicator columns (method_spec.md 3.3).
-SEASON_PREFIX: Final = "season"
-
-#: Seasons in calendar order from the northern winter. Nominal, not ordered.
-SEASONS: Final[tuple[str, ...]] = ("winter", "spring", "summer", "autumn")
-
-#: Suffixes of the four daily target statistics, in specification order (3.4).
+#: Suffixes of the four daily target statistics, in specification order
+#: (method_spec.md 3.4). Prefixed with the target name to form column names.
 DAILY_STATISTIC_SUFFIXES: Final[tuple[str, ...]] = (
-    "daily_q1",
-    "daily_q2",
-    "daily_q3",
-    "daily_std",
+    "_daily_q1",
+    "_daily_q2",
+    "_daily_q3",
+    "_daily_std",
 )
 
-#: Northern-hemisphere season of each calendar month, indexed 1-12. The southern
-#: hemisphere is this list shifted by two seasons, which :func:`season_tag` applies.
-_NORTHERN_SEASON_BY_MONTH: Final[Mapping[int, str]] = {
-    1: "winter",
-    2: "winter",
-    3: "spring",
-    4: "spring",
-    5: "spring",
-    6: "summer",
-    7: "summer",
-    8: "summer",
-    9: "autumn",
-    10: "autumn",
-    11: "autumn",
-    12: "winter",
+#: Quantiles behind ``_daily_q1``, ``_daily_q2`` and ``_daily_q3``.
+_DAILY_QUANTILES: Final[tuple[float, float, float]] = (0.25, 0.50, 0.75)
+
+
+class RadiationClass(str, Enum):
+    """Shortwave radiation category (method_spec.md 3.1).
+
+    Ordered weak < medium < strong, which is the order the ordinal encoding in
+    :func:`build_feature_matrix` uses (0, 1, 2).
+    """
+
+    WEAK = "weak"
+    MEDIUM = "medium"
+    STRONG = "strong"
+
+
+class Season(str, Enum):
+    """Season tag (method_spec.md 3.3).
+
+    The declaration order below is the fixed categorical order and therefore the
+    ordinal encoding (winter 0, spring 1, summer 2, autumn 3). It is a stable
+    labelling, not a claim that seasons are ordered: it exists so that a
+    serialised model and a later prediction frame agree on the codes.
+    """
+
+    WINTER = "winter"
+    SPRING = "spring"
+    SUMMER = "summer"
+    AUTUMN = "autumn"
+
+
+#: Ordered categories of the radiation feature, weak -> strong.
+_RADIATION_CATEGORIES: Final[tuple[str, ...]] = tuple(member.value for member in RadiationClass)
+
+#: Categories of the season feature, in fixed encoding order.
+_SEASON_CATEGORIES: Final[tuple[str, ...]] = tuple(member.value for member in Season)
+
+#: Dtypes the two categorical features always carry, whichever values appear in
+#: the data: a summer-only frame still declares all four seasons, so its ordinal
+#: codes agree with those a fitted model was trained on.
+_RADIATION_DTYPE: Final = pd.CategoricalDtype(list(_RADIATION_CATEGORIES), ordered=True)
+_SEASON_DTYPE: Final = pd.CategoricalDtype(list(_SEASON_CATEGORIES), ordered=False)
+
+
+def _season_months(**groups: tuple[int, ...]) -> Mapping[int, Season]:
+    """Return a month -> season lookup from three-month groups keyed by season name.
+
+    The assertion is a spelling guard on the tables below: every calendar month
+    must be claimed exactly once, so a duplicated or dropped month is a startup
+    failure rather than a silently mislabelled season.
+    """
+    lookup: dict[int, Season] = {}
+    for name, months in groups.items():
+        for month in months:
+            assert month not in lookup, f"month {month} is claimed twice"
+            lookup[month] = Season(name)
+    assert sorted(lookup) == list(range(1, 13)), "every calendar month must map to a season"
+    return lookup
+
+
+#: Month -> season per hemisphere, written out rather than derived arithmetically
+#: so it can be read straight off the table in method_spec.md section 3.3.
+SEASONS_BY_HEMISPHERE: Final[Mapping[Hemisphere, Mapping[int, Season]]] = {
+    Hemisphere.NORTH: _season_months(
+        winter=(12, 1, 2),
+        spring=(3, 4, 5),
+        summer=(6, 7, 8),
+        autumn=(9, 10, 11),
+    ),
+    Hemisphere.SOUTH: _season_months(
+        winter=(6, 7, 8),
+        spring=(9, 10, 11),
+        summer=(12, 1, 2),
+        autumn=(3, 4, 5),
+    ),
 }
 
-#: Season opposite each season, used to flip the northern table southwards.
-_OPPOSITE_SEASON: Final[Mapping[str, str]] = {
-    "winter": "summer",
-    "spring": "autumn",
-    "summer": "winter",
-    "autumn": "spring",
-}
+
+# ---------------------------------------------------------------------------
+# Input coercion helpers
+# ---------------------------------------------------------------------------
 
 
-def season_names() -> tuple[str, ...]:
-    """Return the one-hot season column names in their fixed order."""
-    return tuple(f"{SEASON_PREFIX}_{season}" for season in SEASONS)
+def _as_float_series(values: object, *, field_name: str) -> pd.Series:
+    """Return ``values`` as a float :class:`pandas.Series`, preserving any index."""
+    if isinstance(values, pd.Series):
+        series = values
+    elif isinstance(values, pd.Index):
+        series = pd.Series(values.to_numpy(), index=values)
+    elif isinstance(values, (np.ndarray, Sequence)) and not isinstance(values, (str, bytes)):
+        series = pd.Series(list(values))
+    else:
+        raise FeatureError(
+            f"{field_name} must be a Series, Index, array or sequence of numbers, "
+            f"got {type(values).__name__}"
+        )
+    # Converted unconditionally rather than dtype-tested first: `np.issubdtype`
+    # raises on pandas extension dtypes, and a list of strings arrives as
+    # StringDtype under pandas 3. The conversion itself is the check.
+    try:
+        numeric: pd.Series = series.astype(float)
+    except (TypeError, ValueError) as exc:
+        raise FeatureError(
+            f"{field_name} must be numeric; it could not be read as floats ({exc})"
+        ) from None
+    return numeric
 
 
-def daily_statistic_names(target: str) -> tuple[str, ...]:
-    """Return the four daily-statistic column names for ``target``, in order.
+def _as_boolean_mask(mask: object, index: pd.Index, *, field_name: str) -> np.ndarray:
+    """Return ``mask`` as a boolean array aligned to ``index``.
 
-    They carry the target's name because the statistics are target-specific: a
-    separate feature matrix exists per target (method_spec.md 3.4).
+    A :class:`pandas.Series` is reindexed onto ``index`` so alignment is by label,
+    not by position; a label the mask does not cover is treated as *not
+    available*, which is the conservative direction for a leakage guard. A plain
+    array must already match ``index`` in length.
     """
-    return tuple(f"{target}_{suffix}" for suffix in DAILY_STATISTIC_SUFFIXES)
+    if isinstance(mask, pd.Series):
+        if not pd.api.types.is_bool_dtype(mask.dtype):
+            raise FeatureError(f"{field_name} must be boolean, got dtype {mask.dtype}")
+        # `.eq(True)` rather than `.fillna(False)`: reindexing onto a label the
+        # mask does not cover leaves NaN, and comparing is both simpler and free
+        # of pandas' downcasting behaviour on object columns.
+        return np.asarray(mask.reindex(index).eq(True).to_numpy(), dtype=bool)
+    array = np.asarray(mask)
+    if array.dtype != np.bool_:
+        raise FeatureError(f"{field_name} must be boolean, got dtype {array.dtype}")
+    if array.shape != (len(index),):
+        raise FeatureError(
+            f"{field_name} has shape {array.shape} but the series has {len(index)} rows; "
+            "pass a boolean Series to align by timestamp instead"
+        )
+    return array
 
 
-def feature_names(
-    target: str,
-    *,
-    mode: Mode | str,
-    features: FeatureConfig | None = None,
-) -> tuple[str, ...]:
-    """Return the feature column names a run produces, in matrix order.
+def _time_index(values: object, *, field_name: str) -> pd.DatetimeIndex:
+    """Return the :class:`pandas.DatetimeIndex` behind ``values``.
 
-    The order is part of the contract: drivers first in the canonical order of
-    method_spec.md section 2, then the receptive-limiter groups in the order of
-    section 3. Computable without any data, so a caller can check a saved model's
-    feature list against the configuration that is about to be used.
+    Accepts timestamps directly or an object carrying them on its index, so
+    ``season_tag(df.index)`` and ``season_tag(series)`` both work.
     """
-    settings = FeatureConfig() if features is None else features
-    names = list(Mode.coerce(mode).drivers)
-    if settings.use_receptive_limiter:
-        names.append(RADIATION_CLASS)
-        names.append(TIME_DISTANCE_HOURS)
-        names.extend(season_names())
-        names.extend(daily_statistic_names(target))
-    return tuple(names)
+    if isinstance(values, (pd.Series, pd.DataFrame)):
+        return as_datetime_index(values.index, field_name=f"{field_name} index")
+    return as_datetime_index(values, field_name=field_name)
 
 
 # ---------------------------------------------------------------------------
@@ -173,488 +228,672 @@ def feature_names(
 def radiation_tag(
     shortwave: object,
     *,
-    thresholds: tuple[float, float] = DEFAULT_RADIATION_THRESHOLDS,
-    convention: BoundaryConvention | str = BoundaryConvention.MEDIUM_INCLUSIVE,
+    thresholds: tuple[float, float] | None = None,
+    convention: BoundaryConvention | str | None = None,
+    config: FeatureConfig | None = None,
 ) -> pd.Series:
-    """Return the weak/medium/strong radiation category of ``shortwave``.
+    """Return the radiation category of each shortwave value (method_spec.md 3.1).
 
-    The bins are exhaustive over the reals. Under the default
-    ``medium_inclusive`` convention (ambiguity A2) a value of exactly 10 or
-    exactly 100 W m-2 is ``medium``; ``medium_exclusive`` puts 10 in ``weak`` and
-    100 in ``strong``.
+    The paper gives the thresholds - weak below 10 W m-2, medium 10-100 W m-2,
+    strong above 100 W m-2 - but its prose does not settle what happens *at*
+    exactly 10 and 100 (ambiguity A2). The convention is therefore explicit and
+    configurable, and the bins are inclusive and exhaustive over the reals:
 
-    Missing radiation yields a missing category, never a default class: guessing
-    one would move a row into a bin the measurement does not support. The result
-    is an ordered :class:`~pandas.Categorical`, so ``weak < medium < strong``
-    holds for anything that wants to compare them.
+    ``medium_inclusive`` (the documented default)
+        ``x < 10`` weak, ``10 <= x <= 100`` medium, ``100 < x`` strong.
+    ``medium_exclusive``
+        ``x <= 10`` weak, ``10 < x < 100`` medium, ``100 <= x`` strong.
+
+    Missing shortwave yields a **missing category**, never a default class: a row
+    whose radiation is unknown is not quietly declared weak.
+
+    Thresholds and convention come from ``config`` when given, and otherwise from
+    the explicit arguments, and otherwise from :class:`FeatureConfig` defaults.
+    Passing both ``config`` and an explicit override is rejected rather than
+    silently resolved, so no result can disagree with the manifest that describes
+    it.
+
+    :returns: an ordered categorical Series (``weak`` < ``medium`` < ``strong``)
+        carrying the index of ``shortwave`` and named
+        :data:`RADIATION_CATEGORY`.
     """
-    low, high = _check_thresholds(thresholds)
-    rule = BoundaryConvention.coerce(convention)
-    values = _as_float_series(shortwave, name=SHORTWAVE)
+    if config is not None and (thresholds is not None or convention is not None):
+        raise ConfigError(
+            "pass either config= or explicit thresholds/convention, not both: "
+            "two sources of the same setting cannot be reconciled in the run manifest"
+        )
+    if config is None:
+        config = FeatureConfig(
+            radiation_thresholds=(
+                FeatureConfig().radiation_thresholds if thresholds is None else thresholds
+            ),
+            boundary_convention=(
+                FeatureConfig().boundary_convention if convention is None else convention
+            ),
+        )
+    low, high = config.radiation_thresholds
 
-    if rule is BoundaryConvention.MEDIUM_INCLUSIVE:
-        weak = values < low
-        strong = values > high
+    series = _as_float_series(shortwave, field_name="shortwave")
+    values = series.to_numpy(dtype=float)
+
+    if config.convention is BoundaryConvention.MEDIUM_INCLUSIVE:
+        is_weak = values < low
+        is_strong = values > high
     else:
-        weak = values <= low
-        strong = values >= high
+        is_weak = values <= low
+        is_strong = values >= high
+    # NaN compares False against every bound, so it falls through both branches
+    # and is excluded explicitly rather than landing in `medium`.
+    known = ~np.isnan(values)
 
-    codes = np.where(weak, 0, np.where(strong, 2, 1))
-    codes = np.where(values.isna().to_numpy(), -1, codes)
-    tag = pd.Categorical.from_codes(
-        codes.astype(np.int8),
-        dtype=pd.CategoricalDtype(list(RADIATION_CATEGORIES), ordered=True),
-    )
-    result: pd.Series = pd.Series(tag, index=values.index, name=RADIATION_CLASS)
-    return result
+    codes = np.full(values.shape, -1, dtype=np.int8)
+    codes[known & is_weak] = 0
+    codes[known & ~is_weak & ~is_strong] = 1
+    codes[known & is_strong] = 2
 
-
-def radiation_code(tag: pd.Series) -> pd.Series:
-    """Return :func:`radiation_tag` output as the ordinal codes the model sees.
-
-    ``weak`` -> 0.0, ``medium`` -> 1.0, ``strong`` -> 2.0, missing -> NaN. The
-    category is a binned continuous variable, so the ordinal encoding preserves
-    the ordering the bins already carry and costs the forest no extra splits;
-    contrast :func:`season_tag`, which is nominal and one-hot encoded.
-    """
-    codes = np.asarray(tag.cat.codes, dtype=float)
-    codes[codes < 0] = np.nan
-    result: pd.Series = pd.Series(codes, index=tag.index, name=RADIATION_CLASS)
-    return result
+    categorical = pd.Categorical.from_codes(codes, dtype=_RADIATION_DTYPE)
+    tagged: pd.Series = pd.Series(categorical, index=series.index, name=RADIATION_CATEGORY)
+    return tagged
 
 
 # ---------------------------------------------------------------------------
-# 3.2 Elapsed hours
+# 3.2 Time distance
 # ---------------------------------------------------------------------------
 
 
 def time_distance_hours(
-    values: object,
+    timestamps: object,
     *,
     origin: pd.Timestamp | str | None = None,
 ) -> pd.Series:
-    """Return elapsed hours since ``origin`` (method_spec.md 3.2).
+    """Return hours elapsed since the start of the series (method_spec.md 3.2).
 
-    A thin alias for :func:`rfrgapfill.time.elapsed_hours`, kept here so the four
-    receptive-limiter groups can be imported from one place. ``origin`` defaults
-    to the earliest timestamp given; pass the site series' first timestamp
-    whenever a subset is transformed on its own, or the same row would receive
-    different values in the subset than in the whole series.
+    ``time_distance_hours = (timestamp - first_timestamp) / 1 hour``, computed
+    from timestamp differences and never from row position, so a row after a
+    week-long gap carries its true elapsed distance. At 30-minute cadence a
+    complete series yields 0.0, 0.5, 1.0, ... The feature's stated purpose is to
+    represent gradual ecosystem growth, degradation and other long-term trends.
+
+    ``origin`` defaults to the earliest timestamp given. **Pass the origin of the
+    full site series whenever a subset is transformed on its own** - training
+    rows, a prediction frame and an artificial-gap interval must all measure from
+    the same zero, or the same timestamp would carry different feature values in
+    each. :func:`build_feature_matrix` threads this through for you.
+
+    A thin wrapper over :func:`rfrgapfill.time.elapsed_hours`, re-exported here so
+    that the four receptive-limiter transformers can be read side by side; the
+    elapsed-time arithmetic itself lives in one place.
     """
-    return elapsed_hours(values, origin=origin)
+    index = _time_index(timestamps, field_name="timestamps")
+    return elapsed_hours(index, origin=origin)
 
 
 # ---------------------------------------------------------------------------
-# 3.3 Hemisphere-aware season
+# 3.3 Season
 # ---------------------------------------------------------------------------
 
 
-def season_tag(values: object, hemisphere: Hemisphere | str) -> pd.Series:
-    """Return the meteorological season of each timestamp for ``hemisphere``.
+def season_tag(
+    timestamps: object,
+    *,
+    hemisphere: Hemisphere | str | None = None,
+    latitude: float | None = None,
+) -> pd.Series:
+    """Return the season of each timestamp for the site's hemisphere (3.3).
 
-    December-February is ``winter`` in the north and ``summer`` in the south, and
-    so on around the year (method_spec.md 3.3). The hemisphere is required: there
-    is no silent default, because getting it wrong inverts the seasonal signal at
-    every southern site.
+    Seasons are three-month calendar groups, mirrored between hemispheres:
+
+    ======================  ==========  ==========
+    Months                  Northern    Southern
+    ======================  ==========  ==========
+    Dec, Jan, Feb           ``winter``  ``summer``
+    Mar, Apr, May           ``spring``  ``autumn``
+    Jun, Jul, Aug           ``summer``  ``winter``
+    Sep, Oct, Nov           ``autumn``  ``spring``
+    ======================  ==========  ==========
+
+    The hemisphere must be supplied: pass ``hemisphere="north"|"south"``, or a
+    ``latitude`` to infer it by the documented rule ``latitude >= 0 -> north``
+    (ambiguity A9 - a declared tie-break for equatorial sites, not a scientific
+    claim). There is no silent default, because guessing it would mirror the
+    seasonal signal of the model.
+
+    :returns: a categorical Series named :data:`SEASON`, with the fixed category
+        order of :class:`Season`.
     """
-    index = as_datetime_index(values)
-    half = Hemisphere.coerce(hemisphere)
-    table = _NORTHERN_SEASON_BY_MONTH
-    if half is Hemisphere.SOUTH:
-        table = {month: _OPPOSITE_SEASON[season] for month, season in table.items()}
-    seasons = [table[int(month)] for month in index.month]
-    tag = pd.Categorical(seasons, categories=list(SEASONS), ordered=False)
-    result: pd.Series = pd.Series(tag, index=index, name=SEASON_PREFIX)
-    return result
+    if hemisphere is not None and latitude is not None:
+        raise ConfigError(
+            "pass either hemisphere= or latitude=, not both: an explicit hemisphere "
+            "always overrides latitude, so supplying both hides which one applied"
+        )
+    if hemisphere is not None:
+        resolved = Hemisphere.coerce(hemisphere)
+    elif latitude is not None:
+        resolved = Hemisphere.from_latitude(latitude)
+    else:
+        raise ConfigError(
+            "season_tag needs a hemisphere: pass hemisphere='north'|'south' or "
+            "latitude=<degrees>. The season feature is hemisphere-specific and has "
+            "no defensible default (docs/method_spec.md section 3.3)."
+        )
 
+    index = _time_index(timestamps, field_name="timestamps")
+    lookup = SEASONS_BY_HEMISPHERE[resolved]
+    months = np.asarray(index.month, dtype=int)
+    codes = np.asarray(
+        [_SEASON_CATEGORIES.index(lookup[month].value) for month in range(1, 13)], dtype=np.int8
+    )[months - 1]
 
-def season_indicators(tag: pd.Series) -> pd.DataFrame:
-    """Return the one-hot encoding of :func:`season_tag`, in :data:`SEASONS` order.
-
-    Season is nominal - the year is a cycle, not a ladder - so one-hot indicators
-    are used rather than the ordinal encoding applied to the radiation category.
-    Columns are always all four seasons, even when the series covers only part of
-    a year, so the feature matrix has the same shape for every site.
-    """
-    codes = np.asarray(tag.cat.codes)
-    columns = {
-        f"{SEASON_PREFIX}_{season}": (codes == position).astype(float)
-        for position, season in enumerate(SEASONS)
-    }
-    indicators: pd.DataFrame = pd.DataFrame(columns, index=tag.index)
-    return indicators
+    categorical = pd.Categorical.from_codes(codes, dtype=_SEASON_DTYPE)
+    tagged: pd.Series = pd.Series(categorical, index=index, name=SEASON)
+    return tagged
 
 
 # ---------------------------------------------------------------------------
-# 3.4 Daily target statistics, and the leakage rule of 3.5
+# 3.4 Daily target statistics
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class DailyStatistics:
-    """Daily target statistics joined back to every timestamp, with their provenance.
-
-    :attr:`frame` is what the model consumes. The counts beside it say how each
-    day got its numbers, so a report can state how much of a long gap was covered
-    by a neighbouring day's statistics rather than its own - the substitution is
-    leakage-safe but it is still a substitution, and it stays visible.
-    """
-
-    #: One row per input timestamp, four columns named for the target.
-    frame: pd.DataFrame
-    #: The strategy that produced it.
-    strategy: DailyStatisticStrategy
-    #: Minimum visible observations a day needed to compute its own statistics.
-    min_observations: int
-    #: Calendar days spanned by the input.
-    n_days: int
-    #: Days with enough visible target observations of their own.
-    n_days_observed: int
-    #: Days that took a neighbouring day's statistics instead.
-    n_days_from_neighbour: int
-    #: Days left with missing statistics; their rows cannot be trained or predicted.
-    n_days_missing: int
-    #: Timestamps carrying a neighbouring day's statistics.
-    n_rows_from_neighbour: int
-    #: Timestamps left with missing statistics.
-    n_rows_missing: int
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-serialisable summary for the run manifest."""
-        return {
-            "strategy": self.strategy.value,
-            "min_observations": self.min_observations,
-            "n_days": self.n_days,
-            "n_days_observed": self.n_days_observed,
-            "n_days_from_neighbour": self.n_days_from_neighbour,
-            "n_days_missing": self.n_days_missing,
-            "n_rows_from_neighbour": self.n_rows_from_neighbour,
-            "n_rows_missing": self.n_rows_missing,
-        }
+def daily_statistic_names(target: str) -> tuple[str, ...]:
+    """Return the four daily-statistic column names for ``target``, in order."""
+    if not isinstance(target, str) or not target.strip():
+        raise ConfigError(f"target must be a non-empty string, got {target!r}")
+    return tuple(f"{target}{suffix}" for suffix in DAILY_STATISTIC_SUFFIXES)
 
 
 def daily_flux_statistics(
     target: object,
     *,
-    available: object | None = None,
-    name: str | None = None,
-    min_observations: int = 2,
-    strategy: DailyStatisticStrategy | str = DailyStatisticStrategy.NEAREST_VISIBLE_DAY,
-) -> DailyStatistics:
-    """Return per-day Q1, Q2, Q3 and standard deviation of ``target``, joined to every row.
+    available_mask: object | None = None,
+    target_name: str | None = None,
+    min_observations: int | None = None,
+    strategy: DailyStatisticStrategy | str | None = None,
+    fallback_window_days: int | None = None,
+    ddof: int | None = None,
+    config: FeatureConfig | None = None,
+) -> pd.DataFrame:
+    """Return per-day Q1, Q2, Q3 and std of the target, joined back to every row.
 
-    ``available`` is the leakage boundary (method_spec.md 3.5): a boolean mask
-    over the same index naming the target observations the model may see. Values
-    outside it are dropped before anything is computed, so held-out truth cannot
-    reach a feature built to predict it. Omitting it uses every finite target
-    value, which is correct for operational filling - where nothing is held out -
-    and wrong for artificial-gap validation, where the mask is the point.
+    Statistics are computed per **calendar day** from the target observations
+    *visible to the model* and then broadcast to all timestamps of that day
+    (method_spec.md 3.4). The paper's stated purpose is to reduce the effect of
+    potential outliers. Because they are derived from the target, they are
+    target-specific: there is a separate feature matrix per target.
 
-    A day needs ``min_observations`` visible values before it has statistics of
-    its own; the default of 2 is the fewest the sample standard deviation is
-    defined on. What a day below that gets instead is ``strategy`` (ambiguity
-    A4): :attr:`~rfrgapfill.config.DailyStatisticStrategy.WITHIN_DAY` leaves it
-    missing, and the default
-    :attr:`~rfrgapfill.config.DailyStatisticStrategy.NEAREST_VISIBLE_DAY` copies
-    the nearest day that does qualify, ties going to the earlier day. Neither
-    reads a value outside ``available``.
+    **This is the leakage-critical transformer** (method_spec.md 3.5, ambiguity
+    A6). ``available_mask`` is a boolean Series or array marking the rows whose
+    target value the model is allowed to see - quality-controlled observations,
+    minus anything hidden by an artificial gap. Masked-out rows are excluded from
+    the statistics exactly as if they were missing, so hidden truth cannot reach a
+    feature used to predict it. With no mask the whole target is treated as
+    visible, which is correct for operational filling of real gaps (where the
+    missing values are genuinely absent) and wrong for artificial-gap validation
+    (where the mask must be built first).
 
-    Quartiles use pandas' default linear interpolation and the standard deviation
-    uses ``ddof=1``.
+    A day with fewer than ``min_observations`` visible values is handled by the
+    chosen :class:`~rfrgapfill.config.DailyStatisticStrategy`, since the paper
+    does not say what it did with one (ambiguity A4):
+
+    ``missing`` (the documented default)
+        All four statistics are missing for that day. Nothing is imputed and
+        nothing is borrowed; the affected rows are excluded from training and
+        flagged at prediction time by the model layer.
+    ``within_day_available``
+        Whatever the day itself has is used, ignoring the minimum. Never looks
+        outside the calendar day.
+    ``neighbor_day_fallback``
+        The day takes the statistics of the nearest day that meets the minimum,
+        up to ``fallback_window_days`` away; ties resolve to the earlier day.
+    ``rolling_available``
+        The day is recomputed from the visible observations within
+        ``+/- fallback_window_days`` calendar days, and stays missing if that
+        pool is still below the minimum.
+
+    All four are leakage safe: each of them draws only on values ``available_mask``
+    admits, so the two that reach into neighbouring days reach into *visible*
+    neighbouring days. They differ in what the feature means, not in what it is
+    allowed to see, which is why the choice is recorded in the run manifest.
+
+    Note that ``ddof=1`` additionally leaves the standard deviation undefined for
+    a day with a single visible observation, while its quartiles are all defined
+    and equal to that value.
+
+    :param strategy: the below-minimum behaviour above. Defaults to the
+        configured ``daily_statistic_strategy`` (``missing``).
+    :param fallback_window_days: reach of the two fallback strategies, in
+        calendar days; rejected for the strategies that never leave the day.
+    :param ddof: delta degrees of freedom for the standard deviation. Defaults to
+        the configured ``daily_std_ddof`` (1, the sample standard deviation;
+        ambiguity A11 - the paper does not state which convention it used).
+    :returns: a frame indexed like ``target`` whose columns are
+        :func:`daily_statistic_names`.
     """
-    rule = DailyStatisticStrategy.coerce(strategy)
-    if min_observations < 1:
-        raise FeatureError(f"min_observations must be >= 1, got {min_observations}")
+    overrides = (min_observations, strategy, fallback_window_days, ddof)
+    if config is not None and any(override is not None for override in overrides):
+        raise ConfigError(
+            "pass either config= or explicit min_observations/strategy/"
+            "fallback_window_days/ddof, not both: two sources of the same setting "
+            "cannot be reconciled in the run manifest"
+        )
+    if config is None:
+        # Built rather than checked field by field, so an explicit call and a
+        # configured run are validated by exactly the same rules.
+        base = FeatureConfig()
+        config = FeatureConfig(
+            min_daily_observations=(
+                base.min_daily_observations if min_observations is None else min_observations
+            ),
+            daily_statistic_strategy=(base.statistic_strategy if strategy is None else strategy),
+            fallback_window_days=fallback_window_days,
+            daily_std_ddof=base.daily_std_ddof if ddof is None else ddof,
+        )
+    minimum = config.min_daily_observations
+    degrees = config.daily_std_ddof
+    chosen = config.statistic_strategy
+    window = config.fallback_window
 
-    values = _as_float_series(target, name=name or "target")
-    index = as_datetime_index(values.index)
-    label = name or str(values.name)
-    columns = list(daily_statistic_names(label))
+    series = _as_float_series(target, field_name="target")
+    index = _time_index(series, field_name="target")
+    name = target_name if target_name is not None else series.name
+    if not isinstance(name, str) or not name.strip():
+        raise ConfigError(
+            "the target's name is needed to name its daily-statistic features; pass "
+            "target_name= or give the Series a name"
+        )
+    columns = daily_statistic_names(name)
 
-    visible = values.copy()
-    if available is not None:
-        mask = _as_bool_array(available, length=len(values), field_name="available")
+    visible = pd.Series(series.to_numpy(dtype=float), index=index)
+    if available_mask is not None:
+        mask = _as_boolean_mask(available_mask, index, field_name="available_mask")
         visible = visible.where(mask)
 
-    days = index.normalize()
-    grouped = visible.groupby(days, sort=True)
-    counts = grouped.count()
+    day = index.normalize()
+    grouped = visible.groupby(day, sort=True)
+    # pandas skips NaN in every one of these, so masked-out and genuinely missing
+    # values are excluded identically.
     per_day = pd.DataFrame(
         {
-            columns[0]: grouped.quantile(0.25),
-            columns[1]: grouped.quantile(0.50),
-            columns[2]: grouped.quantile(0.75),
-            columns[3]: grouped.std(ddof=1),
+            columns[0]: grouped.quantile(_DAILY_QUANTILES[0]),
+            columns[1]: grouped.quantile(_DAILY_QUANTILES[1]),
+            columns[2]: grouped.quantile(_DAILY_QUANTILES[2]),
+            columns[3]: grouped.std(ddof=degrees),
         }
     )
-    qualifies = (counts >= min_observations).to_numpy() & per_day.notna().all(axis=1).to_numpy()
-    per_day = per_day.where(pd.Series(qualifies, index=per_day.index), other=np.nan)
+    counts = grouped.count().to_numpy()
 
-    source = np.where(qualifies, "day", "missing")
-    if rule is DailyStatisticStrategy.NEAREST_VISIBLE_DAY:
-        per_day, source = _fill_from_nearest_day(per_day, qualifies)
+    if chosen is not DailyStatisticStrategy.WITHIN_DAY_AVAILABLE:
+        # Every other strategy starts from "a day below the minimum has no
+        # statistics of its own"; the two reaching strategies then look further.
+        deficient = counts < minimum
+        per_day.loc[deficient, :] = np.nan
+        if chosen is DailyStatisticStrategy.NEIGHBOR_DAY_FALLBACK:
+            assert window is not None
+            _fill_from_nearest_day(per_day, deficient=deficient, window_days=window)
+        elif chosen is DailyStatisticStrategy.ROLLING_AVAILABLE:
+            assert window is not None
+            _fill_from_rolling_window(
+                per_day,
+                visible=visible,
+                deficient=deficient,
+                window_days=window,
+                minimum=minimum,
+                degrees=degrees,
+            )
 
-    joined = per_day.reindex(pd.DatetimeIndex(days))
-    joined.index = values.index
-    row_source = pd.Series(source, index=per_day.index).reindex(pd.DatetimeIndex(days)).to_numpy()
-
-    return DailyStatistics(
-        frame=joined,
-        strategy=rule,
-        min_observations=min_observations,
-        n_days=len(per_day),
-        n_days_observed=int(np.sum(source == "day")),
-        n_days_from_neighbour=int(np.sum(source == "neighbour")),
-        n_days_missing=int(np.sum(source == "missing")),
-        n_rows_from_neighbour=int(np.sum(row_source == "neighbour")),
-        n_rows_missing=int(np.sum(row_source == "missing")),
-    )
+    joined: pd.DataFrame = per_day.reindex(day)
+    joined.index = index
+    joined.index.name = series.index.name
+    return joined
 
 
 def _fill_from_nearest_day(
     per_day: pd.DataFrame,
-    qualifies: np.ndarray,
-) -> tuple[pd.DataFrame, np.ndarray]:
-    """Return ``per_day`` with unqualified days taking the nearest qualified day's row.
+    *,
+    deficient: np.ndarray,
+    window_days: int,
+) -> None:
+    """Give each deficient day the statistics of the nearest day that qualifies.
 
-    Distance is measured between calendar days, so a day inside a 30-day gap
-    takes the statistics of the closest day outside it. Ties go to the earlier
-    day, which makes the result independent of iteration order.
+    In place. Distance is measured in calendar days between the day labels, not
+    in row positions, so a day on the far side of a missing month is correctly
+    seen as a month away. Ties resolve to the **earlier** day, an arbitrary but
+    fixed rule that keeps the result reproducible. A day with no qualifying day
+    within ``window_days`` keeps its missing statistics.
     """
-    source = np.where(qualifies, "day", "missing").astype(object)
-    donors = np.flatnonzero(qualifies)
-    if donors.size == 0 or donors.size == len(per_day):
-        return per_day, source
+    qualifying = np.flatnonzero(~deficient)
+    wanted = np.flatnonzero(deficient)
+    if qualifying.size == 0 or wanted.size == 0:
+        return
 
-    dates = per_day.index.to_numpy(dtype="datetime64[D]").astype(np.int64)
-    positions = np.arange(len(per_day))
-    after = np.searchsorted(donors, positions, side="left")
-    previous = np.clip(after - 1, 0, donors.size - 1)
-    following = np.clip(after, 0, donors.size - 1)
+    days = per_day.index.to_numpy(dtype="datetime64[ns]").astype("int64")
+    limit = int(pd.Timedelta(days=window_days).value)
+    donor_days = days[qualifying]
 
-    distance_previous = np.abs(dates - dates[donors[previous]])
-    distance_following = np.abs(dates - dates[donors[following]])
-    # `<=` keeps the earlier donor on a tie.
-    chosen = np.where(distance_previous <= distance_following, donors[previous], donors[following])
+    insert = np.searchsorted(donor_days, days[wanted])
+    left = np.clip(insert - 1, 0, donor_days.size - 1)
+    right = np.clip(insert, 0, donor_days.size - 1)
+    # `insert == 0` means there is no earlier donor and `insert == size` none
+    # later; the sentinel distance keeps those candidates from ever winning.
+    unreachable = np.iinfo(np.int64).max
+    distance_left = np.where(insert > 0, days[wanted] - donor_days[left], unreachable)
+    distance_right = np.where(
+        insert < donor_days.size, donor_days[right] - days[wanted], unreachable
+    )
 
-    filled = per_day.iloc[chosen].copy()
-    filled.index = per_day.index
-    source[~qualifies] = "neighbour"
-    return filled, source
+    take_left = distance_left <= distance_right
+    donor = np.where(take_left, qualifying[left], qualifying[right])
+    distance = np.minimum(distance_left, distance_right)
+
+    reachable = distance <= limit
+    if not reachable.any():
+        return
+    # Snapshot first: the rows being written are all deficient and the rows being
+    # read are all qualifying, but reading from an array that is not being
+    # mutated makes that independence explicit rather than incidental.
+    values = per_day.to_numpy(dtype=float, copy=True)
+    per_day.iloc[wanted[reachable], :] = values[donor[reachable]]
+
+
+def _fill_from_rolling_window(
+    per_day: pd.DataFrame,
+    *,
+    visible: pd.Series,
+    deficient: np.ndarray,
+    window_days: int,
+    minimum: int,
+    degrees: int,
+) -> None:
+    """Recompute each deficient day from a centred window of visible observations.
+
+    In place. The pool is every visible target observation whose calendar day
+    lies within ``window_days`` days of the deficient day, inclusive on both
+    sides and including the day itself. A pool that is still below ``minimum``
+    leaves the day missing rather than reporting a statistic of one or two
+    values borrowed from a week away.
+    """
+    wanted = np.flatnonzero(deficient)
+    if wanted.size == 0:
+        return
+
+    observed = visible.dropna()
+    if observed.empty:
+        return
+    observation_days = (
+        as_datetime_index(observed.index, field_name="target")
+        .normalize()
+        .to_numpy(dtype="datetime64[ns]")
+        .astype("int64")
+    )
+    order = np.argsort(observation_days, kind="stable")
+    observation_days = observation_days[order]
+    observation_values = observed.to_numpy(dtype=float)[order]
+
+    days = per_day.index.to_numpy(dtype="datetime64[ns]").astype("int64")
+    reach = int(pd.Timedelta(days=window_days).value)
+
+    for position in wanted:
+        centre = days[position]
+        start = np.searchsorted(observation_days, centre - reach, side="left")
+        stop = np.searchsorted(observation_days, centre + reach, side="right")
+        pool = observation_values[start:stop]
+        if pool.size < minimum:
+            continue
+        quantiles = np.quantile(pool, _DAILY_QUANTILES)
+        deviation = float(pool.std(ddof=degrees)) if pool.size > degrees else np.nan
+        per_day.iloc[position, :] = [*quantiles, deviation]
 
 
 # ---------------------------------------------------------------------------
-# Feature matrix
+# Feature matrix assembly
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class FeatureMatrix:
-    """A built design matrix together with what it is safe to use it for.
+def feature_names(
+    config: RFRConfig | FeatureConfig,
+    *,
+    target: str | None = None,
+    drivers: Sequence[str] | None = None,
+) -> tuple[str, ...]:
+    """Return the feature columns for ``config``, in their deterministic order.
 
-    :attr:`complete` is the part callers must not ignore: a row whose drivers or
-    daily statistics are missing is not predictable, and the package neither
-    imputes it nor lets it through (method_spec.md section 7). Training selects
-    on it and prediction leaves the rest missing.
+    The order is: the canonical drivers of the selected mode, in specification
+    order, followed - when the receptive limiter is enabled - by the radiation
+    category, elapsed hours, the season tag and the four daily target statistics.
+    :func:`build_feature_matrix` reproduces it exactly, and acceptance test 6
+    pins the two together.
+
+    Computable without any data, so it can be recorded in the run manifest and
+    checked against a reloaded model before predicting. ``use_receptive_limiter =
+    False`` yields the ORF benchmark's columns: the same drivers, nothing else
+    (method_spec.md 3.6).
     """
+    if isinstance(config, RFRConfig):
+        features = config.features
+        names = list(config.drivers) if drivers is None else list(drivers)
+    else:
+        features = config
+        if drivers is None:
+            raise ConfigError(
+                "drivers= is required when feature_names is called with a FeatureConfig; "
+                "pass an RFRConfig to take them from its mode"
+            )
+        names = list(drivers)
+    return tuple(names) + receptive_limiter_features(features, target=target)
 
-    #: One row per input timestamp, columns in :func:`feature_names` order.
-    frame: pd.DataFrame
-    #: The target these features were built for.
-    target: str
-    #: Whether the receptive-limiter groups are present (False is the ORF benchmark).
-    use_receptive_limiter: bool
-    #: Rows whose every feature is finite, so the model can use them.
-    complete: pd.Series
-    #: Provenance of the daily statistics; ``None`` for ORF, which has none.
-    daily_statistics: DailyStatistics | None
 
-    @property
-    def names(self) -> tuple[str, ...]:
-        """The feature column names, in matrix order."""
-        return tuple(self.frame.columns)
+def receptive_limiter_features(
+    config: RFRConfig | FeatureConfig,
+    *,
+    target: str | None = None,
+) -> tuple[str, ...]:
+    """Return the feature columns the receptive limiter contributes, in order.
 
-    @property
-    def n_complete(self) -> int:
-        """How many rows carry a complete feature vector."""
-        return int(self.complete.sum())
+    Empty for an ORF configuration, which is the whole of the difference between
+    the two arms of the Supplementary Figure S1 comparison. :func:`feature_names`
+    is built from this, so the identity
 
-    @property
-    def n_incomplete(self) -> int:
-        """How many rows are missing at least one feature."""
-        return int(len(self.complete) - self.complete.sum())
+    ``feature_names(cfg, target=t) == cfg.drivers + receptive_limiter_features(cfg, target=t)``
 
-    def incomplete_by_feature(self) -> pd.Series:
-        """Return, per feature, how many rows it is missing on.
+    holds by construction rather than by two lists being kept in step by hand.
+    The ORF benchmark tests assert exactly that ORF drops this tuple and keeps
+    everything else (method_spec.md 3.6).
 
-        The diagnostic to reach for when a run trains on far fewer rows than
-        expected: it names the driver responsible instead of leaving a bare count.
-        """
-        counts: pd.Series = self.frame.isna().sum()
-        return counts
+    With ``feature_mode="legacy_fluxlib"`` the tuple is ``fluxlib``'s instead -
+    seven daily statistics, then season code, radiation rank, day of year and year
+    (:func:`rfrgapfill.legacy.legacy_feature_names`) - under names disjoint from
+    the ``paper_safe`` ones, so a model fitted in one mode rejects the other.
+    """
+    features = config.features if isinstance(config, RFRConfig) else config
+    if not features.use_receptive_limiter:
+        return ()
+    if features.mode is FeatureMode.LEGACY_FLUXLIB:
+        # Imported here because rfrgapfill.legacy builds on this module's helpers.
+        from rfrgapfill.legacy import legacy_feature_names
 
-    def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-serialisable summary for the run manifest."""
-        return {
-            "target": self.target,
-            "use_receptive_limiter": self.use_receptive_limiter,
-            "feature_names": list(self.names),
-            "n_rows": len(self.frame),
-            "n_complete": self.n_complete,
-            "n_incomplete": self.n_incomplete,
-            "incomplete_by_feature": {
-                name: int(count)
-                for name, count in self.incomplete_by_feature().items()
-                if int(count) > 0
-            },
-            "daily_statistics": (
-                None if self.daily_statistics is None else self.daily_statistics.to_dict()
-            ),
-        }
+        return legacy_feature_names(target)
+    names = [RADIATION_CATEGORY, TIME_DISTANCE_HOURS, SEASON]
+    if target is not None:
+        names += list(daily_statistic_names(target))
+    return tuple(names)
 
 
 def build_feature_matrix(
     data: pd.DataFrame,
     *,
-    target: str,
     config: RFRConfig,
+    target: str | None = None,
     column_map: ColumnMap | Mapping[str, str] | None = None,
-    available: object | None = None,
-    origin: pd.Timestamp | None = None,
-) -> FeatureMatrix:
-    """Return the design matrix for one target (method_spec.md sections 2-3).
-
-    ``data`` must already carry a :class:`~pandas.DatetimeIndex`; run it through
-    :func:`rfrgapfill.time.prepare_time_index` first. Drivers are read through
-    ``config``'s column map and renamed to their canonical names, so nothing
-    downstream sees a station column name.
-
-    ``available`` is passed straight to :func:`daily_flux_statistics` and is the
-    leakage boundary. In artificial-gap validation it must exclude every withheld
-    observation, and it must be built before this call - which is why
-    :mod:`rfrgapfill.validation` generates the gap mask first.
-
-    With ``config.features.use_receptive_limiter=False`` this returns the drivers
-    alone: the ORF benchmark of Supplementary Figure S1, same drivers and same
-    estimator, feature engineering removed.
-    """
-    if not isinstance(data.index, pd.DatetimeIndex):
-        raise FeatureError(
-            "build_feature_matrix needs a DatetimeIndex; call prepare_time_index() first"
-        )
-    if target not in data.columns:
-        raise FeatureError(f"target column {target!r} is not in the data")
-
-    settings = config.features
-    mapping = config.require_column_map(column_map)
-    frame = _driver_frame(data, config=config, column_map=mapping)
-
-    daily: DailyStatistics | None = None
-    if settings.use_receptive_limiter:
-        tag = radiation_tag(
-            frame[SHORTWAVE],
-            thresholds=settings.radiation_thresholds,
-            convention=settings.convention,
-        )
-        frame[RADIATION_CLASS] = radiation_code(tag)
-        frame[TIME_DISTANCE_HOURS] = time_distance_hours(
-            data.index, origin=data.index.min() if origin is None else origin
-        )
-        for column, values in season_indicators(
-            season_tag(data.index, config.resolve_hemisphere())
-        ).items():
-            frame[column] = values
-        daily = daily_flux_statistics(
-            data[target],
-            available=available,
-            name=target,
-            min_observations=settings.min_daily_observations,
-            strategy=settings.daily_strategy,
-        )
-        for column in daily.frame.columns:
-            frame[column] = daily.frame[column]
-
-    expected = feature_names(target, mode=config.rfr_mode, features=settings)
-    ordered = cast("pd.DataFrame", frame.loc[:, list(expected)])
-    complete = ordered.notna().all(axis=1)
-    complete.name = "complete"
-
-    return FeatureMatrix(
-        frame=ordered,
-        target=target,
-        use_receptive_limiter=settings.use_receptive_limiter,
-        complete=complete,
-        daily_statistics=daily,
-    )
-
-
-def _driver_frame(
-    data: pd.DataFrame,
-    *,
-    config: RFRConfig,
-    column_map: ColumnMap,
+    available_mask: object | None = None,
+    origin: pd.Timestamp | str | None = None,
+    encode: bool = True,
 ) -> pd.DataFrame:
-    """Return the mode's drivers as float columns under their canonical names."""
-    missing = column_map.missing_columns(data.columns)
-    needed = set(column_map.columns(config.drivers))
-    absent = sorted(column for column in missing if column in needed)
-    if absent:
+    """Assemble the receptive-limiter feature matrix for one site and one target.
+
+    ``data`` must already sit on a validated time axis - call
+    :func:`rfrgapfill.time.prepare_time_index` first - and carry the driver
+    columns named by ``column_map`` (or by ``config.column_map``). Drivers are
+    copied into the matrix under their **canonical** names, so a matrix built
+    from FLUXNET columns and one built from a station's own names are
+    interchangeable.
+
+    Column order is exactly :func:`feature_names`. Rows are the rows of ``data``,
+    in order, with missing inputs carried through as missing features; no row is
+    dropped and no value is imputed here. Deciding which rows are usable belongs
+    to the model layer, which reports what it excluded.
+
+    :param target: the target flux column in ``data``. Required while the
+        receptive limiter is on, since the daily statistics are derived from it;
+        ignored for the ORF benchmark, which has no target-derived features.
+    :param available_mask: rows whose target value the model may see, passed
+        straight to :func:`daily_flux_statistics`. **Required for artificial-gap
+        validation**; see that function for what omitting it means.
+    :param origin: zero point for :func:`time_distance_hours`. Defaults to the
+        first timestamp of ``data``; pass the full series' origin whenever
+        ``data`` is a subset, or the same timestamp will get different values in
+        the subset than in the whole series.
+    :param encode: when true (the default) the two categorical features are
+        returned as float ordinal codes - ``weak``/``medium``/``strong`` as
+        0/1/2 and ``winter``/``spring``/``summer``/``autumn`` as 0/1/2/3, with
+        missing categories as ``NaN`` - which is what the Random Forest consumes.
+        Pass ``encode=False`` to keep them as pandas categoricals for inspection
+        and testing. The codes are fixed by the declaration order of
+        :class:`RadiationClass` and :class:`Season`, so a model and a later
+        prediction frame always agree.
+    """
+    if not isinstance(data, pd.DataFrame):
+        raise FeatureError(f"data must be a pandas DataFrame, got {type(data).__name__}")
+    if not isinstance(config, RFRConfig):
+        raise ConfigError(f"config must be an RFRConfig, got {type(config).__name__}")
+
+    index = as_datetime_index(data.index, field_name="the data index")
+    features = config.features
+    columns = config.require_column_map(column_map)
+    missing_columns = columns.missing_columns(data.columns)
+    if missing_columns:
         raise FeatureError(
-            f"the data is missing mapped driver column(s): {', '.join(absent)}. "
-            "Check the column map against the frame's columns."
+            f"mapped driver column(s) absent from the data: {', '.join(missing_columns)}"
         )
-    columns = {
-        name: _as_float_series(data[column_map.column(name)], name=name)
-        for name in CANONICAL_VARIABLES
-        if name in config.drivers
+
+    matrix = pd.DataFrame(index=index)
+    matrix.index.name = data.index.name
+    for canonical in config.drivers:
+        matrix[canonical] = _as_float_series(
+            data[columns.column(canonical)], field_name=f"driver {canonical!r}"
+        ).to_numpy(dtype=float)
+
+    if features.use_receptive_limiter:
+        if target is None:
+            raise ConfigError(
+                "target= is required when the receptive limiter is enabled: the daily "
+                "statistics of method_spec.md 3.4 are target-specific. For the ORF "
+                "benchmark set FeatureConfig(use_receptive_limiter=False)."
+            )
+        if target not in data.columns:
+            raise FeatureError(f"target column {target!r} is not in the data")
+
+        if features.mode is FeatureMode.LEGACY_FLUXLIB:
+            # fluxlib's derivation, in its own columns; `origin` and `encode` do not
+            # apply, since it has no elapsed-hours feature and its tags are integers.
+            from rfrgapfill.legacy import build_legacy_features
+
+            legacy = build_legacy_features(
+                data[target],
+                data[columns.column(SHORTWAVE)],
+                hemisphere=config.resolve_hemisphere(),
+                target_name=target,
+                available_mask=available_mask,
+                thresholds=features.radiation_thresholds,
+            )
+            for name in legacy.columns:
+                matrix[name] = legacy[name].to_numpy(dtype=float)
+            expected_legacy = feature_names(config, target=target)
+            assert tuple(matrix.columns) == expected_legacy, (
+                f"feature order drifted from feature_names(): "
+                f"{tuple(matrix.columns)} != {expected_legacy}"
+            )
+            legacy_matrix: pd.DataFrame = matrix
+            return legacy_matrix
+
+        matrix[RADIATION_CATEGORY] = radiation_tag(
+            data[columns.column(SHORTWAVE)], config=features
+        ).to_numpy()
+        matrix[TIME_DISTANCE_HOURS] = time_distance_hours(
+            index, origin=index.min() if origin is None else origin
+        ).to_numpy(dtype=float)
+        matrix[SEASON] = season_tag(index, hemisphere=config.resolve_hemisphere()).to_numpy()
+        statistics = daily_flux_statistics(
+            data[target],
+            available_mask=available_mask,
+            target_name=target,
+            config=features,
+        )
+        for name in statistics.columns:
+            matrix[name] = statistics[name].to_numpy(dtype=float)
+
+        if encode:
+            matrix[RADIATION_CATEGORY] = _encode(matrix[RADIATION_CATEGORY], _RADIATION_DTYPE)
+            matrix[SEASON] = _encode(matrix[SEASON], _SEASON_DTYPE)
+        else:
+            matrix[RADIATION_CATEGORY] = pd.Categorical(
+                matrix[RADIATION_CATEGORY], dtype=_RADIATION_DTYPE
+            )
+            matrix[SEASON] = pd.Categorical(matrix[SEASON], dtype=_SEASON_DTYPE)
+
+    expected = feature_names(config, target=target if features.use_receptive_limiter else None)
+    assert tuple(matrix.columns) == expected, (
+        f"feature order drifted from feature_names(): {tuple(matrix.columns)} != {expected}"
+    )
+    assembled: pd.DataFrame = matrix
+    return assembled
+
+
+def _encode(values: pd.Series, dtype: pd.CategoricalDtype) -> pd.Series:
+    """Return ordinal float codes for a categorical column, missing as ``NaN``."""
+    categorical = pd.Categorical(values, dtype=dtype)
+    codes = np.asarray(categorical.codes, dtype=float)
+    codes[codes < 0] = np.nan
+    encoded: pd.Series = pd.Series(codes, index=values.index, name=values.name)
+    return encoded
+
+
+def describe_features(
+    config: RFRConfig,
+    *,
+    target: str | None = None,
+) -> dict[str, Any]:
+    """Return a manifest-ready description of the feature stage.
+
+    Records the column order together with every choice that determined it, so a
+    result can be traced back to the conventions that produced it (method_spec.md
+    section 7).
+    """
+    features = config.features
+    described: dict[str, Any] = {
+        "use_receptive_limiter": features.use_receptive_limiter,
+        "feature_mode": features.mode.value,
+        "drivers": list(config.drivers),
+        "feature_names": list(feature_names(config, target=target)),
+        "target": target,
     }
-    drivers: pd.DataFrame = pd.DataFrame(columns, index=data.index)
-    return drivers
+    if features.use_receptive_limiter and features.mode is FeatureMode.LEGACY_FLUXLIB:
+        from rfrgapfill.legacy import describe_legacy_features
 
-
-# ---------------------------------------------------------------------------
-# Coercion helpers
-# ---------------------------------------------------------------------------
-
-
-def _as_float_series(values: object, *, name: str) -> pd.Series:
-    """Return ``values`` as a float Series, keeping a pandas index when given."""
-    if isinstance(values, pd.Series):
-        try:
-            converted = values.astype(float)
-        except (TypeError, ValueError) as error:
-            raise FeatureError(f"{name} must be numeric: {error}") from error
-        converted.name = name
-        return converted
-    array = np.asarray(values, dtype=object)
-    try:
-        numeric = array.astype(float)
-    except (TypeError, ValueError) as error:
-        raise FeatureError(f"{name} must be numeric: {error}") from error
-    result: pd.Series = pd.Series(numeric, name=name)
-    return result
-
-
-def _as_bool_array(values: object, *, length: int, field_name: str) -> np.ndarray:
-    """Return ``values`` as a boolean array of ``length``, treating NaN as False."""
-    array = values.to_numpy() if isinstance(values, pd.Series) else np.asarray(values)
-    if array.ndim != 1 or array.size != length:
-        raise FeatureError(
-            f"{field_name} must be a 1-D mask of length {length}, got shape {array.shape}"
+        described.update(describe_legacy_features(config))
+    elif features.use_receptive_limiter:
+        described.update(
+            {
+                "radiation_thresholds": list(features.radiation_thresholds),
+                "boundary_convention": features.convention.value,
+                "hemisphere": config.resolve_hemisphere().value,
+                "hemisphere_source": config.hemisphere_source,
+                "min_daily_observations": features.min_daily_observations,
+                "daily_statistic_strategy": features.statistic_strategy.value,
+                "fallback_window_days": features.fallback_window,
+                "daily_std_ddof": features.daily_std_ddof,
+                "radiation_category_codes": {
+                    name: code for code, name in enumerate(_RADIATION_CATEGORIES)
+                },
+                "season_codes": {name: code for code, name in enumerate(_SEASON_CATEGORIES)},
+            }
         )
-    if array.dtype == bool:
-        return array
-    filled = pd.Series(array).fillna(False)
-    return filled.astype(bool).to_numpy()
-
-
-def _check_thresholds(thresholds: Sequence[float]) -> tuple[float, float]:
-    """Return ``thresholds`` as a strictly increasing pair of finite floats."""
-    if len(thresholds) != 2:
-        raise FeatureError(f"radiation thresholds must be a pair, got {thresholds!r}")
-    low, high = float(thresholds[0]), float(thresholds[1])
-    if not (np.isfinite(low) and np.isfinite(high)):
-        raise FeatureError(f"radiation thresholds must be finite, got ({low}, {high})")
-    if not low < high:
-        raise FeatureError(f"radiation thresholds must be increasing, got ({low}, {high})")
-    return low, high
+    return described

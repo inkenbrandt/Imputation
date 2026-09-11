@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rfr-gapfill"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "Leakage-safe Random Forest Robust (RFR) gap filling for eddy-covariance flux data, after Zhu et al. (2022)."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -25,6 +25,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Atmospheric Science",
     "Typing :: Typed",
 ]
@@ -47,10 +48,12 @@ dev = [
 # Notebooks are deliberately NOT a core or dev requirement; the package core
 # must never depend on them.
 notebooks = ["jupyter", "matplotlib"]
+# YAML configuration files for load_config and the CLI. JSON needs nothing extra.
+yaml = ["pyyaml>=6.0"]
 
 [project.urls]
-Homepage = "https://github.com/paulinkenbrandt/Imputation"
-Documentation = "https://github.com/paulinkenbrandt/Imputation/tree/main/docs"
+Homepage = "https://github.com/inkenbrandt/Imputation"
+Documentation = "https://github.com/inkenbrandt/Imputation/tree/main/docs"
 
 [project.scripts]
 rfr-gapfill = "rfrgapfill.cli:main"
@@ -69,6 +72,7 @@ markers = [
     "slow: long-running tests (model fitting, end-to-end scenarios)",
     "fluxnet: requires real FLUXNET2015 input data not shipped with the package",
     "supplement: requires the journal supplementary files (mmc*.docx / mmc7.xlsx)",
+    "notebooks: executes the example notebooks (needs the `notebooks` extra)",
 ]
 filterwarnings = ["error::DeprecationWarning:rfrgapfill.*"]
 
@@ -92,7 +96,7 @@ strict = true
 warn_unreachable = true
 
 [[tool.mypy.overrides]]
-module = ["sklearn.*", "scipy.*", "joblib.*"]
+module = ["sklearn.*", "scipy.*", "joblib.*", "matplotlib.*", "yaml", "yaml.*"]
 ignore_missing_imports = true
 
 # numpy's bundled stubs use `type` statements, which mypy cannot parse while
@@ -106,3 +110,10 @@ follow_imports_for_stubs = true
 [tool.coverage.run]
 source = ["rfrgapfill"]
 branch = true
+
+# CI fails a run whose branch coverage falls below this. It sits a few points
+# under the measured total (94%) so platform noise cannot trip it, while a new
+# module landing without tests can.
+[tool.coverage.report]
+fail_under = 90
+show_missing = true

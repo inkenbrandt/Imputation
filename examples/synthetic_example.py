@@ -1,4 +1,4 @@
-"""Synthetic end-to-end demonstration.
+"""Synthetic end-to-end demonstration: RFR3 and RFR10, validated and scored.
 
 Builds half-hourly data with known diurnal and seasonal structure, runs the
 artificial-gap validation of Zhu et al. (2022) over it -- 24-hour, 7-day and

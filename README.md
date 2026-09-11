@@ -1,5 +1,7 @@
 # rfr-gapfill
 
+[![CI](https://github.com/inkenbrandt/Imputation/actions/workflows/ci.yml/badge.svg)](https://github.com/inkenbrandt/Imputation/actions/workflows/ci.yml)
+
 Leakage-safe **Random Forest Robust (RFR)** gap filling for eddy-covariance flux
 data, reproducing the method of:
 
@@ -33,6 +35,52 @@ metrics, and the validation orchestration, plus an optional FLUXNET2015 adapter.
 | Model, filling, validation orchestration | done |
 | FLUXNET2015 adapter | done |
 
+What each piece is doing:
+
+- `site.config("RFR3", ...)` fills in the site's cadence, latitude, column
+  mapping and seed. With your own data you build an `RFRConfig` directly.
+- `daily_statistic_strategy="rolling_available"` matters: under the default, a
+  gap covering whole days has no daily target statistics, so 7-day and 30-day
+  gaps get no predictions at all ([A4](docs/assumptions.md#a4-days-with-too-few-measured-values)).
+- The one-point grid is for speed. Drop `hyperparameter_grid` to search the
+  package's default grid.
+- `site.known_gaps()` is a fixed plan of one 30-day, two 7-day and three 24-hour
+  gaps. Leave out `gaps=` to draw the paper's scenario instead (about 25% of the
+  measured data, mixed 20/30/50).
+- NEE's 30-day R2 is negative while its RMSE is the smallest of any NEE class.
+  That gap falls in winter, when NEE hardly varies, and R2 compares the error
+  with that tiny variance. Read the metrics together
+  ([`docs/validation.md`](docs/validation.md#read-the-metrics-together)).
+- `result.frame` is a new frame: the input is never modified. `pre_filled` rows
+  were already gap-filled before they reached the package and are left alone.
+
+`python examples/synthetic_example.py` goes further: both configurations, per
+gap class and day/night subset, the energy balance, and the published medians
+printed for reference. The [example notebooks](docs/examples.md) cover the same
+ground step by step, with figures, and go on to a FLUXNET-format file and the
+command line.
+
+## Expected input
+
+One site at a time, as a pandas `DataFrame` with one row per time step:
+
+- **Time.** A `DatetimeIndex`, or a timestamp column named with `timestamp=`.
+  Numbers are refused as timestamps, because pandas would read them as
+  nanoseconds since 1970. Rows are sorted for you; duplicate timestamps raise
+  unless you choose how to resolve them. Missing rows are fine.
+- **Cadence.** Half-hourly is the paper's; other regular cadences such as hourly
+  work. Declare it with `frequency=` or let it be inferred.
+- **Targets.** One continuous flux column per model. To compare with the paper,
+  name them `NEE` (µmol m-2 s-1), `H` and `LE` (W m-2).
+- **A QC column per target**, strongly recommended. Values in
+  `observed_qc_values` (default `0`, FLUXNET's "measured") are measurements;
+  anything else, including a missing flag, is treated as already gap-filled.
+- **Drivers** for the chosen mode, in the units of the table below. The package
+  neither fills nor converts them.
+- **Latitude or hemisphere**, for the season feature. One is required.
+- **`NETRAD` and `G`** as well, if you want the energy-balance check.
+- **Missing values as `NaN`.** A sentinel such as FLUXNET's `-9999` would be read
+  as a real number.
 ## Specification first
 
 The implementation is checked against a frozen specification rather than against
@@ -40,7 +88,7 @@ prose in the paper:
 
 - [`docs/method_spec.md`](docs/method_spec.md) — the contract: driver lists,
   receptive-limiter features, gap scenario, metrics, and a **Known ambiguities**
-  table (A1–A10) covering every point where the paper is silent.
+  table (A1–A12) covering every point where the paper is silent.
 - [`docs/method_spec.yaml`](docs/method_spec.yaml) — machine-readable companion.
   Each block is tagged `provenance: paper` or `provenance: default` so code and
   tests can tell a published fact from a documented choice of ours.
@@ -59,9 +107,21 @@ default, expose it in configuration, and record it in the ambiguities table.
 Two named configurations, both fitted **per site and per target**:
 
 - **RFR3** — Random Forest plus receptive limiter, using the three
-  MDS-equivalent drivers: downward shortwave radiation, VPD, air temperature.
-- **RFR10** — RFR3 plus net radiation, wind speed, wind direction, soil heat flux,
-  soil temperature, relative humidity, soil water content.
+  MDS-equivalent drivers.
+- **RFR10** — the same, with seven more drivers.
+
+| Driver | Canonical name | FLUXNET2015 column | Units | RFR3 | RFR10 |
+|---|---|---|---|:---:|:---:|
+| Downward shortwave radiation | `shortwave` | `SW_IN_F` | W m-2 | ✓ | ✓ |
+| Vapour pressure deficit | `vpd` | `VPD_F_MDS` | hPa | ✓ | ✓ |
+| Air temperature | `air_temperature` | `TA_F_MDS` | degC | ✓ | ✓ |
+| Net radiation | `net_radiation` | `NETRAD` | W m-2 | | ✓ |
+| Wind speed | `wind_speed` | `WS` | m s-1 | | ✓ |
+| Wind direction | `wind_direction` | `WD` | degrees | | ✓ |
+| Soil heat flux | `soil_heat_flux` | `G_F_MDS` | W m-2 | | ✓ |
+| Soil temperature | `soil_temperature` | `TS_F_MDS` | degC | | ✓ |
+| Relative humidity | `relative_humidity` | `RH` | % | | ✓ |
+| Soil water content | `soil_water_content` | `SWC_F_MDS` | % | | ✓ |
 
 The **receptive limiter** is the paper's feature-engineering stage: a radiation
 category, elapsed hours since the series start, a hemisphere-aware season tag, and
@@ -123,22 +183,99 @@ options, and neither averages the duplicated rows. Missing rows are *not* an
 error — real flux series have them, which is exactly why durations are
 elapsed-time quantities.
 
-## Install
+## Leakage-safe validation features
 
-Requires Python 3.10+.
+The daily target statistics are built *from the target*, so an artificial-gap
+validation that computes them naively lets the hidden truth build its own
+predictors. `rfrgapfill.leakage` is the workflow that prevents it, and validation
+features should be built through it rather than by calling the transformers
+directly.
 
-```bash
-# with uv
-uv venv
-uv pip install -e ".[dev]"
+```python
+from rfrgapfill import build_validation_features, holdout_mask_from_intervals
 
-# or with pip
-python -m venv .venv && .venv/Scripts/activate   # .venv/bin/activate on POSIX
-pip install -e ".[dev]"
+holdout = holdout_mask_from_intervals(df.index, [("2020-06-06", "2020-06-13")])
+
+validation = build_validation_features(
+    df, config=config, target="LE", holdout=holdout, qc_column="LE_QC"
+)
+
+validation.training_features(), validation.training_target()  # what the model sees
+validation.holdout_features()                                 # what it predicts
+validation.scoring_truth()                                    # scoring only
+validation.to_dict()                                          # for the run manifest
 ```
 
-Notebooks are not a core or development dependency; install the optional
-`notebooks` extra if you want the example notebook environment.
+The truth is a separate attribute from the features, and two independent
+protections keep it out of them: the held-out values are removed from the frame
+the features are read from, *and* the transformer is told which rows are visible.
+Either alone is sufficient, and both are checked:
+
+```python
+from rfrgapfill import detect_target_leakage, require_no_target_leakage
+
+detect_target_leakage(df, config=config, target="LE", holdout=holdout)   # () when safe
+require_no_target_leakage(df, config=config, target="LE", holdout=holdout)
+```
+
+The probe replaces the hidden truth with absurd values, rebuilds every feature —
+with and without the frame-level masking — and reports any column that moved. In
+`paper_safe` mode it must report nothing, for every daily-statistic strategy.
+
+One consequence worth knowing before a long-gap run: under the documented default
+`daily_statistic_strategy="missing"`, a gap covering a whole calendar day leaves
+every row of that day without daily statistics, so 7-day and 30-day gaps produce
+no complete feature rows at all. The paper does not say what it did here
+(ambiguity A4), so the alternatives are explicit — `within_day_available`,
+`neighbor_day_fallback`, `rolling_available` — all of them drawing only on visible
+observations, and `to_dict()` reports `holdout_rows_with_complete_features` so the
+choice cannot go unnoticed.
+
+### Historical `fluxlib` compatibility
+
+[`docs/fluxlib_audit.md`](docs/fluxlib_audit.md) audits the paper-era `fluxlib`
+code the article cites. That code computes the daily statistics *before* the
+artificial gaps are hidden, so held-out truth reaches its own predictors, and it
+departs from the article in several other places. `feature_mode="legacy_fluxlib"`
+reproduces its derivation so you can measure how much that flatters a score: it
+warns on every validation build, labels its arms `RFR3-legacy` / `RFR10-legacy`,
+and is never paper faithful. `hyperparameter_preset="legacy_fluxlib"` (the
+archived `GridSearchCV` grid) and `"legacy_fluxlib_fixed"` (the parameters its
+pipelines actually fitted) are the matching model settings. No default follows the
+old code.
+
+```python
+historical = config.replace(
+    features=FeatureConfig(feature_mode="legacy_fluxlib"), cv_folds=3
+).with_hyperparameter_preset("legacy_fluxlib_fixed")
+```
+
+## The Random Forest itself
+
+`RFRModel` is the low-level model layer: a `RandomForestRegressor` inside a
+`GridSearchCV` whose grid, folds, seed and `n_jobs` all come from the
+configuration. It takes a feature matrix and a target vector and nothing else, so
+the same class serves an RFR run, the ORF benchmark and an operational fill.
+
+```python
+from rfrgapfill import RFRModel, build_feature_matrix
+
+features = build_feature_matrix(df, config=config, target="LE")
+
+model = RFRModel(config, target="LE").fit(features, df["LE"])
+model.get_feature_names()      # the order the model was fitted on
+model.get_best_params()        # what GridSearchCV chose from the configured grid
+model.fit_report.to_dict()     # rows offered, fitted, and why the rest were not
+model.to_dict()                # grid, folds, seed, best params, versions
+
+predictions = model.predict(features)          # a float Series on df's index
+model.save("LE.joblib")
+RFRModel.load("LE.joblib")                     # config revalidated as it loads
+```
+
+The grid is **ours**, not the paper's: the article says `GridSearchCV` was used and
+never enumerates the search, so `hyperparameter_grid_is_paper_exact` is `False` in
+every manifest this package writes (ambiguity A1).
 
 ## Filling real gaps
 
@@ -268,6 +405,9 @@ the daily-product caveat are all in
 
 ```bash
 pytest              # tests
+pytest -m "not slow and not supplement"   # the fast subset
+pytest --cov        # tests with branch coverage; fails below 90%
+pytest -m notebooks # execute the example notebooks (needs the notebooks extra)
 ruff check .        # lint
 ruff format .       # format
 mypy                # type check (strict, src/rfrgapfill)
@@ -275,6 +415,20 @@ mypy                # type check (strict, src/rfrgapfill)
 
 Test markers: `slow`, `fluxnet` (needs real FLUXNET2015 input), `supplement`
 (needs the journal supplementary files). None of that data is committed here.
+
+Every pull request and every push to `main` runs
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+
+| Job | What it checks |
+|---|---|
+| Lint and types | `ruff check`, `ruff format --check`, strict `mypy` |
+| Tests | the full suite with branch coverage, on Python 3.10 to 3.14 and on Windows; the `yaml` extra and matplotlib are installed so their tests run |
+| Dependency floors | the full suite on Python 3.10 at the lowest version of every dependency `pyproject.toml` allows, so a declared minimum cannot quietly become false |
+| Example notebooks | executes every notebook in `examples/notebooks/` with the `notebooks` extra installed |
+| Package | builds the sdist and the wheel from it, runs `twine check`, installs the wheel into a clean environment and runs the README quick start and the console script against it |
+
+The `supplement` and `fluxnet` tests skip in CI because their data is not in the
+repository. Run them locally before changing anything they cover.
 
 ## Citing
 

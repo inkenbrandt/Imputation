@@ -15,10 +15,10 @@ science modules can import from here without a cycle.
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Final, TypeVar
+from typing import Any, Final, TypeVar, cast
 
 __all__ = [
     "AIR_TEMPERATURE",
@@ -41,6 +41,7 @@ __all__ = [
     "ColumnMap",
     "ColumnMapError",
     "ConfigError",
+    "FrozenRecord",
     "GapClass",
     "Hemisphere",
     "Mode",
@@ -58,6 +59,48 @@ class ConfigError(ValueError):
 
 class ColumnMapError(ConfigError):
     """Raised when required canonical variables are not mapped to input columns."""
+
+
+# ---------------------------------------------------------------------------
+# Serialisation support for frozen configuration objects
+# ---------------------------------------------------------------------------
+
+
+def _unfreeze(value: object) -> object:
+    """Return a picklable copy of ``value``, unwrapping a read-only mapping."""
+    return dict(value) if isinstance(value, MappingProxyType) else value
+
+
+class FrozenRecord:
+    """Pickle and copy support for this package's frozen dataclasses.
+
+    The configuration objects and the fitted model's reports all normalise their
+    mapping fields into a :class:`types.MappingProxyType`, so a validated object
+    cannot be edited in place behind the validation that produced it. ``pickle``
+    cannot serialise a mapping proxy, which would leave a ``joblib``-saved model
+    unable to carry the configuration it was fitted under - and
+    ``docs/method_spec.md`` section 5 requires exactly that.
+
+    The pickled state is therefore the dataclass fields with the proxies copied
+    back to plain dictionaries, and restoring re-runs ``__post_init__`` so a
+    reloaded object is **revalidated** rather than trusted. A model file edited to
+    carry an impossible configuration fails on load rather than predicting under
+    settings the constructor would have rejected.
+    """
+
+    __slots__ = ()
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Return the dataclass fields, with read-only mappings copied to dicts."""
+        return {item.name: _unfreeze(getattr(self, item.name)) for item in fields(cast(Any, self))}
+
+    def __setstate__(self, state: Mapping[str, Any]) -> None:
+        """Restore ``state`` and re-run the dataclass validation over it."""
+        for name, value in state.items():
+            object.__setattr__(self, name, value)
+        post_init = getattr(self, "__post_init__", None)
+        if post_init is not None:
+            post_init()
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +310,7 @@ class GapClass(str, Enum):
 
 
 @dataclass(frozen=True)
-class ColumnMap:
+class ColumnMap(FrozenRecord):
     """Mapping from canonical variable names to the input frame's column names.
 
     ``variables`` maps canonical names (:data:`CANONICAL_VARIABLES`) to arbitrary

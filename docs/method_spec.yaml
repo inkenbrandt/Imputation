@@ -40,6 +40,13 @@ methods:
     use_receptive_limiter: false
     role: benchmark
     supported_by: "Supplementary Figure S1"
+    defined_relative_to: the_rfr_run_it_is_compared_against
+    must_match_compared_rfr:
+      [mode, drivers, random_state, hyperparameter_grid, cv_strategy, cv_folds,
+       cv_shuffle, column_map, observed_qc_values, artificial_gap_mask]
+    pairing_enforced_by: require_orf_pairing
+    paired_metrics: [r2, slope, rmse, bias]
+    per_site_improvement_required: false
     provenance: paper
   - name: MDS
     role: external_reference_only
@@ -147,11 +154,43 @@ receptive_limiter:
     source: "quality-controlled observations of the target flux"
     joined_back_to_all_timestamps_of_day: true
     target_specific: true
+    quantile_interpolation: linear
+    std_ddof:
+      default: 1
+      provenance: default      # A11
+    sparse_day_strategy:
+      default: missing            # A4
+      alternatives:
+        - within_day_available
+        - neighbor_day_fallback
+        - rolling_available
+      minimum_visible_observations: 1
+      fallback_window_days:
+        default: 7
+        applies_to: [neighbor_day_fallback, rolling_available]
+      all_strategies_use_visible_observations_only: true
+      # Under the default, a gap covering a whole day leaves every row of that
+      # day without daily statistics, so 7 d and 30 d gaps yield no complete
+      # feature rows unless a reaching strategy is chosen deliberately.
+      default_leaves_multi_day_gaps_without_features: true
     provenance: paper
   feature_order_deterministic: true
 
 leakage_policy:
   default_feature_mode: paper_safe
+  module: rfrgapfill.leakage
+  workflow:
+    - build_holdout_mask                 # holdout_mask_from_intervals
+    - mask_held_out_target_values        # hide_target
+    - daily_statistics_from_visible_only # available_target_mask
+    - build_prediction_features          # build_validation_features
+    - retain_untouched_truth_for_scoring # ValidationFeatureSet.truth
+  independent_protections: [hide_target, available_mask]
+  probe:
+    detect: detect_target_leakage
+    require: require_no_target_leakage
+    error: LeakageError
+    checks_with_and_without_frame_masking: true
   modes:
     paper_safe:
       mask_before_feature_computation: true
@@ -163,12 +202,28 @@ leakage_policy:
       empty_day_statistics_options: [nearest_visible_day, within_day]
       min_daily_observations: 2
     legacy_fluxlib:
-      status: reserved
-      enable_only_with_implementation_evidence: true
+      status: implemented              # Step 20, on implementation evidence
+      evidence: docs/fluxlib_audit.md
+      source: "fluxlib 0.0.23, commit da53256, gapfill/ggapfill.py GFiller.set_stats"
+      module: rfrgapfill.legacy
+      mask_before_feature_computation: false
+      daily_statistics_use_visible_observations_only: false
+      held_out_truth_in_features: reproduced
+      daily_statistics: [max, min, mean, std, p25, p50, p75]
+      target_gaps: "linearly interpolated before the daily statistics"
+      daily_join: "midnight keeps its own day; every other row takes the next day's"
+      time_features: [day_of_year, year]
+      superseded_settings_configurable: false
+      warning: rfrgapfill.legacy.LegacyFluxlibWarning
+      paper_faithful: false
+      method_labels: [RFR3-legacy, RFR10-legacy]
+      not_reproduced: [driver interpolation, prediction-row back-filling]
   silent_mixing_allowed: false
   provenance: default          # A6
 
 gap_scenario:
+  module: rfrgapfill.gaps
+  implementation: rfrgapfill.gaps.GapScenarioGenerator
   missing_fraction: 0.25
   durations:
     short: "24h"
@@ -181,13 +236,31 @@ gap_scenario:
   allocation_basis:
     default: missing_records
     alternatives: [gap_events]
+    algorithm: rfrgapfill.gaps.allocate_gaps
+    missing_records: "events_c = round(share_c * target_records / records_per_event_c)"
+    gap_events: "n = round(target_records / mean_event_size); largest remainder by share"
+    rounding: "half up; largest remainder ties resolve in class order"
+    planned_from: "records a complete grid would hold, before any interval is placed"
     provenance: default        # A3
+  fraction_measured_against: "genuinely observed target values, not rows"
   min_observed_fraction: 0.50
+  observed_fraction_denominator: n_expected
   allow_overlap: false
+  placement_order: "longest class first"
   seeded: true
+  bounded_retries: max_attempts_per_gap
   shared_gaps_across_targets: true
-  manifest_fields: [start, end, duration, gap_class, affected_rows, observed_fraction]
+  joint_targets_available_where: "every target is observed"
+  manifest: rfrgapfill.gaps.GapManifest
+  manifest_fields: [gap_id, gap_class, start, end, duration, n_expected, n_rows,
+                    n_observed_before_masking, observed_fraction]
+  reports_achieved_mix_on_both_bases: true
+  tolerances:                  # A7
+    fraction: fraction_tolerance
+    mix: mix_tolerance
+    breach: warning            # rfrgapfill.gaps.GapScenarioWarning
   must_report_when_unsatisfiable: true
+  unsatisfiable_error: rfrgapfill.gaps.GapError
   provenance: paper
 
 train_test_design:
@@ -198,6 +271,36 @@ train_test_design:
   supported_by: "Figure 2"
   provenance: paper
 
+validation_workflow:
+  module: rfrgapfill.validation
+  implementation: rfrgapfill.validation.validate_rfr
+  stages:
+    - place_artificial_gaps          # GapScenarioGenerator, or a handed-in manifest
+    - holdout_mask_from_manifest     # GapManifest.mask
+    - leakage_safe_features          # build_validation_features
+    - fit_on_remaining_observations  # RFRModel.fit
+    - predict_withheld_rows          # RFRModel.predict
+    - score_by_subset_and_gap_class  # core_metrics
+    - energy_balance_for_h_and_le    # compare_energy_balance
+  shared_gap_locations_across_targets: true
+  reuse_manifest_for_paired_arms: gaps=
+  predictions_outside_gaps: missing
+  observed_values_modified: false
+  input_frame_mutated: false
+  incomplete_predictor_rows: "not predicted and not scored; counted in n_offered"
+  result: rfrgapfill.validation.ValidationReport
+  per_target_result: rfrgapfill.validation.TargetValidation
+  tidy_table_columns: [target, method, mode, gap_class, subset, n, n_offered,
+                       r2, slope, rmse, bias]
+  bias_spread_by_gap_class:
+    record: rfrgapfill.validation.BiasSpread
+    unit: "one bias per placed interval, not per row"
+    single_site_analogue_of: "Table S8 cross-site IQR"
+    table: "TargetValidation.bias_spread_frame / ValidationReport.bias_spread_frame"
+  nothing_scored_warning: rfrgapfill.validation.ValidationWarning   # ambiguity A4
+  manifest: RunManifest.from_validation, one per target
+  provenance: paper
+
 model:
   estimator: sklearn.ensemble.RandomForestRegressor
   deterministic_random_state: true
@@ -205,13 +308,36 @@ model:
   hyperparameter_search: GridSearchCV
   hyperparameter_grid_enumerated_in_paper: false
   grid_provenance: default     # A1
+  hyperparameter_presets:      # RFRConfig.hyperparameter_preset; none is paper exact
+    default: package_default
+    package_default: DEFAULT_HYPERPARAMETER_GRID
+    legacy_fluxlib: "fluxlib GFiller.auto_optimize grid, 288 candidates, cv=3; called by no archived pipeline"
+    legacy_fluxlib_fixed: "max_depth=20, min_samples_leaf=3, min_samples_split=12, n_estimators=100"
+    evidence: docs/fluxlib_audit.md
   cv_strategy_provenance: default  # A5
   train_rows: "valid target and valid required features"
   report_rows_excluded_for_missing_predictors: true
   one_model_per_target: true
   serialization: joblib
+  implementation: rfrgapfill.model.RFRModel
+  scoring: r2                  # scikit-learn's regressor default
+  cv_splitters:
+    kfold: "sklearn.model_selection.KFold(n_splits=cv_folds, shuffle=cv_shuffle)"
+    time_series_split: "sklearn.model_selection.TimeSeriesSplit(n_splits=cv_folds)"
+  non_finite_predictor_rows:
+    at_fit: dropped
+    at_predict: "missing prediction, or raise when on_incomplete='raise'"
+    native_sklearn_nan_handling_used: false
+    provenance: default        # method_spec.md section 5
+  n_jobs_applied_to: estimator  # not the grid search: one level of parallelism
+  saved_payload:
+    format_version: 1
+    carries: [config, feature_names, search, fit_report, versions]
+    config_revalidated_on_load: true
+    warns_on_sklearn_version_drift: true
 
 metrics:
+  module: rfrgapfill.metrics
   required: [r2, slope, rmse, bias]
   definitions:
     r2: "coefficient of determination"
@@ -221,6 +347,19 @@ metrics:
   regression_orientation:
     x: measured
     y: filled
+  r2_definition:
+    default: residual          # A12: 1 - SS_res/SS_tot
+    alternatives: [squared_correlation]
+    config: r2_definition
+    provenance: default
+  slope_fit_intercept:
+    default: true
+    provenance: default
+  pairing:
+    align_series_silently: false     # differing indexes are an error
+    drop_incomplete_pairs: true      # both sides at once
+    n_counts: "complete pairs, and is the bias denominator"
+  undefined_result: null             # never NaN, never zero
   subsets: [all, daytime, nighttime]
   daytime_threshold:
     variable: shortwave
@@ -234,7 +373,126 @@ metrics:
     evaluated_on: "same artificial-gap intervals"
     variants: [measured, filled]
     returns: [measured_ebr, filled_ebr, difference]
+    implementation: rfrgapfill.metrics.compare_energy_balance
+    row_rule: "a row is used only where every component is present; both ratios share one row set"
+    non_positive_denominator: null     # sum(NETRAD - G) <= 0 is undefined, not a closure
+    denominator_rule_applies_to: "the interval's sum, not each row"
+    reports_denominator: available_energy
+    row_accounting: [n, n_offered, n_missing_measured, n_missing_filled,
+                     n_missing_available_energy]
+    in_validation:
+      record: rfrgapfill.validation.EnergyBalanceCheck
+      offered_rows: "every withheld row (one mask, shared by H and LE)"
+      measured_flux: "genuine measurements only; a pre-filled value counts as missing"
+      by_gap_class: true               # when report_by_gap_class
+      table: ValidationReport.energy_balance_frame
+      in_manifests_of: [H, LE]
   provenance: paper
+
+reporting:
+  module: rfrgapfill.sensitivity
+  computes_metrics: false            # every value comes from a validation run
+  tidy_table:
+    implementation: rfrgapfill.sensitivity.gap_length_table
+    columns: [site, target, method, mode, gap_class, subset, units, n, n_offered, r2, slope, rmse, bias]
+    gap_class_order: [all, short, long, very_long]   # duration order, never alphabetical
+    accepts: [ValidationReport, TargetValidation, tidy DataFrame]
+    metric_dtype: float               # an all-undefined column is missing, not object
+  across_sites:
+    implementation: rfrgapfill.sensitivity.median_across_sites
+    statistic: median
+    quantile_interpolation: linear    # A11
+    skips_undefined_sites: true
+    rejects_repeated_cells: true      # one site must not be weighted twice
+  readable_view:
+    implementation: rfrgapfill.sensitivity.gap_length_pivot
+    duplicate_cells: error            # `pivot`, never `pivot_table`
+  benchmarks:
+    module: rfrgapfill.benchmarks
+    values: rfrgapfill.benchmarks.PUBLISHED_BENCHMARKS
+    source_document: docs/supplement_benchmarks.md
+    source_table: "Supplementary Table S3 (mmc4.docx)"
+    site_population: "94-site complete-analysis subset"
+    blocks: [diel medians, very-long-gap medians, nighttime medians]
+    n_values: 24
+    comparison: rfrgapfill.benchmarks.compare_to_benchmarks
+    asserts_thresholds: false         # reproduction benchmarks, not pass/fail
+    units:
+      nee_model: "umol m-2 s-1"
+      nee_published: "g C m-2 d-1"
+      conversion: rfrgapfill.benchmarks.convert_nee_to_carbon_units
+      conversion_kind: "rate conversion, not an aggregation of half hours into days"
+      mismatched_units: "comparable=false; never differenced"   # A10
+  plotting:
+    module: rfrgapfill.plotting
+    derived_from: reporting tables only
+    dependency: matplotlib
+    dependency_required: false        # optional extra, imported when drawing
+  uncertainty:
+    module: rfrgapfill.uncertainty
+    bias_iqr_across_sites:
+      implementation: rfrgapfill.uncertainty.bias_iqr
+      population: "one bias per site: that site's gap_length_table cell"
+      grouped_by: [target, method, mode, gap_class, subset, units, igbp]
+      igbp: "optional site metadata; pooled rows labelled all; unclassified sites pooled only"
+      columns: [target, method, mode, gap_class, subset, igbp, units, n_sites,
+                n_sites_offered, bias_q1, bias_median, bias_q3, bias_iqr]
+      quantile_interpolation: linear  # A11
+      iqr_needs_defined_values: 2
+      undefined_site_bias: skipped
+      rejects_repeated_cells: true
+    bias_iqr_within_site: "TargetValidation.bias_spread_frame (one bias per placed interval)"
+    published_normalized_ranges:
+      values: rfrgapfill.uncertainty.TABLE_S8_RANGES
+      source_table: "Supplementary Table S8 (mmc6.docx)"
+      gap_class: very_long
+      quantity: "bias IQR / joint flux-uncertainty CI"
+      status: experimental            # fixed, not a per-record setting (A8)
+      computed_by_package: false
+      in_published_benchmarks: false  # never reaches compare_to_benchmarks
+  sites:
+    module: rfrgapfill.sites
+    fits_models: false                # per-site results only; sites are never pooled
+    computes_metrics: false
+    metadata:
+      implementation: rfrgapfill.sites.site_metadata
+      source_table: "Supplementary Table S2 (mmc3.docx)"
+      columns: [site_id, latitude, longitude, continent, country, igbp, koppen, start_date,
+                end_date, elevation, instrument_system, height_ratio, included_in_94_site_subset]
+      igbp_vocabulary: rfrgapfill.sites.IGBP_CLASSES
+      instrument_systems: {O: open-path, C: closed-path, M: mixed}
+    site_report:
+      implementation: rfrgapfill.sites.site_report
+      default_metadata: [latitude, longitude, igbp, koppen, instrument_system,
+                         included_in_94_site_subset]
+      site_without_metadata: "rows kept; SiteReportWarning"
+    stratified_summary:
+      implementation: rfrgapfill.sites.stratified_summary
+      grouped_by: [target, method, mode, gap_class, subset, stratum, units]
+      default_stratifier: igbp
+      pooled_label: all
+      statistics: [q1, median, q3, iqr]
+      quantile_interpolation: linear  # A11
+    method_differences:
+      implementation: rfrgapfill.sites.method_differences
+      sign: "method - baseline"       # the Table S10 convention
+      improvement_direction: {r2: higher, slope: closer to 1, rmse: lower, bias: closer to 0}
+      improvement_required: false
+    welch:
+      implementation: rfrgapfill.sites.welch_comparison
+      test: "Welch unequal-variance t-test; per-site values as independent samples"
+      default_confidence: 0.95
+      published: rfrgapfill.sites.TABLE_S10_COMPARISONS
+      comparison: rfrgapfill.sites.compare_to_table_s10
+      asserts_significance: false
+    published_site_tables:
+      readers: [read_table_s2, read_tables_s4_to_s6, read_table_s9]
+      shipped_with_package: false     # publisher material; parsed from a local copy
+      evidence: rfrgapfill.sites.site_level_evidence
+      rfr3_nee_sites: 194             # Table S9
+      rfr10_sites: 94                 # Tables S4-S6
+    thresholds: none
+  provenance: default
 
 data_assumptions:
   reference_resolution: "30min"
@@ -253,6 +511,31 @@ data_assumptions:
     - "<target>_is_filled"
     - "<target>_fill_method"
     - "<target>_model_version"
+
+operational_fill:
+  module: rfrgapfill.fill
+  implementation: rfrgapfill.fill.RFRGapFiller
+  training_rows: "observed only: present, finite, and QC-accepted"
+  prefilled_target_values:
+    trained_on: false
+    used_for_daily_statistics: false
+    overwritten_by_default: false
+    opt_in: refill_pre_filled
+    fill_method_label: pre_filled
+  predicted_rows: "target gaps only; a present value is never replaced by default"
+  incomplete_predictor_rows:
+    default: "left unfilled, labelled unfilled_incomplete_features"
+    alternative: "raise, via on_incomplete='raise'"
+    imputed: false
+  input_frame_mutated: false
+  time_distance_origin: "fixed at fit; reused by fill so the feature keeps its meaning"
+  fill_method_values:
+    observed: "QC-accepted measurement carried through"
+    pre_filled: "value of another provenance, carried through"
+    unfilled_incomplete_features: "no value; predictors incomplete"
+    model: "the arm label: RFR3 | RFR10 | ORF3 | ORF10"
+  report: rfrgapfill.fill.FillReport
+  long_gap_consequence: "see A4; a whole-day gap has no daily statistics and cannot be filled"
 
 reproducibility:
   seeded_components: [artificial_gap_selection, random_forest, cross_validation]
@@ -274,12 +557,24 @@ reproducibility:
     - daily_statistics_strategy
     - achieved_gap_fraction_and_mix
   manifest_format: [json, yaml]
+  module: rfrgapfill.provenance
+  implementation: rfrgapfill.provenance.RunManifest
+  constructors: [RunManifest.from_fill, RunManifest.from_validation]
+  required_fields_checked: rfrgapfill.provenance.REQUIRED_FIELDS
+  required_fields_gate: RunManifest.require_complete
+  gap_manifest_required_for: [validation]
+  hemisphere_required_when: "the season feature is built (not for ORF)"
+  ambiguities_reported: rfrgapfill.provenance.ambiguity_choices
+  settings_digest: "sha256 over versions + target + validated configuration only"
+  undefined_values: "null, never NaN"
+  export: "RunManifest.to_json / save; to_dict is a plain mapping, so any YAML library serialises it"
 
 known_ambiguities:
   - id: A1
     topic: "GridSearchCV hyperparameter grid not enumerated"
-    default: "documented package grid; fluxlib grid only as named preset"
-    config: hyperparameter_grid
+    default: "documented package grid; the archived fluxlib grids as named presets"
+    presets: [package_default, legacy_fluxlib, legacy_fluxlib_fixed]
+    config: [hyperparameter_grid, hyperparameter_preset]
   - id: A2
     topic: "radiation category boundaries at exactly 10 and 100 W m-2"
     default: "inclusive exhaustive bins, medium_inclusive"
@@ -287,6 +582,9 @@ known_ambiguities:
   - id: A3
     topic: "20/30/50 mix = gap events or withheld half-hours"
     default: missing_records
+    alternatives: [gap_events]
+    both_implemented: rfrgapfill.gaps.allocate_gaps
+    achieved_mix_reported_on_both_bases: true
     config: allocation_basis
   - id: A4
     topic: "daily target statistics when a whole day or longer has no visible observations"
@@ -302,16 +600,19 @@ known_ambiguities:
     config: cv_strategy
   - id: A6
     topic: "whether legacy fluxlib daily statistics were leakage-safe"
+    resolved: "no - fluxlib 0.0.23 computes them before the artificial gaps are applied"
+    evidence: docs/fluxlib_audit.md
     default: paper_safe
+    alternatives: [legacy_fluxlib]
     config: feature_mode
   - id: A7
     topic: "exact 25% withheld fraction not always achievable"
     default: "report achieved fraction against documented tolerance"
     config: [missing_fraction, tolerance]
   - id: A8
-    topic: "denominator of normalized joint-uncertainty ratio not reconstructed"
-    default: "bias IQR only; normalized ratios experimental"
-    config: experimental_module
+    topic: "denominator of normalized joint-uncertainty ratio not reconstructed; IQR population unstated"
+    default: "bias IQR across sites and across gaps; published ratios carried as experimental data, never computed"
+    config: rfrgapfill.uncertainty
   - id: A9
     topic: "hemisphere inference at the equator"
     default: "latitude >= 0 -> north; explicit hemisphere overrides"
@@ -319,4 +620,16 @@ known_ambiguities:
   - id: A10
     topic: "unit conversion from half-hourly model units to Table S3 g C m-2 d-1"
     default: "report model units; explicit documented conversion for benchmarks"
-    config: reproduction_module
+    config: "rfrgapfill.benchmarks.convert_nee_to_carbon_units; units= on gap_length_table"
+    mismatched_units_are_not_compared: true
+  - id: A11
+    topic: "degrees-of-freedom convention for the daily standard deviation, and quantile interpolation"
+    default: "sample standard deviation (ddof=1) and linear quantile interpolation"
+    config: daily_std_ddof
+  - id: A12
+    topic: "whether R2 is 1 - SS_res/SS_tot or the squared Pearson correlation"
+    default: residual
+    alternatives: [squared_correlation]
+    fluxlib_evidence: "squared_correlation (scipy linregress rvalue ** 2); docs/fluxlib_audit.md F21"
+    both_implemented: rfrgapfill.metrics.r2
+    config: r2_definition
