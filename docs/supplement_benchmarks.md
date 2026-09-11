@@ -74,13 +74,14 @@ skip when they are absent.
 inspected before any programmatic use; do not infer its role from filename
 ordering.
 
-> **Status note:** the supplementary files are present in the working directory as
-> `1-s2.0-S0168192321004639-mmc1..9.{docx,xlsx}` but are **not tracked in the
-> repository** (publisher-copyright material, git-ignored). The numbers below are
-> transcribed from the project context document and have **not yet been verified
-> against the supplement files themselves**. Until that verification happens, mark
-> tests depending on them with the `supplement` marker and treat the values as
-> provisional.
+> **Verification status.** The supplementary files are **not tracked in the
+> repository** (publisher-copyright material, git-ignored). Section 5 is checked
+> against `mmc9.docx` itself by the `supplement`-marked tests. Sections 2-4 were
+> transcribed from the project context document, and no test parses `mmc4.docx`
+> directly; the `supplement`-marked tests in `tests/test_sites.py` recompute Table
+> S3's medians from the per-site Tables S4-S6 and find the transcribed R2 and
+> slope values to within rounding, with the RMSE discrepancies listed in section 8.
+> Tests that need the files skip when they are absent.
 
 ---
 

@@ -27,7 +27,8 @@ medians as data with an explicit comparison against them, figures drawn from
 those tables, bias-IQR uncertainty diagnostics, and site- and
 ecosystem-stratified reports across a multi-site study, with the Table S10 Welch
 comparison reproduced from the published per-site results. What remains is the
-FLUXNET2015 adapter and the CLI.
+FLUXNET2015 adapter and the CLI; FLUXNET files already work through a column map
+and a few lines of pandas ([`docs/fluxnet.md`](docs/fluxnet.md)).
 
 | Component | State |
 |---|---|
@@ -48,8 +49,142 @@ FLUXNET2015 adapter and the CLI.
 | Legacy `fluxlib` compatibility audit and mode (optional Step 20) | done |
 | Supplementary uncertainty diagnostics (bias IQR, Table S8 as data) | done |
 | Multi-site and ecosystem-stratified reports, Table S10 (Step 20A) | done |
+| User documentation, tested quick start (Step 21) | done |
 | FLUXNET2015 adapter, CLI | not started |
 
+## Documentation
+
+| Page | Read it for |
+|---|---|
+| [`docs/method.md`](docs/method.md) | what the method does and why: drivers, receptive limiter, model, ORF |
+| [`docs/validation.md`](docs/validation.md) | the artificial-gap experiment, leakage safety, reading and comparing results |
+| [`docs/assumptions.md`](docs/assumptions.md) | every point the paper leaves open, the package's conventions, known differences |
+| [`docs/fluxnet.md`](docs/fluxnet.md) | preparing FLUXNET2015 files |
+| [`docs/supplement_benchmarks.md`](docs/supplement_benchmarks.md) | the published numbers, and where each one comes from |
+| [`docs/method_spec.md`](docs/method_spec.md) | the frozen contract the code is tested against |
+
+## Install
+
+Requires Python 3.10+. The package is not on PyPI yet; install it from a clone:
+
+```bash
+git clone https://github.com/paulinkenbrandt/Imputation
+cd Imputation
+
+# with uv
+uv venv
+uv pip install -e ".[dev]"
+
+# or with pip
+python -m venv .venv && .venv/Scripts/activate   # .venv/bin/activate on POSIX
+pip install -e ".[dev]"
+```
+
+`pip install -e .` is enough to use the package; `[dev]` adds the test and lint
+tools. Notebooks and `matplotlib` are the optional `notebooks` extra and are
+never required by the core.
+
+## Quick start
+
+A complete run on a synthetic site, with nothing to download. It validates RFR3
+on NEE, H and LE by hiding known stretches of measured data and predicting them,
+then fills the genuine gaps in LE. It takes about a minute on a laptop, and the
+test suite runs it exactly as written here.
+
+<!-- quickstart:begin -->
+```python
+from rfrgapfill import FeatureConfig, RFRGapFiller, synthetic_site, validate_rfr
+
+site = synthetic_site()  # one seeded year of half-hourly data at 45 deg N
+config = site.config(
+    "RFR3",
+    features=FeatureConfig(daily_statistic_strategy="rolling_available"),  # A4
+    hyperparameter_grid={"n_estimators": (50,)},  # one small point, for speed (A1)
+    n_jobs=-1,
+)
+
+# 1. Artificial-gap validation: hide known stretches, predict them, score them.
+report = validate_rfr(
+    site.frame,
+    config=config,
+    targets=["NEE", "H", "LE"],
+    qc_columns=site.qc_columns(),
+    gaps=site.known_gaps(),
+)
+table = report.to_frame()
+scores = table[table["subset"] == "all"][["target", "gap_class", "n", "r2", "rmse", "bias"]]
+print(scores.round(3).to_string(index=False))
+
+# 2. Real-gap filling: train on the measured rows, fill the genuine gaps.
+filler = RFRGapFiller(config).fit(site.frame, target="LE", qc_column="LE_QC")
+result = filler.fill(site.frame)
+print(result.report.summary())
+print(result.frame["LE_fill_method"].value_counts().to_string())
+```
+<!-- quickstart:end -->
+
+It prints something like this (abridged; the last digits depend on library
+versions):
+
+```text
+target gap_class    n     r2   rmse   bias
+   NEE       all 1309  0.954  1.027 -0.097
+   NEE     short  144  0.935  0.925  0.122
+   NEE      long  573  0.966  1.179 -0.079
+   NEE very_long  592 -0.524  0.881 -0.168
+     H       all 1354  0.956 19.410 -0.742
+   ...
+LE: filled 849 of 849 candidate row(s) with RFR3.
+LE_fill_method
+observed      15130
+pre_filled     1541
+RFR3            849
+```
+
+What each piece is doing:
+
+- `site.config("RFR3", ...)` fills in the site's cadence, latitude, column
+  mapping and seed. With your own data you build an `RFRConfig` directly.
+- `daily_statistic_strategy="rolling_available"` matters: under the default, a
+  gap covering whole days has no daily target statistics, so 7-day and 30-day
+  gaps get no predictions at all ([A4](docs/assumptions.md#a4-days-with-too-few-measured-values)).
+- The one-point grid is for speed. Drop `hyperparameter_grid` to search the
+  package's default grid.
+- `site.known_gaps()` is a fixed plan of one 30-day, two 7-day and three 24-hour
+  gaps. Leave out `gaps=` to draw the paper's scenario instead (about 25% of the
+  measured data, mixed 20/30/50).
+- NEE's 30-day R2 is negative while its RMSE is the smallest of any NEE class.
+  That gap falls in winter, when NEE hardly varies, and R2 compares the error
+  with that tiny variance. Read the metrics together
+  ([`docs/validation.md`](docs/validation.md#read-the-metrics-together)).
+- `result.frame` is a new frame: the input is never modified. `pre_filled` rows
+  were already gap-filled before they reached the package and are left alone.
+
+`python examples/synthetic_example.py` goes further: both configurations, per
+gap class and day/night subset, the energy balance, and the published medians
+printed for reference.
+
+## Expected input
+
+One site at a time, as a pandas `DataFrame` with one row per time step:
+
+- **Time.** A `DatetimeIndex`, or a timestamp column named with `timestamp=`.
+  Numbers are refused as timestamps, because pandas would read them as
+  nanoseconds since 1970. Rows are sorted for you; duplicate timestamps raise
+  unless you choose how to resolve them. Missing rows are fine.
+- **Cadence.** Half-hourly is the paper's; other regular cadences such as hourly
+  work. Declare it with `frequency=` or let it be inferred.
+- **Targets.** One continuous flux column per model. To compare with the paper,
+  name them `NEE` (µmol m-2 s-1), `H` and `LE` (W m-2).
+- **A QC column per target**, strongly recommended. Values in
+  `observed_qc_values` (default `0`, FLUXNET's "measured") are measurements;
+  anything else, including a missing flag, is treated as already gap-filled.
+- **Drivers** for the chosen mode, in the units of the table below. The package
+  neither fills nor converts them.
+- **Latitude or hemisphere**, for the season feature. One is required.
+- **`NETRAD` and `G`** as well, if you want the energy-balance check.
+- **Missing values as `NaN`.** A sentinel such as FLUXNET's `-9999` would be read
+  as a real number.
 ## Specification first
 
 The implementation is checked against a frozen specification rather than against
@@ -73,9 +208,21 @@ default, expose it in configuration, and record it in the ambiguities table.
 Two named configurations, both fitted **per site and per target**:
 
 - **RFR3** — Random Forest plus receptive limiter, using the three
-  MDS-equivalent drivers: downward shortwave radiation, VPD, air temperature.
-- **RFR10** — RFR3 plus net radiation, wind speed, wind direction, soil heat flux,
-  soil temperature, relative humidity, soil water content.
+  MDS-equivalent drivers.
+- **RFR10** — the same, with seven more drivers.
+
+| Driver | Canonical name | FLUXNET2015 column | Units | RFR3 | RFR10 |
+|---|---|---|---|:---:|:---:|
+| Downward shortwave radiation | `shortwave` | `SW_IN_F` | W m-2 | ✓ | ✓ |
+| Vapour pressure deficit | `vpd` | `VPD_F_MDS` | hPa | ✓ | ✓ |
+| Air temperature | `air_temperature` | `TA_F_MDS` | degC | ✓ | ✓ |
+| Net radiation | `net_radiation` | `NETRAD` | W m-2 | | ✓ |
+| Wind speed | `wind_speed` | `WS` | m s-1 | | ✓ |
+| Wind direction | `wind_direction` | `WD` | degrees | | ✓ |
+| Soil heat flux | `soil_heat_flux` | `G_F_MDS` | W m-2 | | ✓ |
+| Soil temperature | `soil_temperature` | `TS_F_MDS` | degC | | ✓ |
+| Relative humidity | `relative_humidity` | `RH` | % | | ✓ |
+| Soil water content | `soil_water_content` | `SWC_F_MDS` | % | | ✓ |
 
 The **receptive limiter** is the paper's feature-engineering stage: a radiation
 category, elapsed hours since the series start, a hemisphere-aware season tag, and
@@ -236,23 +383,6 @@ recent scikit-learn forests would accept `NaN` and quietly impute, which is not 
 rule the paper documents. `predict(..., on_incomplete="raise")` is the fail-loudly
 alternative, and `fit_report` says exactly how many rows went and which feature
 took them.
-
-## Install
-
-Requires Python 3.10+.
-
-```bash
-# with uv
-uv venv
-uv pip install -e ".[dev]"
-
-# or with pip
-python -m venv .venv && .venv/Scripts/activate   # .venv/bin/activate on POSIX
-pip install -e ".[dev]"
-```
-
-Notebooks are not a core or development dependency; install the optional
-`notebooks` extra if you want the example notebook environment.
 
 ## Filling real gaps
 
@@ -685,10 +815,38 @@ plot_gap_length_grid(medians, metric="r2")     # one panel per flux, shared y ax
 `matplotlib` is an optional dependency (`pip install "rfr-gapfill[notebooks]"`),
 imported only when a figure is drawn and named in the error when it is missing.
 
+## Known differences from the paper
+
+The article leaves twelve implementation points open. Each has a default, a
+setting, and a record in every run manifest; none of them may be called paper
+exact. [`docs/assumptions.md`](docs/assumptions.md) explains each one and how to
+change it.
+
+| ID | Open point | Default here |
+|---|---|---|
+| A1 | the `GridSearchCV` grid | a documented 8-candidate grid; `fluxlib`'s grids as named presets |
+| A2 | radiation categories at exactly 10 and 100 W m-2 | `< 10` weak, `10 to 100` medium, `> 100` strong |
+| A3 | whether 20/30/50 counts gap events or withheld records | withheld records; the achieved mix is reported on both bases |
+| A4 | daily statistics for a day with no visible measurements | left missing, so whole-day gaps need a reaching strategy |
+| A5 | cross-validation inside the grid search | 5 unshuffled folds; time-series folds as an enhancement |
+| A6 | whether the original code was leakage safe | it was not; the leakage-safe mode is the default |
+| A7 | hitting exactly 25% withheld | the achieved fraction is reported against a tolerance |
+| A8 | the Table S8 normalized uncertainty ratio | bias IQR reported; the ratio is not computed |
+| A9 | hemisphere at the equator | `latitude >= 0` is north; `hemisphere=` overrides |
+| A10 | units of published NEE RMSE and bias | model units; published cells in other units are not compared |
+| A11 | daily standard deviation and quantile conventions | sample standard deviation, linear quantiles |
+| A12 | which R2 | `1 - SS_res/SS_tot`; squared correlation available |
+
+Beyond those twelve: MDS is not implemented (it appears only as published
+numbers), sites are never pooled into one model, and the supplement disagrees
+with itself in a few places the package records rather than corrects
+([`docs/assumptions.md`](docs/assumptions.md#where-the-supplement-disagrees-with-itself)).
+
 ## Development
 
 ```bash
 pytest              # tests
+pytest -m "not slow and not supplement"   # the fast subset
 ruff check .        # lint
 ruff format .       # format
 mypy                # type check (strict, src/rfrgapfill)
