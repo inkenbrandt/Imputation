@@ -1,0 +1,154 @@
+# Step 23: every pull request is validated automatically, so scientific logic
+# cannot drift silently. Four jobs, all of which must pass:
+#
+#   lint     ruff (lint and format) and strict mypy
+#   test     the full suite with branch coverage, on every supported Python and
+#            on Windows; coverage below [tool.coverage.report] fail_under fails
+#   minimum  the full suite at the oldest dependency versions pyproject.toml
+#            claims to support, so a declared floor cannot quietly become false
+#   package  build the sdist and wheel, check the metadata, install the wheel into
+#            a clean environment and run the README quick start against it
+#
+# Tests marked `supplement` or `fluxnet` skip here: that data is publisher or
+# network material and is never committed.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  FORCE_COLOR: "1"
+
+jobs:
+  lint:
+    name: Lint and types
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: ruff check
+        run: ruff check --output-format=github .
+      - name: ruff format
+        run: ruff format --check .
+      - name: mypy (strict)
+        run: mypy
+
+  test:
+    name: Tests (Python ${{ matrix.python }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: windows-latest
+            python: "3.13"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # The optional extras are installed so their tests run rather than skip:
+      # PyYAML for YAML configuration files, matplotlib for the figures.
+      - name: Install
+        run: python -m pip install -e ".[dev,yaml]" matplotlib
+      - name: pytest with coverage
+        run: python -m pytest --cov --cov-report=term-missing:skip-covered --cov-report=xml
+      - name: Coverage summary
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        run: python -m coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload coverage report
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.xml
+
+  minimum:
+    name: Tests at the dependency floors (Python 3.10)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+      - name: Install uv
+        run: python -m pip install uv
+      # lowest-direct resolves every requirement pyproject.toml names to the
+      # lowest version it allows, and the floors are read from there alone.
+      - name: Install the lowest supported dependencies
+        run: |
+          uv pip install --system --resolution lowest-direct -e .
+          uv pip install --system "pytest>=8.0"
+      - name: Record the versions under test
+        run: uv pip list --system
+      - name: pytest
+        run: python -m pytest
+
+  package:
+    name: Build and smoke-test the wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install build tools
+        run: python -m pip install build twine
+      # build makes the sdist, then the wheel from the sdist, so a file the sdist
+      # forgot breaks this step rather than a user's install.
+      - name: Build the sdist and wheel
+        run: python -m build
+      - name: Check the distribution metadata
+        run: python -m twine check --strict dist/*
+      - name: Install the wheel into a clean environment
+        run: |
+          python -m venv "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/bin/python" -m pip install dist/*.whl pytest
+      # The src layout keeps the checkout off the import path; this proves it.
+      - name: The installed wheel is what imports
+        run: >
+          "$RUNNER_TEMP/smoke/bin/python" -c "import pathlib, rfrgapfill;
+          path = pathlib.Path(rfrgapfill.__file__);
+          assert 'site-packages' in path.parts, path;
+          print(rfrgapfill.__version__, path)"
+      - name: The console script is installed
+        run: |
+          "$RUNNER_TEMP/smoke/bin/rfr-gapfill" --version
+          "$RUNNER_TEMP/smoke/bin/rfr-gapfill" validate --help > /dev/null
+          "$RUNNER_TEMP/smoke/bin/rfr-gapfill" fill --help > /dev/null
+      # tests/test_docs.py executes the README quick start exactly as written.
+      - name: README quick start against the installed wheel
+        run: >
+          "$RUNNER_TEMP/smoke/bin/python" -m pytest -p no:cacheprovider
+          tests/test_docs.py tests/test_scaffold.py
+      - name: Upload the distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/

@@ -8,7 +8,7 @@ abstract: >-
   (RFR) eddy-covariance gap-filling method of Zhu et al. (2022), with explicit
   documentation of every point where the published description is ambiguous.
 type: software
-version: 0.1.0.dev0
+version: 0.1.0
 license: MIT
 authors:
   - family-names: Inkenbrandt

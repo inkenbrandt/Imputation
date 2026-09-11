@@ -1,5 +1,7 @@
 # rfr-gapfill
 
+[![CI](https://github.com/inkenbrandt/Imputation/actions/workflows/ci.yml/badge.svg)](https://github.com/inkenbrandt/Imputation/actions/workflows/ci.yml)
+
 Leakage-safe **Random Forest Robust (RFR)** gap filling for eddy-covariance flux
 data, reproducing the method of:
 
@@ -52,6 +54,8 @@ lines of pandas ([`docs/fluxnet.md`](docs/fluxnet.md)), or through the command l
 | Multi-site and ecosystem-stratified reports, Table S10 (Step 20A) | done |
 | User documentation, tested quick start (Step 21) | done |
 | Command-line interface and configuration files (Step 22) | done |
+| Continuous integration on every pull request (Step 23) | done |
+| Release checklist for 0.1.0 (Step 24) | done |
 | FLUXNET2015 adapter | not started |
 
 ## Documentation
@@ -70,7 +74,7 @@ lines of pandas ([`docs/fluxnet.md`](docs/fluxnet.md)), or through the command l
 Requires Python 3.10+. The package is not on PyPI yet; install it from a clone:
 
 ```bash
-git clone https://github.com/paulinkenbrandt/Imputation
+git clone https://github.com/inkenbrandt/Imputation
 cd Imputation
 
 # with uv
@@ -901,6 +905,7 @@ with itself in a few places the package records rather than corrects
 ```bash
 pytest              # tests
 pytest -m "not slow and not supplement"   # the fast subset
+pytest --cov        # tests with branch coverage; fails below 90%
 ruff check .        # lint
 ruff format .       # format
 mypy                # type check (strict, src/rfrgapfill)
@@ -908,6 +913,19 @@ mypy                # type check (strict, src/rfrgapfill)
 
 Test markers: `slow`, `fluxnet` (needs real FLUXNET2015 input), `supplement`
 (needs the journal supplementary files). None of that data is committed here.
+
+Every pull request and every push to `main` runs
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+
+| Job | What it checks |
+|---|---|
+| Lint and types | `ruff check`, `ruff format --check`, strict `mypy` |
+| Tests | the full suite with branch coverage, on Python 3.10 to 3.14 and on Windows; the `yaml` extra and matplotlib are installed so their tests run |
+| Dependency floors | the full suite on Python 3.10 at the lowest version of every dependency `pyproject.toml` allows, so a declared minimum cannot quietly become false |
+| Package | builds the sdist and the wheel from it, runs `twine check`, installs the wheel into a clean environment and runs the README quick start and the console script against it |
+
+The `supplement` and `fluxnet` tests skip in CI because their data is not in the
+repository. Run them locally before changing anything they cover.
 
 ## Citing
 

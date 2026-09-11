@@ -1138,34 +1138,59 @@ Every pull request receives automatic validation.
 
 Before version `0.1.0`:
 
-- [ ] RFR3 implemented.
-- [ ] RFR10 implemented.
-- [ ] ORF/no-receptive-limiter baseline implemented.
-- [ ] radiation tag tested.
-- [ ] time-distance feature tested.
-- [ ] Northern and Southern season tags tested.
-- [ ] daily Q1/Q2/Q3/std tested.
-- [ ] leakage test passes.
-- [ ] 24-hour artificial gaps tested.
-- [ ] 7-day artificial gaps tested.
-- [ ] 30-day artificial gaps tested.
-- [ ] shared multi-target gap mask tested.
-- [ ] R2 tested.
-- [ ] slope tested.
-- [ ] RMSE tested.
-- [ ] bias tested.
-- [ ] day/night metrics tested.
-- [ ] EBR tested.
-- [ ] Bias-IQR by gap class tested.
-- [ ] Supplementary Table S3 benchmark values documented.
-- [ ] Site/IGBP metadata can be retained in multi-site reports.
-- [ ] random-seed reproducibility tested.
-- [ ] save/load tested.
-- [ ] source distribution and wheel build.
-- [ ] clean-environment install tested.
-- [ ] README example executes.
-- [ ] citation file included.
-- [ ] scientific ambiguities documented.
+- [x] RFR3 implemented.
+- [x] RFR10 implemented.
+- [x] ORF/no-receptive-limiter baseline implemented.
+- [x] radiation tag tested.
+- [x] time-distance feature tested.
+- [x] Northern and Southern season tags tested.
+- [x] daily Q1/Q2/Q3/std tested.
+- [x] leakage test passes.
+- [x] 24-hour artificial gaps tested.
+- [x] 7-day artificial gaps tested.
+- [x] 30-day artificial gaps tested.
+- [x] shared multi-target gap mask tested.
+- [x] R2 tested.
+- [x] slope tested.
+- [x] RMSE tested.
+- [x] bias tested.
+- [x] day/night metrics tested.
+- [x] EBR tested.
+- [x] Bias-IQR by gap class tested.
+- [x] Supplementary Table S3 benchmark values documented.
+- [x] Site/IGBP metadata can be retained in multi-site reports.
+- [x] random-seed reproducibility tested.
+- [x] save/load tested.
+- [x] source distribution and wheel build.
+- [x] clean-environment install tested.
+- [x] README example executes.
+- [x] citation file included.
+- [x] scientific ambiguities documented.
+
+Checked off for `0.1.0`. Where each item is verified:
+
+| Item | Evidence |
+|---|---|
+| RFR3, RFR10 | `tests/test_config.py` (driver sets), `tests/test_schema.py`, `tests/test_features.py` |
+| ORF baseline | `tests/test_features.py`, `tests/test_model.py`, `tests/test_config.py` (`as_orf`), `tests/test_leakage.py` |
+| Radiation tag | `tests/test_features.py::test_radiation_*` |
+| Time distance | `tests/test_features.py::test_elapsed_hours_*`, `tests/test_time.py` |
+| Season tags | `tests/test_features.py::test_northern_seasons_for_every_month`, `::test_southern_seasons_for_every_month` |
+| Daily Q1/Q2/Q3/std | `tests/test_features.py::test_daily_statistics_*` |
+| Leakage | `tests/test_leakage.py` |
+| 24 h / 7 d / 30 d gaps | `tests/test_gaps.py::test_each_gap_class_spans_its_configured_elapsed_duration` |
+| Shared multi-target mask | `tests/test_gaps.py::test_joint_validation_uses_one_set_of_gap_locations_for_every_target` |
+| R2, slope, RMSE, bias, EBR | `tests/test_metrics.py` |
+| Day/night metrics | `tests/test_validation.py::test_day_and_night_are_reported_separately` |
+| Bias-IQR by gap class | `tests/test_uncertainty.py::TestBiasIQR`, `tests/test_validation.py::test_bias_spread_is_reported_per_gap_class` |
+| Table S3 values | [`supplement_benchmarks.md`](supplement_benchmarks.md), `tests/test_benchmarks.py` |
+| Site/IGBP metadata | `tests/test_sites.py::TestSiteReport`, `::TestSiteMetadata` |
+| Seed reproducibility | `tests/test_model.py`, `tests/test_gaps.py`, `tests/test_synthetic.py` |
+| Save/load | `tests/test_model.py::test_a_reloaded_model_reproduces_its_predictions`, `tests/test_provenance.py` |
+| Build, clean install | the `package` job in `.github/workflows/ci.yml` |
+| README example | `tests/test_docs.py` |
+| Citation file | [`CITATION.cff`](../CITATION.cff) |
+| Ambiguities | [`assumptions.md`](assumptions.md), [`method_spec.md`](method_spec.md#known-ambiguities) |
 
 ---
 

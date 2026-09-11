@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import scipy
 from scipy import stats
 
 import rfrgapfill
@@ -655,22 +656,39 @@ def welch_study(igbp: dict[str, str] | None = None) -> pd.DataFrame:
     return site_report(study, metadata)
 
 
+#: ``ttest_ind`` results carry ``df`` and ``confidence_interval()`` from scipy 1.11.
+#: The package computes both itself and supports older scipy; only this oracle
+#: needs the newer one, so the dependency floor stays where the package needs it.
+SCIPY_REPORTS_THE_INTERVAL = tuple(int(part) for part in scipy.__version__.split(".")[:2]) >= (
+    1,
+    11,
+)
+
+
 class TestWelchComparison:
     """Table S10's statistic, checked against scipy."""
 
+    def expected(self):
+        return stats.ttest_ind(list(WELCH_RFR3.values()), list(WELCH_MDS.values()), equal_var=False)
+
     def test_it_is_welchs_test(self):
         row = cell(welch_comparison(welch_study(), method="RFR3", baseline="MDS"), metric="r2")
-        expected = stats.ttest_ind(
-            list(WELCH_RFR3.values()), list(WELCH_MDS.values()), equal_var=False
-        )
-        interval = expected.confidence_interval(0.95)
+        expected = self.expected()
         assert row["t_statistic"] == pytest.approx(expected.statistic)
         assert row["p_value"] == pytest.approx(expected.pvalue)
-        assert row["df"] == pytest.approx(expected.df)
-        assert (row["ci_lower"], row["ci_upper"]) == pytest.approx((interval.low, interval.high))
         assert row["mean_difference"] == pytest.approx(
             np.mean(list(WELCH_RFR3.values())) - np.mean(list(WELCH_MDS.values()))
         )
+
+    @pytest.mark.skipif(
+        not SCIPY_REPORTS_THE_INTERVAL, reason="scipy < 1.11 reports no Welch df or interval"
+    )
+    def test_its_degrees_of_freedom_and_interval_are_welchs(self):
+        row = cell(welch_comparison(welch_study(), method="RFR3", baseline="MDS"), metric="r2")
+        expected = self.expected()
+        interval = expected.confidence_interval(0.95)
+        assert row["df"] == pytest.approx(expected.df)
+        assert (row["ci_lower"], row["ci_upper"]) == pytest.approx((interval.low, interval.high))
 
     def test_the_samples_and_the_pairs_are_counted(self):
         row = cell(welch_comparison(welch_study(), method="RFR3", baseline="MDS"), metric="r2")
