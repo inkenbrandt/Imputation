@@ -4,11 +4,13 @@ The paper was validated on FLUXNET2015, and the package's reference column names
 are FLUXNET2015's. The core never requires them: any data works through a
 `ColumnMap`.
 
-> **Status.** The dedicated adapter planned for `rfrgapfill.fluxnet` (a reader,
-> QC helpers, a missing-variable report) is **not implemented yet**. Everything
-> on this page works today with pandas and `ColumnMap.fluxnet2015()`; the adapter
-> will wrap the same steps. Nothing in this package downloads data or holds
-> credentials: obtain FLUXNET2015 files under their own licence.
+> **Two routes.** This page does every step with pandas and
+> `ColumnMap.fluxnet2015()`, so nothing is hidden. The optional adapter,
+> `rfrgapfill.fluxnet`, wraps the same steps: `read_fluxnet_csv` reads a file,
+> `inspect_fluxnet` reports which drivers, fluxes and QC flags it carries, and
+> `qc_summary` describes a flux's flags. Its conventions are recorded in
+> [`fluxnet_adapter.md`](fluxnet_adapter.md). Nothing in this package downloads
+> data or holds credentials: obtain FLUXNET2015 files under their own licence.
 
 [`04_bring_your_own_data.ipynb`](../examples/notebooks/04_bring_your_own_data.ipynb)
 runs every step on this page, including the command line, on a stand-in file

@@ -1,10 +1,36 @@
-"""Receptive-limiter feature transformers.
+"""Receptive-limiter feature engineering.
 
 The receptive limiter is the paper's feature-engineering stage and the only thing
 that distinguishes RFR from the ORF benchmark (``docs/method_spec.md`` section 3,
 Supplementary Figure S1). It is implemented here as four independent, pure
 transformers plus one assembler:
 
+============================  ===========================================
+:func:`radiation_tag`         shortwave radiation -> weak/medium/strong
+:func:`time_distance_hours`   elapsed hours since the series origin
+:func:`season_tag`            calendar month + hemisphere -> season
+:func:`daily_flux_statistics` per-day target Q1/Q2/Q3/std, joined back
+:func:`build_feature_matrix`  drivers + the above, in a deterministic order
+============================  ===========================================
+
+Every transformer is a function of its inputs alone: no fitted state, no global
+configuration, no hidden imputation. Missing input yields missing output rather
+than a default class, so a row with an incomplete predictor is visibly
+incomplete and can be excluded from training by the model layer instead of being
+silently filled with a fabricated value (method_spec.md section 7).
+
+Two properties this module must keep, both of which are pinned by tests:
+
+* **Deterministic feature order.** :func:`feature_names` returns the column order
+  for a configuration and target without needing any data, and
+  :func:`build_feature_matrix` is required to reproduce it exactly. The order is
+  part of the run manifest and of every serialised model.
+* **Leakage safety.** :func:`daily_flux_statistics` derives features *from the
+  target*, so it takes an ``available_mask`` naming the observations visible to
+  the model. Held-out truth never reaches a feature used to predict it
+  (method_spec.md section 3.5). Passing the mask is the caller's job;
+  :mod:`rfrgapfill.leakage` is the workflow that wires it up for artificial-gap
+  validation, and the one place that should be building validation features.
 """
 
 from __future__ import annotations
