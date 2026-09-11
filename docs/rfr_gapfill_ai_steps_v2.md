@@ -4,6 +4,26 @@ These steps are written for an AI coding agent. Work through them in order. Keep
 
 **Primary rule:** do not silently invent details that are absent from Zhu et al. (2022). Preserve unresolved choices as configuration and document them.
 
+## Progress
+
+| Steps | Status | Modules |
+|---|---|---|
+| 1-4 | done | `docs/method_spec.*`, `schema.py`, `config.py`, `time.py` |
+| 5, 5A, 6 | done | `features.py`, `tests/test_features.py` |
+| 7, 8 | done | `model.py`, `fill.py`, `provenance.py` |
+| 9, 10 | done | `gaps.py`, `tests/test_gaps.py` |
+| 11, 12 | done | `metrics.py` |
+| 13 | done | `validation.py` — `validate_rfr()`, `compare_receptive_limiter()` |
+| 19 (EBR) | done | reported by `validate_rfr` for H and LE |
+| 14-18, 20-24 | outstanding | FLUXNET adapter, reproduction benchmarks, multi-site, CLI, CI, release |
+
+Step 6 surfaced a point the paper does not settle, recorded as **A4a** in
+[`method_spec.md`](method_spec.md): a strictly leakage-safe reading makes gaps
+longer than one day unpredictable, which the paper's own 7- and 30-day results
+rule out. The default is a documented leakage-safe fallback
+(`daily_statistics_strategy="nearest_visible_day"`); the strict reading remains
+available and its cost is measurable.
+
 ---
 
 ## Step 1 — Freeze the scientific specification

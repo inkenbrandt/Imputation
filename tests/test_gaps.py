@@ -1,6 +1,4 @@
-"""Artificial-gap generator tests. Covers acceptance tests 15-21 (gap durations,
-seeded reproducibility, observed-fraction rejection, shared masks, achieved
-fraction and class allocation tolerances).
+"""Artificial-gap generator tests. Covers acceptance tests 15-21.
 
 The allocation tests are the substance of ambiguity A3: both readings of the
 paper's 20/30/50 are checked against hand-calculated event counts, so a change to

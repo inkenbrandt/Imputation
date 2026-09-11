@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Leakage-safe Random Forest Robust (RFR) gap filling for eddy-covariance flux data, after Zhu et al. (2022)."
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [{ name = "Paul Inkenbrandt", email = "paulinkenbrandt@gmail.com" }]
 keywords = [
     "eddy covariance",
@@ -23,8 +23,6 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -83,7 +81,7 @@ line-length = 100
 src = ["src", "tests"]
 # Markdown here is specification prose, not formattable source.
 extend-exclude = ["*.md"]
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "NPY", "PD", "RUF"]

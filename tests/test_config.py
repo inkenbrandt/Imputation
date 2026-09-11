@@ -212,7 +212,9 @@ def test_unknown_feature_modes_are_rejected() -> None:
 
 
 def test_min_daily_observations_controls_the_empty_day_policy() -> None:
-    assert FeatureConfig().min_daily_observations == 1
+    # Two, not one: the sample standard deviation of a single value is undefined,
+    # so a day with one observation cannot produce all four daily statistics.
+    assert FeatureConfig().min_daily_observations == 2
     assert FeatureConfig(min_daily_observations=4).min_daily_observations == 4
     with pytest.raises(ConfigError, match="min_daily_observations"):
         FeatureConfig(min_daily_observations=0)
@@ -436,6 +438,15 @@ def test_validation_reports_all_daytime_and_nighttime_by_default() -> None:
     )
     assert ValidationConfig().report_by_gap_class is True
     assert ValidationConfig().bias_iqr_by_gap_class is True
+
+
+def test_metric_subsets_accept_the_short_day_and_night_spellings() -> None:
+    assert MetricSubset.coerce("day") is MetricSubset.DAYTIME
+    assert MetricSubset.coerce("night") is MetricSubset.NIGHTTIME
+    assert ValidationConfig(subsets=["day", "night"]).metric_subsets == (
+        MetricSubset.DAYTIME,
+        MetricSubset.NIGHTTIME,
+    )
 
 
 def test_validation_subsets_are_deduplicated_and_validated() -> None:

@@ -64,5 +64,10 @@ def test_cli_entry_point_runs(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_specification_documents_are_present() -> None:
     docs = Path(__file__).resolve().parents[1] / "docs"
-    for name in ("method_spec.md", "method_spec.yaml", "supplement_benchmarks.md"):
+    for name in (
+        "method_spec.md",
+        "method_spec.yaml",
+        "supplement_benchmarks.md",
+        "fluxnet_adapter.md",
+    ):
         assert (docs / name).is_file(), f"missing specification document: docs/{name}"

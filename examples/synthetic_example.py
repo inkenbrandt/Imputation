@@ -1,227 +1,170 @@
 """Synthetic end-to-end demonstration: RFR3 and RFR10, validated and scored.
 
-Step 17 of the implementation plan, as a runnable script. Builds half-hourly data
-with known diurnal and seasonal structure, places the paper's 24 h / 7 d / 30 d
-artificial gaps over it, and runs **both** published configurations across NEE, H
-and LE on exactly the same withheld intervals, reporting for each:
+Builds half-hourly data with known diurnal and seasonal structure, runs the
+artificial-gap validation of Zhu et al. (2022) over it -- 24-hour, 7-day and
+30-day gaps at a nominal 25% withheld fraction -- and prints the metrics,
+the gap manifest and the energy-balance ratio.
 
-* R2, slope, RMSE and bias (method_spec.md 6.1);
-* the same four over daytime and nighttime rows (6.2);
-* the same four per gap class, with the spread of bias across gaps (6.3);
-* the energy-balance ratio, measured against filled (6.4);
-* the gap manifest the scenario placed (4.4);
-* both arms lined up against gap duration, with the published Table S3
-  medians printed beside them for reference (6.5).
-
-and checks the property the whole design rests on: **no observed value changed**.
-
-Nothing here asserts that RFR10 beats RFR3. On one synthetic site that would not
-be a scientific claim, and the paper's own evidence for it is a distribution
-across 94 sites (see ``docs/supplement_benchmarks.md``).
+The numbers are not the paper's: the site is synthetic, so this demonstrates the
+workflow rather than reproducing a benchmark. What it does show is the shape of
+a real result, including the weak nighttime skill that aggregate-only reporting
+would hide.
 
 Run it with::
 
-    python examples/synthetic_example.py                 # a fast, small grid
-    python examples/synthetic_example.py --full-grid     # the package default
-    python examples/synthetic_example.py --manifests out # write run manifests
+    python examples/synthetic_example.py
 
-Nothing is downloaded: the site is generated from a seed (Step 16).
+It takes a couple of minutes; the grid is kept small on purpose.
 """
 
 from __future__ import annotations
 
-import argparse
-from collections.abc import Mapping
-from pathlib import Path
-
+import numpy as np
 import pandas as pd
 
-from rfrgapfill import (
-    DEFAULT_HYPERPARAMETER_GRID,
-    FeatureConfig,
-    SyntheticSite,
-    ValidationReport,
-    benchmark_table,
-    gap_length_pivot,
-    gap_length_table,
-    synthetic_site,
-    validate_rfr,
-)
+from rfrgapfill import ColumnMap, RFRConfig, validate_rfr
 
-#: Enough trees to be a Random Forest, few enough to run in a coffee break. The
-#: package default grid (A1) is what ``--full-grid`` uses instead.
-QUICK_GRID = {"n_estimators": (100,)}
-
-#: A 7-day gap covers whole calendar days, so under the documented default
-#: ``daily_statistic_strategy="missing"`` it has no daily target statistics and
-#: receives no predictions at all (ambiguity A4). A long-gap run has to choose a
-#: reaching strategy deliberately; this is that choice, and it is recorded in
-#: every manifest the run writes.
-LONG_GAP_STRATEGY = "rolling_available"
-
-TARGETS = ("NEE", "H", "LE")
+#: Deliberately small, so the example runs in a coffee break rather than an hour.
+DEMO_GRID = {"n_estimators": (100,), "min_samples_leaf": (1, 5)}
 
 
-def build_site(days: int, seed: int) -> SyntheticSite:
-    """Return the synthetic site the demonstration runs on."""
-    return synthetic_site(days=days, seed=seed)
+def synthetic_site(*, days: int = 400, seed: int = 0) -> pd.DataFrame:
+    """Return a synthetic half-hourly site with FLUXNET2015 column names.
 
-
-def run_arm(
-    site: SyntheticSite, mode: str, *, full_grid: bool, gaps, jobs: int | None
-) -> ValidationReport:
-    """Validate every target under one driver set, over the given intervals.
-
-    ``jobs`` is passed to the forest, not to the grid search, so one setting
-    cannot multiply into folds x candidates x trees workers. It changes how long
-    the run takes and nothing about what it produces: the forest is seeded.
+    Drivers carry a diurnal and a seasonal cycle; the fluxes are smooth functions
+    of them plus noise. Twelve percent of each flux is then removed and flagged
+    in a ``<target>_QC`` column, standing in for the real gaps every
+    eddy-covariance series has before any artificial ones are added.
     """
-    config = site.config(
-        mode,
-        features=FeatureConfig(daily_statistic_strategy=LONG_GAP_STRATEGY),
-        hyperparameter_grid=DEFAULT_HYPERPARAMETER_GRID if full_grid else QUICK_GRID,
-        n_jobs=jobs,
+    rng = np.random.default_rng(seed)
+    index = pd.date_range("2019-01-01", periods=days * 48, freq="30min", name="timestamp")
+    n = len(index)
+    hour = index.hour + index.minute / 60
+    day_of_year = index.dayofyear
+
+    shortwave = np.clip(800 * np.sin(np.pi * (hour - 5) / 14), 0, None) * (
+        0.7 + 0.3 * np.sin(2 * np.pi * day_of_year / 365)
     )
-    return validate_rfr(
-        site.frame,
-        config=config,
-        targets=list(TARGETS),
-        qc_columns=dict(site.qc_columns()),
-        gaps=gaps,
+    shortwave = np.where((hour < 5) | (hour > 19), 0.0, shortwave) + rng.normal(0, 5, n).clip(0)
+    air_temperature = (
+        12
+        + 10 * np.sin(2 * np.pi * (day_of_year - 100) / 365)
+        + 5 * np.sin(np.pi * (hour - 6) / 12)
+        + rng.normal(0, 1, n)
     )
-
-
-def show_gap_manifest(report: ValidationReport) -> None:
-    """Print the placed intervals and what the scenario achieved."""
-    print("\n== Gap manifest ==")
-    print(report.gaps.summary())
-    frame = report.gaps.to_frame()
-    print(frame.to_string(index=False))
-
-
-def show_metrics(report: ValidationReport) -> None:
-    """Print the core metrics by target, gap class and day/night subset."""
-    print(f"\n== {report.method}: metrics ==")
-    table = report.to_frame().round({"r2": 3, "slope": 3, "rmse": 3, "bias": 3})
-    print(table.to_string(index=False))
-
-    print(f"\n== {report.method}: bias spread across the gaps of each class ==")
-    rows = [
-        {"target": result.target, "gap_class": gap_class.value, **spread.to_dict()}
-        for result in report
-        for gap_class, spread in result.bias_spread.items()
-    ]
-    print(pd.DataFrame(rows).round(3).to_string(index=False))
-
-    if report.energy_balance is not None:
-        balance = report.energy_balance
-        print(f"\n== {report.method}: energy-balance ratio (H + LE) ==")
-        print(
-            f"rows={balance.n}  measured={balance.measured:.4f}  "
-            f"filled={balance.filled:.4f}  difference={balance.difference:+.4f}"
-        )
-
-
-def show_gap_length_comparison(reports: Mapping[str, ValidationReport]) -> None:
-    """Print both arms against gap duration, and the published medians beside them."""
-    table = gap_length_table(list(reports.values()), site="synthetic")
-    print("\n== Skill by gap length: the arms side by side (Step 18) ==")
-    for metric in ("r2", "rmse"):
-        print(f"\n{metric}, all observations:")
-        print(gap_length_pivot(table, metric=metric).round(3).to_string())
-
-    print("\n== The published medians, for reference only ==")
-    print(gap_length_pivot(benchmark_table(), metric="r2", gap_class="all").round(2).to_string())
-    print(
-        "\nThose are medians across the paper's 94 FLUXNET sites "
-        "(docs/supplement_benchmarks.md), not a target this synthetic\n"
-        "site is expected to reach, and no comparison against them is made or "
-        "implied here. A real reproduction run over matching\n"
-        "FLUXNET inputs would aggregate its sites with median_across_sites() and "
-        "call compare_to_benchmarks(), which refuses to\n"
-        "difference NEE RMSE or bias until the units are converted explicitly "
-        "(ambiguity A10)."
+    humidity = np.clip(
+        80 - 0.03 * shortwave - 0.8 * (air_temperature - 12) + rng.normal(0, 4, n), 10, 100
+    )
+    vpd = np.clip(
+        0.61 * np.exp(17.5 * air_temperature / (air_temperature + 241)) * (1 - humidity / 100) * 10,
+        0,
+        None,
+    )
+    net_radiation = 0.75 * shortwave - 40 + rng.normal(0, 8, n)
+    soil_heat = 0.08 * net_radiation + rng.normal(0, 4, n)
+    soil_temperature = (
+        12 + 8 * np.sin(2 * np.pi * (day_of_year - 120) / 365) + rng.normal(0, 0.5, n)
     )
 
-
-def check_observations_untouched(
-    site: SyntheticSite, before: pd.DataFrame, report: ValidationReport
-) -> None:
-    """Verify the run left every measured value exactly as it found it."""
-    print(f"\n== {report.method}: observed values ==")
-    pd.testing.assert_frame_equal(site.frame, before)
-    print("input frame unchanged: yes")
-    for result in report:
-        truth = result.features.truth
-        original = before[result.target].astype(float)
-        pd.testing.assert_series_equal(truth, original, check_names=False)
-        outside = ~result.features.holdout_mask.to_numpy()
-        predicted_outside = int(result.predictions.notna().to_numpy()[outside].sum())
-        print(
-            f"  {result.target}: truth identical to input; "
-            f"{predicted_outside} prediction(s) outside the artificial gaps"
-        )
-
-
-def write_manifests(report: ValidationReport, directory: Path) -> None:
-    """Write one run manifest per target, each checked for completeness."""
-    directory.mkdir(parents=True, exist_ok=True)
-    for result in report:
-        path = directory / f"{report.method}_{result.target}_run.json"
-        report.manifest(result.target).save(path)
-        print(f"  wrote {path}")
+    frame = pd.DataFrame(
+        {
+            "SW_IN_F": shortwave,
+            "VPD_F_MDS": vpd,
+            "TA_F_MDS": air_temperature,
+            "NETRAD": net_radiation,
+            "WS": np.clip(2 + rng.normal(0, 1, n), 0.1, None),
+            "WD": rng.uniform(0, 360, n),
+            "G_F_MDS": soil_heat,
+            "TS_F_MDS": soil_temperature,
+            "RH": humidity,
+            "SWC_F_MDS": np.clip(
+                30 + 5 * np.sin(2 * np.pi * (day_of_year - 60) / 365) + rng.normal(0, 1, n), 5, 60
+            ),
+            "NEE": (
+                1.2 * np.exp(0.07 * (soil_temperature - 10))
+                - 0.04 * shortwave * np.clip(1 - ((air_temperature - 22) / 18) ** 2, 0, 1)
+                + rng.normal(0, 1.2, n)
+            ),
+            "H": (
+                0.30 * (net_radiation - soil_heat)
+                + 1.5 * (air_temperature - 12)
+                + rng.normal(0, 15, n)
+            ),
+            "LE": np.clip(
+                0.45 * (net_radiation - soil_heat) * (1 - np.exp(-vpd / 8)) + rng.normal(0, 12, n),
+                -20,
+                None,
+            ),
+        },
+        index=index,
+    )
+    for target in ("NEE", "H", "LE"):
+        flags = np.zeros(n, dtype=int)
+        dropped = rng.random(n) < 0.12
+        flags[dropped] = 1
+        frame.loc[dropped, target] = np.nan
+        frame[f"{target}_QC"] = flags
+    return frame
 
 
 def main() -> int:
-    """Run both published configurations and report what they produced."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--days", type=int, default=365, help="length of the record in days")
-    parser.add_argument("--seed", type=int, default=20220101, help="seed for the whole fixture")
-    parser.add_argument(
-        "--full-grid",
-        action="store_true",
-        help="search the package's documented default grid instead of a single point",
-    )
-    parser.add_argument(
-        "--manifests", type=Path, default=None, help="directory to write run manifests into"
-    )
-    parser.add_argument(
-        "--jobs",
-        type=int,
-        default=-1,
-        help="n_jobs for the forest (-1 uses every core; results are unaffected)",
-    )
-    args = parser.parse_args()
+    """Run the artificial-gap validation on a synthetic site and report it."""
+    frame = synthetic_site()
+    print(f"synthetic site: {len(frame):,} half-hourly rows, {frame.index[0]} to {frame.index[-1]}")
 
-    site = build_site(args.days, args.seed)
-    before = site.frame.copy(deep=True)
+    report = validate_rfr(
+        frame,
+        targets=["NEE", "H", "LE"],
+        config=RFRConfig(
+            mode="RFR10",
+            frequency="30min",
+            latitude=51.5,
+            site_id="SYN-01",
+            random_state=42,
+            n_jobs=-1,
+            column_map=ColumnMap.fluxnet2015("RFR10"),
+            hyperparameter_grid=DEMO_GRID,
+            cv_folds=3,
+        ),
+        qc_columns={"NEE": "NEE_QC", "H": "H_QC", "LE": "LE_QC"},
+    )
+
+    gaps = report["NEE"].gaps
     print(
-        f"site {site.site_id}: {len(site.frame)} rows at {site.time_step}, "
-        f"latitude {site.latitude} ({site.hemisphere.value}ern hemisphere)"
+        f"\nartificial gaps: {gaps.n_gaps} intervals withholding "
+        f"{gaps.achieved_fraction:.1%} of the observations "
+        f"(requested {gaps.config.missing_fraction:.0%})"
     )
+    print("achieved mix: " + ", ".join(f"{k.value} {v:.0%}" for k, v in gaps.achieved_mix.items()))
+    if not report.satisfied:
+        print("\nthe requested design was not fully achievable:")
+        for reason in report.warnings:
+            print(f"  - {reason}")
+        print("  read the metrics against the achieved fraction and mix above.")
 
-    # One set of intervals for both arms and all three fluxes, so every number
-    # below is comparable to every other (method_spec.md 4.4).
-    gaps = site.known_gaps()
+    print("\nmetrics (target x gap class x subset):")
+    print(report.metrics_frame().round(3).to_string(index=False))
 
-    reports = {}
-    for mode in ("RFR3", "RFR10"):
-        print(f"\nrunning {mode} on {', '.join(TARGETS)} ...")
-        reports[mode] = run_arm(site, mode, full_grid=args.full_grid, gaps=gaps, jobs=args.jobs)
+    balance = report.energy_balance
+    if balance is not None:
+        print(
+            f"\nenergy-balance ratio over the gaps: measured {balance.measured:.3f}, "
+            f"filled {balance.filled:.3f}, difference {balance.difference:+.3f} "
+            f"({balance.n_rows:,} rows)"
+        )
 
-    show_gap_manifest(reports["RFR3"])
-    for mode, report in reports.items():
-        show_metrics(report)
-        check_observations_untouched(site, before, report)
-        if args.manifests is not None:
-            print(f"\n== {mode}: run manifests ==")
-            write_manifests(report, args.manifests)
-
-    show_gap_length_comparison(reports)
+    print("\nbias IQR by gap class:")
+    for target in report.targets:
+        parts = [
+            f"{gap_class.value} {result.bias_iqr:.3f}"
+            for gap_class, result in report[target].by_gap_class.items()
+        ]
+        print(f"  {target}: " + ", ".join(parts))
 
     print(
-        "\nBoth configurations completed. No metric is asserted to favour either arm: "
-        "one synthetic site is a software check, not evidence about the method."
+        "\nNighttime skill is far weaker than daytime skill above. That is expected "
+        "(see docs/supplement_benchmarks.md) and is why this package never reports "
+        "the aggregate alone."
     )
     return 0
 

@@ -364,6 +364,16 @@ class ColumnMap(FrozenRecord):
             )
         object.__setattr__(self, "variables", MappingProxyType(cleaned))
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Rebuild through the constructor so pickling revalidates.
+
+        The mapping is held in a :class:`~types.MappingProxyType`, which pickle
+        cannot serialise. Reconstructing from a plain dict also means an unpickled
+        instance has been through ``__post_init__`` rather than being restored
+        field by field into a state that could never have been constructed.
+        """
+        return (type(self), (dict(self.variables), self.timestamp))
+
     # -- lookup --------------------------------------------------------------
 
     def __contains__(self, name: object) -> bool:
