@@ -198,8 +198,22 @@ leakage_policy:
       held_out_truth_in_features: forbidden
       empty_day_statistics: missing
     legacy_fluxlib:
-      status: reserved
-      enable_only_with_implementation_evidence: true
+      status: implemented              # Step 20, on implementation evidence
+      evidence: docs/fluxlib_audit.md
+      source: "fluxlib 0.0.23, commit da53256, gapfill/ggapfill.py GFiller.set_stats"
+      module: rfrgapfill.legacy
+      mask_before_feature_computation: false
+      daily_statistics_use_visible_observations_only: false
+      held_out_truth_in_features: reproduced
+      daily_statistics: [max, min, mean, std, p25, p50, p75]
+      target_gaps: "linearly interpolated before the daily statistics"
+      daily_join: "midnight keeps its own day; every other row takes the next day's"
+      time_features: [day_of_year, year]
+      superseded_settings_configurable: false
+      warning: rfrgapfill.legacy.LegacyFluxlibWarning
+      paper_faithful: false
+      method_labels: [RFR3-legacy, RFR10-legacy]
+      not_reproduced: [driver interpolation, prediction-row back-filling]
   silent_mixing_allowed: false
   provenance: default          # A6
 
@@ -290,6 +304,12 @@ model:
   hyperparameter_search: GridSearchCV
   hyperparameter_grid_enumerated_in_paper: false
   grid_provenance: default     # A1
+  hyperparameter_presets:      # RFRConfig.hyperparameter_preset; none is paper exact
+    default: package_default
+    package_default: DEFAULT_HYPERPARAMETER_GRID
+    legacy_fluxlib: "fluxlib GFiller.auto_optimize grid, 288 candidates, cv=3; called by no archived pipeline"
+    legacy_fluxlib_fixed: "max_depth=20, min_samples_leaf=3, min_samples_split=12, n_estimators=100"
+    evidence: docs/fluxlib_audit.md
   cv_strategy_provenance: default  # A5
   train_rows: "valid target and valid required features"
   report_rows_excluded_for_missing_predictors: true
@@ -504,8 +524,9 @@ reproducibility:
 known_ambiguities:
   - id: A1
     topic: "GridSearchCV hyperparameter grid not enumerated"
-    default: "documented package grid; fluxlib grid only as named preset"
-    config: hyperparameter_grid
+    default: "documented package grid; the archived fluxlib grids as named presets"
+    presets: [package_default, legacy_fluxlib, legacy_fluxlib_fixed]
+    config: [hyperparameter_grid, hyperparameter_preset]
   - id: A2
     topic: "radiation category boundaries at exactly 10 and 100 W m-2"
     default: "inclusive exhaustive bins, medium_inclusive"
@@ -528,7 +549,10 @@ known_ambiguities:
     config: cv_strategy
   - id: A6
     topic: "whether legacy fluxlib daily statistics were leakage-safe"
+    resolved: "no - fluxlib 0.0.23 computes them before the artificial gaps are applied"
+    evidence: docs/fluxlib_audit.md
     default: paper_safe
+    alternatives: [legacy_fluxlib]
     config: feature_mode
   - id: A7
     topic: "exact 25% withheld fraction not always achievable"
@@ -555,5 +579,6 @@ known_ambiguities:
     topic: "whether R2 is 1 - SS_res/SS_tot or the squared Pearson correlation"
     default: residual
     alternatives: [squared_correlation]
+    fluxlib_evidence: "squared_correlation (scipy linregress rvalue ** 2); docs/fluxlib_audit.md F21"
     both_implemented: rfrgapfill.metrics.r2
     config: r2_definition

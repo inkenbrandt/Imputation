@@ -71,6 +71,7 @@ from rfrgapfill.features import describe_features
 from rfrgapfill.fill import FillReport, FillResult, RFRGapFiller, method_label
 from rfrgapfill.gaps import GapManifest
 from rfrgapfill.leakage import ValidationFeatureSet
+from rfrgapfill.legacy import LEGACY_DAILY_STATISTIC_RULE, LEGACY_RADIATION_RULE
 from rfrgapfill.model import FitReport, RFRModel
 from rfrgapfill.schema import ColumnMap, ConfigError, FrozenRecord, coerce_enum
 from rfrgapfill.time import TimeAxis, iso_duration
@@ -340,23 +341,36 @@ def ambiguity_choices(config: RFRConfig) -> dict[str, Any]:
         raise ConfigError(f"config must be an RFRConfig, got {type(config).__name__}")
     features = config.features
     scenario = config.validation.gaps
-    grid = {key: list(values) for key, values in config.hyperparameter_grid.items()}
+    # In legacy_fluxlib mode fluxlib's own rules replace A2 and A4, so reporting the
+    # (unused) paper_safe settings there would describe a run that did not happen.
+    legacy = features.mode is FeatureMode.LEGACY_FLUXLIB
+    grid = {key: list(values) for key, values in config.grid.items()}
     default_grid = {key: list(values) for key, values in DEFAULT_HYPERPARAMETER_GRID.items()}
+    preset = config.preset
 
     choices: dict[str, dict[str, Any]] = {
         "A1": {
             "topic": "GridSearchCV hyperparameter grid not enumerated in the article",
             "settings": {
                 "hyperparameter_grid": grid,
+                "hyperparameter_preset": None if preset is None else preset.value,
                 "is_package_default": grid == default_grid,
             },
         },
         "A2": {
             "topic": "radiation-category boundaries at exactly 10 and 100 W m-2",
-            "settings": {
-                "radiation_thresholds": list(features.radiation_thresholds),
-                "boundary_convention": features.convention.value,
-            },
+            "settings": (
+                {
+                    "feature_mode": features.mode.value,
+                    "radiation_thresholds": list(features.radiation_thresholds),
+                    "rule": LEGACY_RADIATION_RULE,
+                }
+                if legacy
+                else {
+                    "radiation_thresholds": list(features.radiation_thresholds),
+                    "boundary_convention": features.convention.value,
+                }
+            ),
         },
         "A3": {
             "topic": "the 20/30/50 mix as gap events or as withheld half-hours",
@@ -364,11 +378,15 @@ def ambiguity_choices(config: RFRConfig) -> dict[str, Any]:
         },
         "A4": {
             "topic": "daily target statistics for a day with too few visible observations",
-            "settings": {
-                "daily_statistic_strategy": features.statistic_strategy.value,
-                "min_daily_observations": features.min_daily_observations,
-                "fallback_window_days": features.fallback_window,
-            },
+            "settings": (
+                {"feature_mode": features.mode.value, "rule": LEGACY_DAILY_STATISTIC_RULE}
+                if legacy
+                else {
+                    "daily_statistic_strategy": features.statistic_strategy.value,
+                    "min_daily_observations": features.min_daily_observations,
+                    "fallback_window_days": features.fallback_window,
+                }
+            ),
         },
         "A5": {
             "topic": "cross-validation details inside GridSearchCV",
@@ -383,7 +401,12 @@ def ambiguity_choices(config: RFRConfig) -> dict[str, Any]:
             "topic": "whether the legacy fluxlib daily statistics were leakage safe",
             "settings": {
                 "feature_mode": features.mode.value,
-                "is_leakage_safe": features.mode is FeatureMode.PAPER_SAFE,
+                "is_leakage_safe": not (legacy and features.use_receptive_limiter),
+                "evidence": (
+                    "fluxlib 0.0.23 computes the daily statistics before the artificial "
+                    "gaps are applied, so held-out values reach them; see "
+                    "docs/fluxlib_audit.md"
+                ),
             },
         },
         "A7": {

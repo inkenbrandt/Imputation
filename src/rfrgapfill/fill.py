@@ -53,7 +53,7 @@ from typing import Any, Final
 import numpy as np
 import pandas as pd
 
-from rfrgapfill.config import RFRConfig
+from rfrgapfill.config import FeatureMode, RFRConfig
 from rfrgapfill.features import (
     DAILY_STATISTIC_SUFFIXES,
     build_feature_matrix,
@@ -124,11 +124,17 @@ def method_label(config: RFRConfig) -> str:
 
     ``"RFR3"``/``"RFR10"`` with the receptive limiter on, ``"ORF3"``/``"ORF10"``
     with it off (method_spec.md 3.6), so a filled column records which of the two
-    produced it rather than only that a forest did.
+    produced it rather than only that a forest did. An RFR arm built with
+    ``feature_mode="legacy_fluxlib"`` is ``"RFR3-legacy"``/``"RFR10-legacy"``, so
+    a table or a median across sites can never pool it with a ``paper_safe`` arm.
+    ORF builds no target-derived feature, so its label ignores the feature mode.
     """
     if not isinstance(config, RFRConfig):
         raise ConfigError(f"config must be an RFRConfig, got {type(config).__name__}")
-    return f"{'ORF' if config.is_orf else 'RFR'}{len(config.drivers)}"
+    label = f"{'ORF' if config.is_orf else 'RFR'}{len(config.drivers)}"
+    if not config.is_orf and config.features.mode is FeatureMode.LEGACY_FLUXLIB:
+        return f"{label}-legacy"
+    return label
 
 
 def fill_column_names(target: str) -> tuple[str, ...]:

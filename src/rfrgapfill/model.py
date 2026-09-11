@@ -13,8 +13,9 @@ Three behaviours here are documented choices rather than paper statements:
 * **The grid is ours** (ambiguity A1). The article states that ``GridSearchCV``
   was used and does not enumerate the grid, so
   :data:`~rfrgapfill.config.DEFAULT_HYPERPARAMETER_GRID` is a package default and
-  is reported as one. An archived ``fluxlib`` grid may be added later as a named
-  preset; nothing here may be labelled paper exact.
+  is reported as one. The grids found in the archived ``fluxlib`` code are named
+  presets (``RFRConfig.hyperparameter_preset``); nothing here may be labelled paper
+  exact.
 * **Rows with a non-finite predictor are dropped at fit and left unpredicted at
   predict.** Recent scikit-learn forests accept ``NaN`` natively, which would
   quietly substitute an undocumented imputation rule for the specification's
@@ -526,13 +527,15 @@ class RFRModel:
         package default rather than a paper value (A1).
         """
         config = self._config
-        grid = {key: list(values) for key, values in config.hyperparameter_grid.items()}
+        grid = {key: list(values) for key, values in config.grid.items()}
+        preset = config.preset
         described: dict[str, Any] = {
             "estimator": "sklearn.ensemble.RandomForestRegressor",
             "target": self._target,
             "mode": config.rfr_mode.value,
             "feature_names": list(self._fitted_names or self._expected_names or ()),
             "hyperparameter_grid": grid,
+            "hyperparameter_preset": None if preset is None else preset.value,
             "hyperparameter_grid_is_package_default": (
                 grid == {key: list(values) for key, values in DEFAULT_HYPERPARAMETER_GRID.items()}
             ),
@@ -710,9 +713,7 @@ class RFRModel:
 
         search: GridSearchCV = GridSearchCV(
             estimator=self._build_estimator(),
-            param_grid={
-                key: list(values) for key, values in self._config.hyperparameter_grid.items()
-            },
+            param_grid={key: list(values) for key, values in self._config.grid.items()},
             cv=self._build_cv(),
             scoring=None,  # the regressor's own score: r2
             refit=True,

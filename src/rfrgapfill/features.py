@@ -46,6 +46,7 @@ from rfrgapfill.config import (
     BoundaryConvention,
     DailyStatisticStrategy,
     FeatureConfig,
+    FeatureMode,
     RFRConfig,
 )
 from rfrgapfill.schema import SHORTWAVE, ColumnMap, ConfigError, Hemisphere
@@ -722,10 +723,20 @@ def receptive_limiter_features(
     holds by construction rather than by two lists being kept in step by hand.
     The ORF benchmark tests assert exactly that ORF drops this tuple and keeps
     everything else (method_spec.md 3.6).
+
+    With ``feature_mode="legacy_fluxlib"`` the tuple is ``fluxlib``'s instead -
+    seven daily statistics, then season code, radiation rank, day of year and year
+    (:func:`rfrgapfill.legacy.legacy_feature_names`) - under names disjoint from
+    the ``paper_safe`` ones, so a model fitted in one mode rejects the other.
     """
     features = config.features if isinstance(config, RFRConfig) else config
     if not features.use_receptive_limiter:
         return ()
+    if features.mode is FeatureMode.LEGACY_FLUXLIB:
+        # Imported here because rfrgapfill.legacy builds on this module's helpers.
+        from rfrgapfill.legacy import legacy_feature_names
+
+        return legacy_feature_names(target)
     names = [RADIATION_CATEGORY, TIME_DISTANCE_HOURS, SEASON]
     if target is not None:
         names += list(daily_statistic_names(target))
@@ -806,6 +817,29 @@ def build_feature_matrix(
         if target not in data.columns:
             raise FeatureError(f"target column {target!r} is not in the data")
 
+        if features.mode is FeatureMode.LEGACY_FLUXLIB:
+            # fluxlib's derivation, in its own columns; `origin` and `encode` do not
+            # apply, since it has no elapsed-hours feature and its tags are integers.
+            from rfrgapfill.legacy import build_legacy_features
+
+            legacy = build_legacy_features(
+                data[target],
+                data[columns.column(SHORTWAVE)],
+                hemisphere=config.resolve_hemisphere(),
+                target_name=target,
+                available_mask=available_mask,
+                thresholds=features.radiation_thresholds,
+            )
+            for name in legacy.columns:
+                matrix[name] = legacy[name].to_numpy(dtype=float)
+            expected_legacy = feature_names(config, target=target)
+            assert tuple(matrix.columns) == expected_legacy, (
+                f"feature order drifted from feature_names(): "
+                f"{tuple(matrix.columns)} != {expected_legacy}"
+            )
+            legacy_matrix: pd.DataFrame = matrix
+            return legacy_matrix
+
         matrix[RADIATION_CATEGORY] = radiation_tag(
             data[columns.column(SHORTWAVE)], config=features
         ).to_numpy()
@@ -867,7 +901,11 @@ def describe_features(
         "feature_names": list(feature_names(config, target=target)),
         "target": target,
     }
-    if features.use_receptive_limiter:
+    if features.use_receptive_limiter and features.mode is FeatureMode.LEGACY_FLUXLIB:
+        from rfrgapfill.legacy import describe_legacy_features
+
+        described.update(describe_legacy_features(config))
+    elif features.use_receptive_limiter:
         described.update(
             {
                 "radiation_thresholds": list(features.radiation_thresholds),

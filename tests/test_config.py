@@ -200,9 +200,10 @@ def test_paper_safe_is_the_default_feature_mode() -> None:
     assert FeatureConfig().use_receptive_limiter is True
 
 
-def test_legacy_fluxlib_mode_is_reserved_and_refused_until_evidence_exists() -> None:
-    with pytest.raises(ConfigError, match="reserved and not implemented"):
-        FeatureConfig(feature_mode="legacy_fluxlib")
+def test_legacy_fluxlib_mode_is_available_but_never_the_default() -> None:
+    # Implemented in Step 20 on fluxlib evidence; tests/test_legacy.py covers it.
+    assert FeatureConfig(feature_mode="legacy_fluxlib").mode is FeatureMode.LEGACY_FLUXLIB
+    assert FeatureConfig().mode is FeatureMode.PAPER_SAFE
 
 
 def test_unknown_feature_modes_are_rejected() -> None:

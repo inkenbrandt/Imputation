@@ -43,6 +43,7 @@ uncertainty diagnostics and the CLI.
 | Synthetic site generator and known gaps | done |
 | Paper-validation workflow (`validate_rfr`) | done |
 | Gap-length sensitivity tables, published benchmarks, plots | done |
+| Legacy `fluxlib` compatibility audit and mode (optional Step 20) | done |
 | FLUXNET2015 adapter, supplementary uncertainty diagnostics, CLI | not started |
 
 ## Specification first
@@ -179,6 +180,25 @@ no complete feature rows at all. The paper does not say what it did here
 `neighbor_day_fallback`, `rolling_available` — all of them drawing only on visible
 observations, and `to_dict()` reports `holdout_rows_with_complete_features` so the
 choice cannot go unnoticed.
+
+### Historical `fluxlib` compatibility
+
+[`docs/fluxlib_audit.md`](docs/fluxlib_audit.md) audits the paper-era `fluxlib`
+code the article cites. That code computes the daily statistics *before* the
+artificial gaps are hidden, so held-out truth reaches its own predictors, and it
+departs from the article in several other places. `feature_mode="legacy_fluxlib"`
+reproduces its derivation so you can measure how much that flatters a score: it
+warns on every validation build, labels its arms `RFR3-legacy` / `RFR10-legacy`,
+and is never paper faithful. `hyperparameter_preset="legacy_fluxlib"` (the
+archived `GridSearchCV` grid) and `"legacy_fluxlib_fixed"` (the parameters its
+pipelines actually fitted) are the matching model settings. No default follows the
+old code.
+
+```python
+historical = config.replace(
+    features=FeatureConfig(feature_mode="legacy_fluxlib"), cv_folds=3
+).with_hyperparameter_preset("legacy_fluxlib_fixed")
+```
 
 ## The Random Forest itself
 

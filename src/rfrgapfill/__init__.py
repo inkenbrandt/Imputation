@@ -33,6 +33,7 @@ from rfrgapfill.benchmarks import (
 )
 from rfrgapfill.config import (
     DEFAULT_HYPERPARAMETER_GRID,
+    HYPERPARAMETER_PRESETS,
     AllocationBasis,
     BoundaryConvention,
     ColumnMap,
@@ -45,6 +46,7 @@ from rfrgapfill.config import (
     GapClass,
     GapScenarioConfig,
     Hemisphere,
+    HyperparameterPreset,
     MetricSubset,
     Mode,
     R2Definition,
@@ -97,6 +99,11 @@ from rfrgapfill.leakage import (
     holdout_mask_from_intervals,
     observed_target_mask,
     require_no_target_leakage,
+)
+from rfrgapfill.legacy import (
+    LegacyFluxlibWarning,
+    build_legacy_features,
+    legacy_feature_names,
 )
 from rfrgapfill.metrics import (
     CoreMetrics,
@@ -208,6 +215,7 @@ __all__ = [
     "FILL_COLUMN_SUFFIXES",
     "GAP_CLASS_ORDER",
     "GAP_MANIFEST_COLUMNS",
+    "HYPERPARAMETER_PRESETS",
     "MANIFEST_FORMAT",
     "MANIFEST_VERSION",
     "METHOD_ORDER",
@@ -256,10 +264,12 @@ __all__ = [
     "GapScenarioGenerator",
     "GapScenarioWarning",
     "Hemisphere",
+    "HyperparameterPreset",
     "IncompletePolicy",
     "InsufficientTrainingDataError",
     "KnownGap",
     "LeakageError",
+    "LegacyFluxlibWarning",
     "MetricError",
     "MetricSubset",
     "Mode",
@@ -297,6 +307,7 @@ __all__ = [
     "bias",
     "bias_iqr",
     "build_feature_matrix",
+    "build_legacy_features",
     "build_validation_features",
     "compare_energy_balance",
     "compare_to_benchmarks",
@@ -316,6 +327,7 @@ __all__ = [
     "hide_target",
     "holdout_mask_from_intervals",
     "known_gap_manifest",
+    "legacy_feature_names",
     "load_manifest",
     "median_across_sites",
     "method_label",

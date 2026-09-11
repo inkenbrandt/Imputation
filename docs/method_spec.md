@@ -193,9 +193,18 @@ when one does. Both run with and without the frame-level hiding, so the mask is
 shown to suffice by itself. In `paper_safe` mode the probe must return nothing,
 for every daily-statistic strategy.
 
-`feature_mode="legacy_fluxlib"` is reserved for a compatibility mode to be added
-only if implementation evidence for a different derivation is found. The two modes
-must never be mixed silently.
+`feature_mode="legacy_fluxlib"` is the compatibility mode, added on implementation
+evidence ([`fluxlib_audit.md`](fluxlib_audit.md)): the paper-era `fluxlib` code
+computes its daily statistics before the artificial gaps are hidden, so held-out
+values reach them. The mode reproduces that derivation - seven statistics, a
+linearly interpolated target, a one-day look-ahead in the join, day of year and
+year in place of elapsed hours, and integer season and radiation tags - in its own
+columns (`rfrgapfill.legacy`). `build_validation_features` warns
+(`LegacyFluxlibWarning`) on every build in this mode, the probe above reports the
+seven statistics, `is_paper_faithful` is false, and RFR arms are labelled
+`RFR3-legacy`/`RFR10-legacy`. The two modes are never mixed silently: their
+target-derived columns are disjoint, so a model fitted in one rejects a matrix
+from the other. It is never a default.
 
 ### 3.6 ORF switch
 
@@ -371,8 +380,13 @@ rows and scores them.
 
 The paper states that `GridSearchCV` was used but does not enumerate the grid. The
 package therefore ships a documented default grid in configuration
-(`hyperparameter_grid`); any archived `fluxlib` grid may be added as a **named
-preset**, never as "paper exact" (ambiguity A1).
+(`hyperparameter_grid`), and the grids found in the archived `fluxlib` code as
+**named presets** (`hyperparameter_preset`), never as "paper exact" (ambiguity
+A1): `legacy_fluxlib` is `GFiller.auto_optimize`'s 288-candidate grid, searched
+there with `cv=3` but called by no archived pipeline, and `legacy_fluxlib_fixed`
+is the single parameter set those pipelines actually fitted
+([`fluxlib_audit.md`](fluxlib_audit.md), F10-F11). A preset and an explicit grid
+must agree; `package_default` is the default.
 
 `rfrgapfill.model.RFRModel` is that estimator plus the search around it, and
 nothing else: it is handed a feature matrix and a target vector, so the same class
@@ -672,15 +686,15 @@ described as reproducing the paper exactly.
 
 | ID | Ambiguity | Default chosen | Configuration |
 |---|---|---|---|
-| A1 | The complete `GridSearchCV` hyperparameter grid is not enumerated in the article. | Documented default grid shipped with the package; any archived `fluxlib` grid only as a named preset. | `hyperparameter_grid` |
-| A2 | Radiation-category boundary handling at exactly 10 and 100 W m-2 is not explicit in the prose. | Inclusive, exhaustive bins: `<10` weak, `10–100` medium, `>100` strong. | `radiation_thresholds`, `boundary_convention` |
-| A3 | The 20/30/50 gap mix may refer to the number of gap events or the number of withheld half-hours. | `missing_records`. Both readings are implemented in `rfrgapfill.gaps.allocate_gaps` (section 4.3); every manifest reports the achieved mix on both bases alongside the one requested. | `allocation_basis` |
-| A4 | Handling of daily target statistics when a whole day or longer interval has too few or no visible observations is unspecified. | `missing`: statistics left missing; affected rows excluded from training and flagged at prediction time rather than imputed. Three reaching alternatives (`within_day_available`, `neighbor_day_fallback`, `rolling_available`) are implemented and leakage safe; a long-gap run must choose one deliberately (section 3.4). | `daily_statistic_strategy`, `min_daily_observations`, `fallback_window_days` |
-| A5 | Cross-validation details inside `GridSearchCV` (fold count, shuffling, temporal blocking) are unspecified. | Conventional `GridSearchCV` folds on the training portion; blocked/time-aware CV offered as a labelled enhancement. | `cv_strategy` |
-| A6 | Whether the historical `fluxlib` implementation computed daily target statistics leakage-safely is unverified. | Leakage-safe `paper_safe` mode is the default; a `legacy_fluxlib` mode is added only on implementation evidence. | `feature_mode` |
+| A1 | The complete `GridSearchCV` hyperparameter grid is not enumerated in the article. | Documented default grid shipped with the package. The archived `fluxlib` grid (`legacy_fluxlib`) and the fixed parameters its pipelines fitted (`legacy_fluxlib_fixed`) are named presets; no archived pipeline calls that grid ([audit](fluxlib_audit.md) F10-F11). | `hyperparameter_grid`, `hyperparameter_preset` |
+| A2 | Radiation-category boundary handling at exactly 10 and 100 W m-2 is not explicit in the prose. | Inclusive, exhaustive bins: `<10` weak, `10–100` medium, `>100` strong. `fluxlib` instead puts a value exactly on a threshold, and a missing one, in a fourth class (F8); only `legacy_fluxlib` reproduces that. | `radiation_thresholds`, `boundary_convention` |
+| A3 | The 20/30/50 gap mix may refer to the number of gap events or the number of withheld half-hours. | `missing_records`. Both readings are implemented in `rfrgapfill.gaps.allocate_gaps` (section 4.3); every manifest reports the achieved mix on both bases alongside the one requested. `fluxlib` apportions records (F14), which supports this default. | `allocation_basis` |
+| A4 | Handling of daily target statistics when a whole day or longer interval has too few or no visible observations is unspecified. | `missing`: statistics left missing; affected rows excluded from training and flagged at prediction time rather than imputed. Three reaching alternatives (`within_day_available`, `neighbor_day_fallback`, `rolling_available`) are implemented and leakage safe; a long-gap run must choose one deliberately (section 3.4). `fluxlib` interpolates the target across every gap first (F3); only `legacy_fluxlib` reproduces that. | `daily_statistic_strategy`, `min_daily_observations`, `fallback_window_days` |
+| A5 | Cross-validation details inside `GridSearchCV` (fold count, shuffling, temporal blocking) are unspecified. | Conventional `GridSearchCV` folds on the training portion; blocked/time-aware CV offered as a labelled enhancement. `fluxlib` used 3 unshuffled folds (F12). | `cv_strategy` |
+| A6 | Whether the historical `fluxlib` implementation computed daily target statistics leakage-safely. | **Resolved by implementation evidence: it did not.** `fluxlib` 0.0.23 computes them before the artificial gaps are applied ([audit](fluxlib_audit.md) F1). `paper_safe` stays the default; `legacy_fluxlib` reproduces the historical derivation, with a warning, for comparison only (section 3.5). | `feature_mode` |
 | A7 | The achieved artificial-missing fraction cannot always hit exactly 25% given real gaps and series boundaries. | Report achieved fraction and class allocation against a documented tolerance. | `missing_fraction`, tolerance |
 | A8 | The denominator of the supplement's normalized joint-uncertainty ratio is not reconstructed, and whether its bias IQR is taken across sites or across gaps is not stated. | Bias IQR reported over both populations (section 6.3), the across-site one as the Table S8 analogue. The published ratios are carried as data fixed at status `experimental`; no ratio is computed. | `rfrgapfill.uncertainty` |
 | A9 | Hemisphere inference for sites at or very near the equator. | `latitude >= 0 -> north`; an explicit `hemisphere` always overrides. | `hemisphere`, `latitude` |
 | A10 | Units of Table S3 NEE RMSE/bias (`g C m-2 d-1`) differ from the half-hourly model units (`umol m-2 s-1`); the aggregation from half-hourly residuals to daily carbon units is not spelled out. | Report metrics in model units by default; `compare_to_benchmarks` refuses a cell whose units differ, and `convert_nee_to_carbon_units` applies the rate conversion explicitly (section 6.5). | `rfrgapfill.benchmarks`, `units=` on `gap_length_table` |
 | A11 | The paper names the daily standard deviation but not its degrees-of-freedom convention, nor the quantile interpolation behind Q1/Q2/Q3. | Sample standard deviation (`ddof=1`, the pandas default) and linear quantile interpolation (the numpy/pandas default). | `daily_std_ddof` |
-| A12 | `R2` is reported beside a regression slope without saying whether it is `1 - SS_res/SS_tot` or the squared Pearson correlation of that regression. | `residual` (`1 - SS_res/SS_tot`), the only one of the two a systematic offset can lower. Both are implemented; the two coincide in the regime Table S3 sits in, so neither is paper exact (section 6.1). | `r2_definition` |
+| A12 | `R2` is reported beside a regression slope without saying whether it is `1 - SS_res/SS_tot` or the squared Pearson correlation of that regression. | `residual` (`1 - SS_res/SS_tot`), the only one of the two a systematic offset can lower. Both are implemented; the two coincide in the regime Table S3 sits in, so neither is paper exact (section 6.1). `fluxlib` computes the squared correlation (`linregress(...).rvalue ** 2`, [audit](fluxlib_audit.md) F21), so `squared_correlation` is the setting for a historical comparison; the default is kept for its bias sensitivity. | `r2_definition` |

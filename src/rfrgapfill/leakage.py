@@ -39,6 +39,7 @@ none of this, because a genuinely missing value is already invisible.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -46,7 +47,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from rfrgapfill.config import DEFAULT_OBSERVED_QC_VALUES, RFRConfig
+from rfrgapfill.config import DEFAULT_OBSERVED_QC_VALUES, FeatureMode, RFRConfig
 from rfrgapfill.features import (
     FeatureError,
     _as_boolean_mask,  # module-private helper, shared inside the package only
@@ -55,6 +56,7 @@ from rfrgapfill.features import (
     describe_features,
     feature_names,
 )
+from rfrgapfill.legacy import LegacyFluxlibWarning, legacy_statistic_names
 from rfrgapfill.schema import ColumnMap, ConfigError
 from rfrgapfill.time import as_datetime_index, interval_mask
 
@@ -402,6 +404,12 @@ def build_validation_features(
     the paired comparison of Supplementary Figure S1 a comparison of the feature
     engineering and nothing else.
 
+    With ``feature_mode="legacy_fluxlib"`` - and only then - steps 2 and 3 are
+    skipped for the daily statistics, which are computed from every *observed*
+    value, held-out ones included, as ``fluxlib`` computed them. Every such call
+    emits a :class:`~rfrgapfill.legacy.LegacyFluxlibWarning`, and
+    :func:`detect_target_leakage` reports the columns affected.
+
     :param holdout: boolean mask of the rows the scenario withholds. Build one
         from gap intervals with :func:`holdout_mask_from_intervals`.
     :param qc_column: QC/provenance column distinguishing measured from
@@ -439,8 +447,30 @@ def build_validation_features(
     # copied out of the frame before the frame is altered.
     truth = pd.Series(data[target].astype(float).to_numpy(dtype=float), index=index, name=target)
 
-    # Step 2.
-    working = hide_target(data, target, holdout=withheld) if mask_target_values else data
+    legacy = (
+        config.features.mode is FeatureMode.LEGACY_FLUXLIB and config.features.use_receptive_limiter
+    )
+    if legacy:
+        # The historical derivation, reproduced on purpose and nowhere else: fluxlib
+        # computed the daily statistics from every observed value before the
+        # holdout was applied, so steps 2 and 3 are skipped for them. The training
+        # rows and the scored rows are still the available and withheld ones.
+        warnings.warn(
+            LegacyFluxlibWarning(
+                "feature_mode='legacy_fluxlib' reproduces fluxlib's daily statistics, "
+                "which are computed before the artificial gaps are hidden: held-out "
+                f"{target} values reach the features used to predict them, so every "
+                "score from this run is optimistic. Use it to measure that effect, "
+                "never as a reproduction of the method (docs/fluxlib_audit.md)."
+            ),
+            stacklevel=2,
+        )
+        working = data
+        statistics_mask = observed_mask
+    else:
+        # Step 2.
+        working = hide_target(data, target, holdout=withheld) if mask_target_values else data
+        statistics_mask = available
 
     # Steps 3 and 4.
     features = build_feature_matrix(
@@ -448,7 +478,7 @@ def build_validation_features(
         config=config,
         target=target if config.features.use_receptive_limiter else None,
         column_map=column_map,
-        available_mask=available,
+        available_mask=statistics_mask,
         origin=index.min() if origin is None else origin,
         encode=encode,
     )
@@ -569,6 +599,17 @@ def require_no_target_leakage(
     leaking = detect_target_leakage(
         data, config=config, target=target, holdout=holdout, magnitude=magnitude, **kwargs
     )
+    if leaking and config.features.mode is FeatureMode.LEGACY_FLUXLIB:
+        historical = legacy_statistic_names(target)
+        raise LeakageError(
+            f"held-out target values changed {len(leaking)} feature column(s): "
+            f"{', '.join(leaking)}. That is what feature_mode='legacy_fluxlib' "
+            "reproduces: fluxlib computed its daily statistics "
+            f"({', '.join(name for name in leaking if name in historical)}) before the "
+            "artificial gaps were hidden, so this check cannot pass in that mode "
+            "(docs/fluxlib_audit.md). Use feature_mode='paper_safe' for a leakage-free "
+            "validation."
+        )
     if leaking:
         expected = daily_statistic_names(target)
         known = tuple(name for name in leaking if name in expected)

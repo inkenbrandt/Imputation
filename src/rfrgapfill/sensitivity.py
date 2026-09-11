@@ -82,7 +82,17 @@ GAP_CLASS_ORDER: Final[tuple[str, ...]] = (POOLED_GAP_CLASS, "short", "long", "v
 SUBSET_ORDER: Final[tuple[str, ...]] = ("all", "daytime", "nighttime")
 
 #: Methods in the order Supplementary Table S3 lists them, benchmark arms last.
-METHOD_ORDER: Final[tuple[str, ...]] = ("MDS", "RFR3", "RFR10", "ORF3", "ORF10")
+METHOD_ORDER: Final[tuple[str, ...]] = (
+    "MDS",
+    "RFR3",
+    "RFR10",
+    "ORF3",
+    "ORF10",
+    # Historical-compatibility arms (feature_mode="legacy_fluxlib"), after the
+    # arms the paper reports, so they read as a comparison rather than a result.
+    "RFR3-legacy",
+    "RFR10-legacy",
+)
 
 #: The four core metrics, as column names (method_spec.md 6.1).
 METRIC_COLUMNS: Final[tuple[str, ...]] = ("r2", "slope", "rmse", "bias")

@@ -48,6 +48,9 @@ __all__ = [
     "DEFAULT_HYPERPARAMETER_GRID",
     "DEFAULT_OBSERVED_QC_VALUES",
     "DEFAULT_RADIATION_THRESHOLDS",
+    "HYPERPARAMETER_PRESETS",
+    "LEGACY_FLUXLIB_FIXED_HYPERPARAMETERS",
+    "LEGACY_FLUXLIB_HYPERPARAMETER_GRID",
     "AllocationBasis",
     "BoundaryConvention",
     "CVStrategy",
@@ -60,6 +63,7 @@ __all__ = [
     "GapClass",
     "GapScenarioConfig",
     "Hemisphere",
+    "HyperparameterPreset",
     "MetricSubset",
     "Mode",
     "R2Definition",
@@ -76,19 +80,44 @@ __all__ = [
 
 
 class FeatureMode(str, Enum):
-    """How target-derived daily statistics are computed (method_spec.md 3.5, A6)."""
+    """How the receptive-limiter features are derived (method_spec.md 3.5, A6)."""
 
     #: Leakage-safe default: daily statistics see only observations visible to the
     #: model, and the artificial-gap mask is built before features are computed.
     PAPER_SAFE = "paper_safe"
-    #: Reserved compatibility mode. Enabled only if implementation evidence for a
-    #: different derivation in the historical ``fluxlib`` code is found.
+    #: Historical compatibility: the feature derivation of ``fluxlib`` 0.0.23, the
+    #: implementation the paper cites - including its computation of the daily
+    #: statistics *before* the artificial gaps are hidden. Never paper faithful and
+    #: never a default; see :mod:`rfrgapfill.legacy` and ``docs/fluxlib_audit.md``.
     LEGACY_FLUXLIB = "legacy_fluxlib"
 
     @classmethod
     def coerce(cls, value: object) -> FeatureMode:
         """Return ``value`` as a :class:`FeatureMode`."""
         return coerce_enum(cls, value, field_name="feature_mode")
+
+
+class HyperparameterPreset(str, Enum):
+    """Named ``GridSearchCV`` grids (method_spec.md section 5, ambiguity A1).
+
+    The article states that ``GridSearchCV`` was used and enumerates no grid, so
+    none of these is the paper's search. The two ``fluxlib`` presets are what the
+    implementation the paper cites contains (``docs/fluxlib_audit.md``).
+    """
+
+    #: :data:`DEFAULT_HYPERPARAMETER_GRID`, this package's documented choice.
+    PACKAGE_DEFAULT = "package_default"
+    #: The grid of ``fluxlib``'s ``GFiller.auto_optimize`` (releases 0.0.13-0.0.29),
+    #: searched there with 3-fold cross-validation. No archived pipeline calls it.
+    LEGACY_FLUXLIB = "legacy_fluxlib"
+    #: The single parameter set every archived ``fluxlib`` pipeline actually
+    #: fitted, with no search at all. A one-point grid, so the search only refits it.
+    LEGACY_FLUXLIB_FIXED = "legacy_fluxlib_fixed"
+
+    @classmethod
+    def coerce(cls, value: object) -> HyperparameterPreset:
+        """Return ``value`` as a :class:`HyperparameterPreset`."""
+        return coerce_enum(cls, value, field_name="hyperparameter_preset")
 
 
 class DailyStatisticStrategy(str, Enum):
@@ -254,14 +283,57 @@ DEFAULT_GAP_MIX: Final[Mapping[GapClass, float]] = MappingProxyType(
 #: The article states that hyperparameters were optimised with ``GridSearchCV`` but
 #: does not enumerate the grid, so this is **our** default and must never be
 #: described as paper exact. It is deliberately small enough to run on a decade of
-#: half-hourly data. An archived ``fluxlib`` grid may be added later as a named
-#: preset alongside it.
+#: half-hourly data. The archived ``fluxlib`` grids sit beside it as named presets
+#: (:data:`HYPERPARAMETER_PRESETS`).
 DEFAULT_HYPERPARAMETER_GRID: Final[Mapping[str, tuple[Any, ...]]] = MappingProxyType(
     {
         "max_features": (1.0, "sqrt"),
         "min_samples_leaf": (1, 5),
         "n_estimators": (100, 300),
     }
+)
+
+#: ``fluxlib``'s ``GFiller.auto_optimize`` grid, verbatim (A1, docs/fluxlib_audit.md).
+#:
+#: 288 candidates, which ``fluxlib`` searched with ``cv=3`` - pair the preset with
+#: ``cv_folds=3`` to repeat that search. Present in every ``fluxlib`` release from
+#: 0.0.13 to 0.0.29 and called by none of the archived pipelines, which is why it is
+#: a named preset rather than a claim about the paper's runs.
+LEGACY_FLUXLIB_HYPERPARAMETER_GRID: Final[Mapping[str, tuple[Any, ...]]] = MappingProxyType(
+    {
+        "bootstrap": (True,),
+        "max_depth": (80, 90, 100, 110),
+        "max_features": (2, 3),
+        "min_samples_leaf": (3, 4, 5),
+        "min_samples_split": (8, 10, 12),
+        "n_estimators": (100, 200, 300, 1000),
+    }
+)
+
+#: The fixed parameters the archived ``fluxlib`` pipelines fitted (A1).
+#:
+#: From ``gapfill/config-examples/ggapfill.yaml`` (releases 0.0.16-0.0.23) and the
+#: artificial-gap notebooks' ``train_rfr(..., n_estimators=100)``. ``max_features``
+#: was left at scikit-learn's default, which for a regressor used every feature then
+#: and does now. The seed and ``n_jobs`` are the run configuration's, as for any grid.
+LEGACY_FLUXLIB_FIXED_HYPERPARAMETERS: Final[Mapping[str, tuple[Any, ...]]] = MappingProxyType(
+    {
+        "max_depth": (20,),
+        "min_samples_leaf": (3,),
+        "min_samples_split": (12,),
+        "n_estimators": (100,),
+    }
+)
+
+#: Every named grid, by preset (A1). None of them is the paper's search.
+HYPERPARAMETER_PRESETS: Final[Mapping[HyperparameterPreset, Mapping[str, tuple[Any, ...]]]] = (
+    MappingProxyType(
+        {
+            HyperparameterPreset.PACKAGE_DEFAULT: DEFAULT_HYPERPARAMETER_GRID,
+            HyperparameterPreset.LEGACY_FLUXLIB: LEGACY_FLUXLIB_HYPERPARAMETER_GRID,
+            HyperparameterPreset.LEGACY_FLUXLIB_FIXED: LEGACY_FLUXLIB_FIXED_HYPERPARAMETERS,
+        }
+    )
 )
 
 #: Estimator parameters the package controls itself; they may not appear in a grid.
@@ -368,12 +440,6 @@ class FeatureConfig(FrozenRecord):
                 f"use_receptive_limiter must be a bool, got {self.use_receptive_limiter!r}"
             )
         mode = FeatureMode.coerce(self.feature_mode)
-        if mode is FeatureMode.LEGACY_FLUXLIB:
-            raise ConfigError(
-                "feature_mode='legacy_fluxlib' is reserved and not implemented: it may be "
-                "enabled only once implementation evidence for a different daily-statistic "
-                "derivation is found (docs/method_spec.md, ambiguity A6). Use 'paper_safe'."
-            )
         object.__setattr__(self, "feature_mode", mode)
         object.__setattr__(
             self, "boundary_convention", BoundaryConvention.coerce(self.boundary_convention)
@@ -419,6 +485,39 @@ class FeatureConfig(FrozenRecord):
             "daily_std_ddof",
             _check_positive_int(self.daily_std_ddof, field_name="daily_std_ddof", minimum=0),
         )
+        if mode is FeatureMode.LEGACY_FLUXLIB:
+            self._require_legacy_defaults()
+
+    def _require_legacy_defaults(self) -> None:
+        """Reject the settings ``legacy_fluxlib`` replaces with ``fluxlib``'s own rules.
+
+        ``fluxlib`` hard-codes the 10 and 100 W m-2 thresholds and its own boundary
+        handling, never leaves a day without statistics (it interpolates the target
+        first, so no A4 strategy applies) and uses pandas' sample standard
+        deviation. Accepting another value here would record a setting that had no
+        effect, which a manifest must never do - the same rule that refuses a
+        ``fallback_window_days`` for a strategy that never leaves the day.
+        """
+        defaults = FeatureConfig()
+        superseded = [
+            name
+            for name in (
+                "radiation_thresholds",
+                "boundary_convention",
+                "min_daily_observations",
+                "daily_statistic_strategy",
+                "fallback_window_days",
+                "daily_std_ddof",
+            )
+            if getattr(self, name) != getattr(defaults, name)
+        ]
+        if superseded:
+            raise ConfigError(
+                "feature_mode='legacy_fluxlib' reproduces fluxlib's own radiation, "
+                "daily-statistic and standard-deviation rules, so these settings would "
+                f"have no effect and cannot be set: {', '.join(superseded)} "
+                "(docs/fluxlib_audit.md)"
+            )
 
     @property
     def mode(self) -> FeatureMode:
@@ -454,14 +553,19 @@ class FeatureConfig(FrozenRecord):
         return replace(self, **changes)
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-serialisable representation for the run manifest."""
+        """Return a JSON-serialisable representation for the run manifest.
+
+        Under ``legacy_fluxlib`` the settings ``fluxlib``'s own rules replace are
+        reported as ``None`` - not applicable - rather than as values nothing used.
+        """
+        legacy = self.mode is FeatureMode.LEGACY_FLUXLIB
         return {
             "use_receptive_limiter": self.use_receptive_limiter,
             "feature_mode": self.mode.value,
             "radiation_thresholds": list(self.radiation_thresholds),
-            "boundary_convention": self.convention.value,
-            "min_daily_observations": self.min_daily_observations,
-            "daily_statistic_strategy": self.statistic_strategy.value,
+            "boundary_convention": None if legacy else self.convention.value,
+            "min_daily_observations": None if legacy else self.min_daily_observations,
+            "daily_statistic_strategy": None if legacy else self.statistic_strategy.value,
             "fallback_window_days": self.fallback_window,
             "daily_std_ddof": self.daily_std_ddof,
         }
@@ -722,8 +826,14 @@ class RFRConfig(FrozenRecord):
     random_state: int = 42
     #: ``n_jobs`` passed to the estimator and the grid search. ``None`` means 1.
     n_jobs: int | None = None
-    #: ``GridSearchCV`` grid. Our documented default, never "paper exact" (A1).
-    hyperparameter_grid: Mapping[str, Sequence[Any]] = DEFAULT_HYPERPARAMETER_GRID
+    #: ``GridSearchCV`` grid. ``None`` takes the grid of ``hyperparameter_preset``.
+    #: However it is given, it is never "paper exact" (A1).
+    hyperparameter_grid: Mapping[str, Sequence[Any]] | None = None
+    #: Named grid to search (:class:`HyperparameterPreset`) - an *input*: it chooses
+    #: the grid when ``hyperparameter_grid`` is ``None`` (``package_default`` when
+    #: both are), must agree with an explicit grid, and is then cleared so the grid
+    #: alone is the source of truth. Read :attr:`preset` for the preset a grid is.
+    hyperparameter_preset: HyperparameterPreset | str | None = None
     #: Cross-validation strategy inside the grid search (A5).
     cv_strategy: CVStrategy | str = CVStrategy.KFOLD
     #: Number of cross-validation folds.
@@ -796,8 +906,13 @@ class RFRConfig(FrozenRecord):
             )
 
         object.__setattr__(
-            self, "hyperparameter_grid", _validate_hyperparameter_grid(self.hyperparameter_grid)
+            self,
+            "hyperparameter_grid",
+            _resolve_hyperparameter_grid(self.hyperparameter_grid, self.hyperparameter_preset),
         )
+        # Cleared once it has chosen the grid, so replace(hyperparameter_grid=...)
+        # never collides with a preset carried over from before (see `preset`).
+        object.__setattr__(self, "hyperparameter_preset", None)
 
         qc_values = self.observed_qc_values
         if isinstance(qc_values, (str, bytes)) or not isinstance(qc_values, Sequence):
@@ -863,11 +978,32 @@ class RFRConfig(FrozenRecord):
         return self.rfr_mode.drivers
 
     @property
+    def grid(self) -> Mapping[str, tuple[Any, ...]]:
+        """The validated ``GridSearchCV`` grid (narrowed from the input union)."""
+        grid = self.hyperparameter_grid
+        assert grid is not None
+        return cast("Mapping[str, tuple[Any, ...]]", grid)
+
+    @property
+    def preset(self) -> HyperparameterPreset | None:
+        """The named preset the grid equals, or ``None`` for a custom grid (A1)."""
+        return _matching_preset(self.grid)
+
+    def with_hyperparameter_preset(self, preset: HyperparameterPreset | str) -> RFRConfig:
+        """Return a copy that searches ``preset``'s grid instead of the current one.
+
+        :meth:`replace` carries the current grid along, so naming a preset alone
+        would be rejected as a disagreement with it; this clears the grid as well.
+        """
+        return self.replace(hyperparameter_preset=preset, hyperparameter_grid=None)
+
+    @property
     def is_paper_faithful(self) -> bool:
         """Whether every option is the paper-faithful default rather than an enhancement.
 
         False as soon as a labelled enhancement is enabled (time-aware CV, shuffled
-        folds) or the receptive limiter is switched off for the ORF benchmark.
+        folds), the receptive limiter is switched off for the ORF benchmark, or the
+        ``legacy_fluxlib`` historical-compatibility feature mode is chosen.
         """
         return (
             self.features.use_receptive_limiter
@@ -970,9 +1106,8 @@ class RFRConfig(FrozenRecord):
             "site_id": self.site_id,
             "random_state": self.random_state,
             "n_jobs": self.n_jobs,
-            "hyperparameter_grid": {
-                key: list(values) for key, values in self.hyperparameter_grid.items()
-            },
+            "hyperparameter_grid": {key: list(values) for key, values in self.grid.items()},
+            "hyperparameter_preset": None if self.preset is None else self.preset.value,
             "cv_strategy": self.cv.value,
             "cv_folds": self.cv_folds,
             "cv_shuffle": self.cv_shuffle,
@@ -1053,6 +1188,36 @@ def require_orf_pairing(rfr: RFRConfig, orf: RFRConfig) -> None:
             "Derive the benchmark with RFRConfig.as_orf() so the comparison measures the "
             "feature engineering and nothing else (docs/method_spec.md 3.6)."
         )
+
+
+def _resolve_hyperparameter_grid(grid: object, preset: object) -> Mapping[str, tuple[Any, ...]]:
+    """Return the validated grid a configuration searches (A1).
+
+    ``grid=None`` takes the named preset's grid - ``package_default`` when no
+    preset is named either. An explicit grid is rejected when it disagrees with the
+    preset named beside it.
+    """
+    named = None if preset is None else HyperparameterPreset.coerce(preset)
+    if grid is None:
+        chosen = HyperparameterPreset.PACKAGE_DEFAULT if named is None else named
+        return _validate_hyperparameter_grid(HYPERPARAMETER_PRESETS[chosen])
+    validated = _validate_hyperparameter_grid(grid)
+    if named is not None and _matching_preset(validated) is not named:
+        raise ConfigError(
+            f"hyperparameter_grid does not match hyperparameter_preset={named.value!r}: "
+            "pass one or the other. To switch the preset of an existing configuration "
+            "use with_hyperparameter_preset(), which also clears the grid it carries."
+        )
+    return validated
+
+
+def _matching_preset(grid: Mapping[str, Sequence[Any]]) -> HyperparameterPreset | None:
+    """Return the preset ``grid`` equals, or ``None`` for a custom grid (A1)."""
+    candidate = {key: tuple(values) for key, values in sorted(grid.items())}
+    for preset, entries in HYPERPARAMETER_PRESETS.items():
+        if candidate == {key: tuple(values) for key, values in sorted(entries.items())}:
+            return preset
+    return None
 
 
 def _validate_hyperparameter_grid(grid: object) -> Mapping[str, tuple[Any, ...]]:
