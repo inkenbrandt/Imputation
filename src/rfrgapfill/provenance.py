@@ -1029,7 +1029,8 @@ def load_manifest(path: str | Path) -> dict[str, Any]:
     Data, not a :class:`RunManifest`: an archived manifest is a record of a run
     that already happened, and rebuilding a live configuration from it would
     invite treating a hand-edited file as a validated one. Read the sections, or
-    build a fresh :class:`~rfrgapfill.config.RFRConfig` from what they say.
+    rebuild the configuration with ``RFRConfig.from_dict(document["config"])``,
+    which runs every setting back through the constructors' validation.
     """
     source = Path(path)
     try:

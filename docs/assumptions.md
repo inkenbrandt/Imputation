@@ -271,6 +271,5 @@ package records these and does not correct them.
 
 - **MDS.** It appears only as published numbers.
 - **The Table S8 normalized uncertainty ratios** (A8).
-- **The FLUXNET2015 adapter and the command-line interface.** FLUXNET data works
-  today with a few lines of pandas ([`fluxnet.md`](fluxnet.md)); the CLI reports
-  its version only.
+- **The FLUXNET2015 adapter.** FLUXNET data works today with a few lines of pandas
+  or through the command line ([`fluxnet.md`](fluxnet.md)).

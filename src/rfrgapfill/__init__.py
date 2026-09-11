@@ -52,6 +52,7 @@ from rfrgapfill.config import (
     R2Definition,
     RFRConfig,
     ValidationConfig,
+    load_config,
     orf_pairing_differences,
     require_orf_pairing,
 )
@@ -363,6 +364,7 @@ __all__ = [
     "holdout_mask_from_intervals",
     "known_gap_manifest",
     "legacy_feature_names",
+    "load_config",
     "load_manifest",
     "median_across_sites",
     "method_differences",

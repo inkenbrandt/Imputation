@@ -149,6 +149,34 @@ result = filler.fill(raw, refill_pre_filled=True)
 The input frame is never modified, and the validation guide explains the output
 ([`validation.md`](validation.md)).
 
+## From the command line
+
+The same run needs no Python at all. `--na-value` and `--timestamp-format` do
+steps 1 and 2 above; the targets keep their FLUXNET names, so the energy-balance
+check is told which columns are H and LE. `XX-Xxx.json` holds the configuration
+above, as `config.to_dict()` would write it:
+
+```bash
+rfr-gapfill validate FLX_XX-Xxx_FLUXNET2015_FULLSET_HH_2005-2014_1-4.csv \
+  --config XX-Xxx.json \
+  --target NEE_VUT_REF --target H_F_MDS --target LE_F_MDS \
+  --qc-column NEE_VUT_REF=NEE_VUT_REF_QC \
+  --qc-column H_F_MDS=H_F_MDS_QC \
+  --qc-column LE_F_MDS=LE_F_MDS_QC \
+  --energy-balance-targets H_F_MDS LE_F_MDS \
+  --timestamp TIMESTAMP_START --timestamp-format %Y%m%d%H%M --na-value -9999 \
+  --output XX-Xxx_validation/
+
+rfr-gapfill fill FLX_XX-Xxx_FLUXNET2015_FULLSET_HH_2005-2014_1-4.csv \
+  --config XX-Xxx.json --target LE_F_MDS --qc-column LE_F_MDS_QC --refill-pre-filled \
+  --timestamp TIMESTAMP_START --timestamp-format %Y%m%d%H%M --na-value -9999 \
+  --output XX-Xxx_LE_filled.csv
+```
+
+The filled file carries ISO timestamps rather than `YYYYMMDDHHMM` integers. The
+README's [command-line section](../README.md#command-line) lists what each
+subcommand writes.
+
 ## Matching the paper's site set
 
 The paper's 194 sites, their IGBP and Köppen classes, instrument systems and

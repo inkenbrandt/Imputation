@@ -6,7 +6,8 @@ and :class:`ValidationConfig`. Every ambiguity recorded in ``docs/method_spec.md
 are rejected at construction rather than in the middle of a fit.
 
 All configuration objects are frozen dataclasses. They validate and normalise in
-``__post_init__``, expose ``to_dict()`` for the run manifest, and are the only
+``__post_init__``, expose ``to_dict()`` for the run manifest and ``from_dict()`` to
+read that form back (:func:`load_config` reads it from a file), and are the only
 place scientific constants live: no science module may define its own thresholds,
 durations, or driver lists.
 
@@ -18,11 +19,13 @@ documented choice, cross-referenced to the ambiguity table in
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import timedelta
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, cast
 
@@ -69,6 +72,7 @@ __all__ = [
     "R2Definition",
     "RFRConfig",
     "ValidationConfig",
+    "load_config",
     "orf_pairing_differences",
     "require_orf_pairing",
 ]
@@ -398,6 +402,70 @@ def _normalise_gap_class_mapping(
     return {gap_class: normalised.get(gap_class, default[gap_class]) for gap_class in GapClass}
 
 
+#: Keys :meth:`RFRConfig.to_dict` computes from the other settings. Read back only
+#: to be checked against what the settings actually imply.
+_DERIVED_SETTINGS: Final[frozenset[str]] = frozenset(
+    {"resolved_hemisphere", "hemisphere_source", "is_paper_faithful"}
+)
+
+#: Settings :meth:`FeatureConfig.to_dict` reports as ``None`` under
+#: ``legacy_fluxlib``, meaning "not applicable" rather than a value.
+_LEGACY_NOT_APPLICABLE: Final[tuple[str, ...]] = (
+    "boundary_convention",
+    "min_daily_observations",
+    "daily_statistic_strategy",
+)
+
+
+def _settings_from(
+    document: object,
+    *,
+    owner: type[Any],
+    section: str,
+    derived: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Return ``document``'s entries as constructor arguments for dataclass ``owner``.
+
+    Keys ``owner`` does not accept are rejected rather than ignored, so a misspelt
+    setting fails instead of silently leaving its default in force. Keys in
+    ``derived`` are dropped; the caller checks them once the object exists.
+    """
+    if not isinstance(document, Mapping):
+        raise ConfigError(f"{section} must be a mapping of settings, got {type(document).__name__}")
+    accepted = {entry.name for entry in fields(owner)}
+    unknown = sorted(str(key) for key in document if key not in accepted and key not in derived)
+    if unknown:
+        raise ConfigError(
+            f"unknown {section} setting(s): {', '.join(unknown)}. "
+            f"Expected any of: {', '.join(sorted(accepted))}"
+        )
+    return {str(key): value for key, value in document.items() if key in accepted}
+
+
+def _column_map_from_dict(value: object) -> ColumnMap:
+    """Return a column mapping from its ``to_dict`` form or from a flat mapping.
+
+    ``{"variables": {...}, "timestamp": ...}`` is what a manifest records; a flat
+    ``{canonical name: column}`` mapping, optionally with a ``timestamp`` entry, is
+    the shorter form to write by hand.
+    """
+    if value is None or isinstance(value, ColumnMap):
+        return ColumnMap.coerce(value)
+    if not isinstance(value, Mapping):
+        raise ConfigError(f"column_map must be a mapping, got {type(value).__name__}")
+    entries = dict(value)
+    timestamp = entries.pop("timestamp", None)
+    variables = entries.pop("variables") if "variables" in entries else entries
+    if variables is not entries and entries:
+        raise ConfigError(
+            "column_map in its structured form takes only 'variables' and 'timestamp', "
+            f"not {', '.join(sorted(map(str, entries)))}"
+        )
+    if not isinstance(variables, Mapping):
+        raise ConfigError(f"column_map variables must be a mapping, got {type(variables).__name__}")
+    return ColumnMap(variables=dict(variables), timestamp=timestamp)
+
+
 # ---------------------------------------------------------------------------
 # FeatureConfig
 # ---------------------------------------------------------------------------
@@ -552,6 +620,22 @@ class FeatureConfig(FrozenRecord):
         """Return a revalidated copy with ``changes`` applied."""
         return replace(self, **changes)
 
+    @classmethod
+    def from_dict(cls, document: Mapping[str, Any]) -> FeatureConfig:
+        """Return the configuration a :meth:`to_dict`-shaped mapping describes.
+
+        Under ``legacy_fluxlib`` the settings :meth:`to_dict` reports as ``None``
+        (not applicable) are read back as absent. Anywhere else ``None`` is passed
+        through and validated, so it can never quietly stand for the default.
+        """
+        settings = _settings_from(document, owner=cls, section="features")
+        mode = FeatureMode.coerce(settings.get("feature_mode", FeatureMode.PAPER_SAFE))
+        if mode is FeatureMode.LEGACY_FLUXLIB:
+            for name in _LEGACY_NOT_APPLICABLE:
+                if name in settings and settings[name] is None:
+                    del settings[name]
+        return cls(**settings)
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable representation for the run manifest.
 
@@ -694,6 +778,11 @@ class GapScenarioConfig(FrozenRecord):
         """Return a revalidated copy with ``changes`` applied."""
         return replace(self, **changes)
 
+    @classmethod
+    def from_dict(cls, document: Mapping[str, Any]) -> GapScenarioConfig:
+        """Return the scenario a :meth:`to_dict`-shaped mapping describes."""
+        return cls(**_settings_from(document, owner=cls, section="validation.gaps"))
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable representation for the run manifest."""
         return {
@@ -783,6 +872,14 @@ class ValidationConfig(FrozenRecord):
     def replace(self, **changes: Any) -> ValidationConfig:
         """Return a revalidated copy with ``changes`` applied."""
         return replace(self, **changes)
+
+    @classmethod
+    def from_dict(cls, document: Mapping[str, Any]) -> ValidationConfig:
+        """Return the configuration a :meth:`to_dict`-shaped mapping describes."""
+        settings = _settings_from(document, owner=cls, section="validation")
+        if isinstance(settings.get("gaps"), Mapping):
+            settings["gaps"] = GapScenarioConfig.from_dict(settings["gaps"])
+        return cls(**settings)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable representation for the run manifest."""
@@ -1091,6 +1188,49 @@ class RFRConfig(FrozenRecord):
         """Return a revalidated copy with ``changes`` applied."""
         return replace(self, **changes)
 
+    @classmethod
+    def from_dict(cls, document: Mapping[str, Any]) -> RFRConfig:
+        """Return the configuration a :meth:`to_dict`-shaped mapping describes.
+
+        The inverse of :meth:`to_dict`, so the ``config`` section of a run manifest
+        rebuilds the configuration it records - through the constructors, which
+        revalidate every setting rather than trusting the document. Nested sections
+        may be given as mappings; ``column_map`` also accepts the flat
+        ``{canonical name: column}`` form, with an optional ``timestamp`` entry.
+
+        Unknown keys are rejected at every level. The keys :meth:`to_dict` derives
+        (``resolved_hemisphere``, ``hemisphere_source``, ``is_paper_faithful``) are
+        accepted only when they agree with what the other settings imply: a file
+        claiming ``is_paper_faithful: true`` for a run that is not must not load.
+        """
+        settings = _settings_from(
+            document, owner=cls, section="configuration", derived=_DERIVED_SETTINGS
+        )
+        if "mode" not in settings:
+            raise ConfigError(
+                "the configuration must name a mode ('RFR3' or 'RFR10'): there is no "
+                "silent default driver set"
+            )
+        if isinstance(settings.get("features"), Mapping):
+            settings["features"] = FeatureConfig.from_dict(settings["features"])
+        if isinstance(settings.get("validation"), Mapping):
+            settings["validation"] = ValidationConfig.from_dict(settings["validation"])
+        if "column_map" in settings:
+            settings["column_map"] = _column_map_from_dict(settings["column_map"])
+        config = cls(**settings)
+
+        rendered = config.to_dict()
+        stale = sorted(
+            key for key in _DERIVED_SETTINGS if key in document and document[key] != rendered[key]
+        )
+        if stale:
+            raise ConfigError(
+                f"derived setting(s) {', '.join(stale)} disagree with the settings they are "
+                "computed from. They are recorded for readers and never read as settings: "
+                "remove them, or correct the settings they describe."
+            )
+        return config
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable representation for the run manifest."""
         hemisphere = self.hemisphere
@@ -1117,6 +1257,68 @@ class RFRConfig(FrozenRecord):
             "column_map": self.columns.to_dict(),
             "is_paper_faithful": self.is_paper_faithful,
         }
+
+
+# ---------------------------------------------------------------------------
+# Configuration files
+# ---------------------------------------------------------------------------
+
+
+def load_config(path: str | Path, **overrides: Any) -> RFRConfig:
+    """Return the :class:`RFRConfig` a JSON or YAML file describes.
+
+    The file holds the mapping :meth:`RFRConfig.from_dict` reads - the shape of
+    :meth:`RFRConfig.to_dict` - so the ``config`` section of a run manifest is a
+    valid configuration file as it stands. ``overrides`` replace top-level
+    settings before anything is validated; the command line's ``--mode`` reaches
+    the configuration this way.
+
+    ``.json`` needs nothing extra. ``.yaml`` and ``.yml`` need PyYAML
+    (``pip install "rfr-gapfill[yaml]"``), which is not a core dependency.
+    """
+    source = Path(path)
+    try:
+        text = source.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise ConfigError(f"configuration file {source} does not exist") from None
+    except OSError as exc:
+        raise ConfigError(f"cannot read configuration file {source}: {exc}") from exc
+
+    document: object
+    suffix = source.suffix.lower()
+    if suffix == ".json":
+        try:
+            document = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"{source} is not valid JSON: {exc}") from None
+    elif suffix in (".yaml", ".yml"):
+        document = _parse_yaml(text, source=source)
+    else:
+        raise ConfigError(
+            f"cannot tell the format of {source}: name the file *.json, *.yaml or *.yml"
+        )
+    if not isinstance(document, Mapping):
+        raise ConfigError(
+            f"{source} must hold a mapping of settings at the top level, "
+            f"got {type(document).__name__}"
+        )
+    return RFRConfig.from_dict({**document, **overrides})
+
+
+def _parse_yaml(text: str, *, source: Path) -> object:
+    """Return the document in YAML ``text``, or explain that PyYAML is needed."""
+    try:
+        import yaml
+    except ImportError:
+        raise ConfigError(
+            f"{source} is YAML, which needs PyYAML: install it with "
+            "'pip install \"rfr-gapfill[yaml]\"', or write the configuration as JSON"
+        ) from None
+    try:
+        document: object = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{source} is not valid YAML: {exc}") from None
+    return document
 
 
 # ---------------------------------------------------------------------------

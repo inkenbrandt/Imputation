@@ -49,6 +49,8 @@ dev = [
 # Notebooks are deliberately NOT a core or dev requirement; the package core
 # must never depend on them.
 notebooks = ["jupyter", "matplotlib"]
+# YAML configuration files for load_config and the CLI. JSON needs nothing extra.
+yaml = ["pyyaml>=6.0"]
 
 [project.urls]
 Homepage = "https://github.com/paulinkenbrandt/Imputation"
@@ -94,7 +96,7 @@ strict = true
 warn_unreachable = true
 
 [[tool.mypy.overrides]]
-module = ["sklearn.*", "scipy.*", "joblib.*", "matplotlib.*"]
+module = ["sklearn.*", "scipy.*", "joblib.*", "matplotlib.*", "yaml", "yaml.*"]
 ignore_missing_imports = true
 
 # numpy's bundled stubs use `type` statements, which mypy cannot parse while

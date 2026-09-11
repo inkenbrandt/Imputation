@@ -26,9 +26,10 @@ gap-length sensitivity tables across arms and sites, the published Table S3
 medians as data with an explicit comparison against them, figures drawn from
 those tables, bias-IQR uncertainty diagnostics, and site- and
 ecosystem-stratified reports across a multi-site study, with the Table S10 Welch
-comparison reproduced from the published per-site results. What remains is the
-FLUXNET2015 adapter and the CLI; FLUXNET files already work through a column map
-and a few lines of pandas ([`docs/fluxnet.md`](docs/fluxnet.md)).
+comparison reproduced from the published per-site results. A command-line
+interface runs validation and filling in batch over the same API. What remains is
+the FLUXNET2015 adapter; FLUXNET files already work through a column map and a few
+lines of pandas ([`docs/fluxnet.md`](docs/fluxnet.md)), or through the command line.
 
 | Component | State |
 |---|---|
@@ -50,7 +51,8 @@ and a few lines of pandas ([`docs/fluxnet.md`](docs/fluxnet.md)).
 | Supplementary uncertainty diagnostics (bias IQR, Table S8 as data) | done |
 | Multi-site and ecosystem-stratified reports, Table S10 (Step 20A) | done |
 | User documentation, tested quick start (Step 21) | done |
-| FLUXNET2015 adapter, CLI | not started |
+| Command-line interface and configuration files (Step 22) | done |
+| FLUXNET2015 adapter | not started |
 
 ## Documentation
 
@@ -82,7 +84,8 @@ pip install -e ".[dev]"
 
 `pip install -e .` is enough to use the package; `[dev]` adds the test and lint
 tools. Notebooks and `matplotlib` are the optional `notebooks` extra and are
-never required by the core.
+never required by the core. PyYAML, needed only to read YAML configuration files,
+is the optional `yaml` extra; JSON configuration files need nothing.
 
 ## Quick start
 
@@ -668,9 +671,10 @@ Two manifests sharing a digest were configured identically.
 
 Reading one back is `load_manifest(path)`, which returns the document as data
 rather than a live configuration: an archived manifest records a run that already
-happened, and rebuilding a configuration from a hand-editable file would invite
-treating it as a validated one. `to_dict()` is a plain mapping, so
-`yaml.safe_dump(manifest.to_dict())` works with any YAML library you already
+happened. To rerun the design it records, `RFRConfig.from_dict(document["config"])`
+rebuilds the configuration through the constructors, which revalidate every
+setting rather than trusting a hand-editable file. `to_dict()` is a plain mapping,
+so `yaml.safe_dump(manifest.to_dict())` works with any YAML library you already
 have; the package takes no dependency on one.
 
 ## Artificial-gap validation
@@ -814,6 +818,56 @@ plot_gap_length_grid(medians, metric="r2")     # one panel per flux, shared y ax
 
 `matplotlib` is an optional dependency (`pip install "rfr-gapfill[notebooks]"`),
 imported only when a figure is drawn and named in the error when it is missing.
+
+## Command line
+
+Batch runs go through `rfr-gapfill`, a thin shell over the same API. The
+configuration file becomes an `RFRConfig` through `load_config`, and the two
+subcommands call `validate_rfr` and `RFRGapFiller` exactly as a script would, so a
+command-line run and a notebook run of one configuration produce the same numbers:
+
+```bash
+rfr-gapfill validate site.csv --target LE --mode RFR10 --config run.json --output validation/
+rfr-gapfill fill site.csv --target LE --mode RFR10 --config run.json \
+  --qc-column LE_QC --output filled.csv
+```
+
+The configuration file is the mapping `RFRConfig.to_dict()` writes, as JSON, or as
+YAML with the `yaml` extra. Only `mode` and what the constructor demands anyway
+are required; every other setting takes its documented default, and a misspelt
+key is refused rather than ignored:
+
+```json
+{
+  "mode": "RFR3",
+  "latitude": 45.0,
+  "site_id": "XX-Xxx",
+  "frequency": "30min",
+  "features": {"daily_statistic_strategy": "rolling_available"},
+  "column_map": {
+    "shortwave": "SW_IN_F", "vpd": "VPD_F_MDS", "air_temperature": "TA_F_MDS",
+    "timestamp": "TIMESTAMP"
+  }
+}
+```
+
+The `config` section of any run manifest is itself a valid configuration file, so
+a recorded design reruns as it stands, and `--mode` overrides the file's mode so
+one file serves both arms.
+
+| Subcommand | Writes |
+|---|---|
+| `validate` | into `--output`: `metrics.csv`, `bias_spread.csv`, `energy_balance.csv`, `gaps.csv`, `predictions.csv`, `summary.txt`, and `<method>_<target>_manifest.json` per target |
+| `fill` | `--output` (the input columns plus the six provenance columns) and `<stem>.manifest.json` beside it |
+
+The command line owns only what the library leaves to its caller: reading the CSV
+(`--na-value -9999` for FLUXNET's missing marker), finding the timestamp column
+(`--timestamp`, or `column_map.timestamp`; `--timestamp-format %Y%m%d%H%M` for an
+integer `TIMESTAMP_START`), and writing results. Every manifest it writes records
+the command line and the SHA-256 of the input and configuration files. Existing
+output is never replaced without `--overwrite`, and a run that cannot proceed
+exits with status 1 and a one-line message. `rfr-gapfill <command> --help` lists
+every option.
 
 ## Known differences from the paper
 
