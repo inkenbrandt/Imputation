@@ -29,9 +29,10 @@ medians as data with an explicit comparison against them, figures drawn from
 those tables, bias-IQR uncertainty diagnostics, and site- and
 ecosystem-stratified reports across a multi-site study, with the Table S10 Welch
 comparison reproduced from the published per-site results. A command-line
-interface runs validation and filling in batch over the same API. What remains is
-the FLUXNET2015 adapter; FLUXNET files already work through a column map and a few
-lines of pandas ([`docs/fluxnet.md`](docs/fluxnet.md)), or through the command line.
+interface runs validation and filling in batch over the same API, and an optional
+FLUXNET2015 adapter reads FULLSET files, reports which drivers and QC flags a site
+carries and builds the column map from them
+([`docs/fluxnet_adapter.md`](docs/fluxnet_adapter.md)).
 
 | Component | State |
 |---|---|
@@ -56,7 +57,7 @@ lines of pandas ([`docs/fluxnet.md`](docs/fluxnet.md)), or through the command l
 | Command-line interface and configuration files (Step 22) | done |
 | Continuous integration on every pull request (Step 23) | done |
 | Release checklist for 0.1.0 (Step 24) | done |
-| FLUXNET2015 adapter | not started |
+| FLUXNET2015 adapter (`rfrgapfill.fluxnet`) | done |
 
 ## Documentation
 
@@ -67,6 +68,7 @@ lines of pandas ([`docs/fluxnet.md`](docs/fluxnet.md)), or through the command l
 | [`docs/validation.md`](docs/validation.md) | the artificial-gap experiment, leakage safety, reading and comparing results |
 | [`docs/assumptions.md`](docs/assumptions.md) | every point the paper leaves open, the package's conventions, known differences |
 | [`docs/fluxnet.md`](docs/fluxnet.md) | preparing FLUXNET2015 files |
+| [`docs/fluxnet_adapter.md`](docs/fluxnet_adapter.md) | the FLUXNET2015 adapter: its QC-flag semantics and naming conventions |
 | [`docs/supplement_benchmarks.md`](docs/supplement_benchmarks.md) | the published numbers, and where each one comes from |
 | [`docs/method_spec.md`](docs/method_spec.md) | the frozen contract the code is tested against |
 

@@ -260,7 +260,13 @@ def read_fluxnet_csv(
     ``pd.read_csv`` followed by :func:`prepare_fluxnet_frame`. The file is a
     local path the user already holds: this package neither downloads FLUXNET
     data nor stores credentials for doing so.
+
+    Numbers are parsed with ``float_precision="round_trip"`` unless the caller
+    says otherwise: pandas' default parser can be one unit in the last place off,
+    which is enough to change a fitted forest, and the command line reads files
+    the same way.
     """
+    read_csv_kwargs.setdefault("float_precision", "round_trip")
     frame = pd.read_csv(path, **read_csv_kwargs)
     return prepare_fluxnet_frame(frame, timestamp=timestamp, sentinel=sentinel)
 

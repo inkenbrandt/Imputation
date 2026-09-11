@@ -206,4 +206,5 @@ The [README](../README.md#filling-real-gaps) shows the call and the columns.
 | `rfrgapfill.sites` | site metadata, ecosystem-stratified reports, the Table S10 Welch test |
 | `rfrgapfill.synthetic` | a deterministic synthetic site to try everything on |
 | `rfrgapfill.legacy` | the historical `fluxlib` feature derivation, for comparison only |
-| `rfrgapfill.fluxnet`, `rfrgapfill.cli` | placeholders: the FLUXNET adapter and the command line are not implemented yet |
+| `rfrgapfill.fluxnet` | the optional FLUXNET2015 adapter: reading, availability and QC reports ([`fluxnet_adapter.md`](fluxnet_adapter.md)) |
+| `rfrgapfill.cli` | `rfr-gapfill validate` and `rfr-gapfill fill`, over the same API |

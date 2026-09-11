@@ -92,7 +92,7 @@ Two boundaries the adapter refuses to cross:
 
 These are choices about the **data product**, not about the method. They carry
 their own `F` identifiers so they can never be confused with the paper's
-ambiguities `A1`–`A10` in [`method_spec.md`](method_spec.md), and none of them
+ambiguities `A1`–`A12` in [`method_spec.md`](method_spec.md), and none of them
 may be described as "paper exact".
 
 | ID | Question | Choice | Configuration |
@@ -132,23 +132,26 @@ section 6.4), which under FLUXNET naming are `H_F_MDS` and `LE_F_MDS`. Pass
 ## Worked example
 
 ```python
-from rfrgapfill import RFRConfig, validate_rfr
+from rfrgapfill import FeatureConfig, RFRConfig, validate_rfr
 from rfrgapfill.fluxnet import inspect_fluxnet, read_fluxnet_csv
 
 frame = read_fluxnet_csv("FLX_XX-Site_FLUXNET2015_FULLSET_HH_2004-2014_1-4.csv")
 info = inspect_fluxnet(frame)
 info.require(info.best_mode)
 
+config = RFRConfig(
+    mode=info.best_mode,
+    frequency="30min",
+    latitude=51.5,          # or hemisphere="north"; the site's own metadata
+    column_map=info.column_map(),
+    features=FeatureConfig(daily_statistic_strategy="rolling_available"),  # A4
+)
 report = validate_rfr(
     frame,
+    config=config,
     targets=list(info.target_columns()),
-    mode=info.best_mode,
-    scenario="zhu2022",
-    column_map=info.column_map(),
     qc_columns=info.qc_columns(),
     energy_balance_targets=info.heat_targets(),
-    latitude=51.5,          # or hemisphere="north"; the site's own metadata
-    frequency="30min",
 )
 ```
 

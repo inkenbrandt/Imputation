@@ -36,7 +36,7 @@ from rfrgapfill.fluxnet import (
     qc_summary,
     read_fluxnet_csv,
 )
-from rfrgapfill.provenance import observed_mask
+from rfrgapfill.leakage import observed_target_mask
 from rfrgapfill.schema import ColumnMapError, Mode
 
 FAST_GRID = {"n_estimators": (25,), "min_samples_leaf": (2,)}
@@ -337,7 +337,7 @@ def test_qc_summary_agrees_with_the_mask_the_package_actually_uses(
     prepared: pd.DataFrame,
 ) -> None:
     summary = qc_summary(prepared, "NEE_VUT_REF_QC", target="NEE_VUT_REF")
-    mask = observed_mask(prepared, "NEE_VUT_REF", qc_column="NEE_VUT_REF_QC")
+    mask = observed_target_mask(prepared, "NEE_VUT_REF", qc_column="NEE_VUT_REF_QC")
     assert summary.n_measured == int(mask.sum())
 
 
@@ -379,11 +379,11 @@ def test_a_raw_fluxnet_frame_can_be_filled_in_a_few_lines(raw: pd.DataFrame) -> 
         cv_folds=3,
     )
     target = FLUXNET2015_FLUXES["LE"]
-    filler = RFRGapFiller(config).fit(frame, target=target, qc_col=info.qc_columns()[target])
-    result = filler.fill()
+    filler = RFRGapFiller(config).fit(frame, target=target, qc_column=info.qc_columns()[target])
+    result = filler.fill(frame)
 
-    assert result.n_filled > 0
-    measured = observed_mask(frame, target, qc_column=FLUXNET2015_FLUX_QC["LE"])
+    assert result.report.filled_rows > 0
+    measured = observed_target_mask(frame, target, qc_column=FLUXNET2015_FLUX_QC["LE"])
     assert np.allclose(
         result.frame.loc[measured, f"{target}_filled"].to_numpy(),
         frame.loc[measured, target].to_numpy(),
