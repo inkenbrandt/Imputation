@@ -34,6 +34,13 @@ metric. It asserts nothing: a cell whose units differ from the published units i
 marked not comparable rather than differenced (ambiguity A10), and no function in
 that module turns a benchmark into a pass/fail threshold.
 
+Section 5's Table S10 is carried as `rfrgapfill.sites.TABLE_S10_COMPARISONS`, and
+`tests/test_sites.py` re-reads this document to check it. The per-site tables
+(S2, S4-S6, S9) are too large to transcribe and are publisher material, so they
+are not carried at all: `rfrgapfill.sites.read_table_s2()`,
+`read_tables_s4_to_s6()` and `read_table_s9()` parse a local copy into the
+package's tidy tables (section 8).
+
 Section 7's Table S8 ranges are carried separately, as
 `rfrgapfill.uncertainty.TABLE_S8_RANGES`, and `tests/test_uncertainty.py`
 re-reads this document to check them in the same way. They are deliberately
@@ -58,8 +65,10 @@ Supplementary files as supplied with the article.
 | `mmc9.docx` | Supplementary Table S10 — Welch-test confidence intervals | section 4 |
 | `mmc7.xlsx` | **Unverified.** Retain as a benchmark data asset. | none until inspected |
 
-All nine files are present in the working directory with the publisher prefix
-`1-s2.0-S0168192321004639-`, and are git-ignored rather than committed.
+All nine files are present locally in `publication/` with the publisher prefix
+`1-s2.0-S0168192321004639-`, and are git-ignored rather than committed. Tests
+marked `supplement` look for them there (or in `$RFRGAPFILL_SUPPLEMENT_DIR`) and
+skip when they are absent.
 
 `mmc7.xlsx` has no assigned role. Its table identity and structure must be
 inspected before any programmatic use; do not infer its role from filename
@@ -159,22 +168,61 @@ aggregate-only reporting would hide it.
 
 ## 5. Statistical comparison benchmarks
 
-**Source:** Supplementary Table S10 (`mmc9.docx`) — mean method differences with
-Welch-test 95% confidence intervals.
+**Source:** Supplementary Table S10 (`mmc9.docx`) — mean method differences
+(`method - baseline`) across the 94-site subset, with Welch-test 95% confidence
+intervals. The supplement's asterisk marks `p > 0.05`; the last column carries it
+wherever it is printed, on the mean or on the interval. Intervals printed in the
+supplement as `8.17×10-02` are written out. Units: R2 and slope are
+dimensionless; RMSE and bias are `W m-2` for H and LE and, per the caption,
+`g C m-2 d-1` for NEE (ambiguity A10).
 
-Selected mean R2 improvements:
-
-```text
-RFR3 - MDS:     NEE +0.07    H +0.11    LE +0.11
-RFR10 - RFR3:   NEE +0.05    H +0.12    LE +0.10
-```
+| Flux | Metric | Comparison | Mean difference | CI lower | CI upper | p > 0.05 |
+|---|---|---|---:|---:|---:|---|
+| NEE | R2 | RFR3 vs MDS | 0.07 | 0.0 | 0.1 | |
+| NEE | R2 | RFR10 vs RFR3 | 0.05 | 0.02 | 0.09 | |
+| NEE | slope | RFR3 vs MDS | 0.01 | -0.0274 | 0.0484 | * |
+| NEE | slope | RFR10 vs RFR3 | 0.04 | 0.00 | 0.08 | |
+| NEE | bias | RFR3 vs MDS | 0.00 | -0.1 | 0.1 | * |
+| NEE | bias | RFR10 vs RFR3 | 0.03 | -0.03 | 0.08 | * |
+| NEE | RMSE | RFR3 vs MDS | -0.40 | -0.9 | 0.1 | |
+| NEE | RMSE | RFR10 vs RFR3 | -0.24 | -0.67 | 0.18 | * |
+| H | R2 | RFR3 vs MDS | 0.11 | 0.0817 | 0.146 | |
+| H | R2 | RFR10 vs RFR3 | 0.12 | 0.10 | 0.15 | |
+| H | slope | RFR3 vs MDS | 0.06 | 0.0 | 0.1 | |
+| H | slope | RFR10 vs RFR3 | 0.11 | 0.09 | 0.13 | |
+| H | bias | RFR3 vs MDS | 1.97 | 0.7 | 3.2 | |
+| H | bias | RFR10 vs RFR3 | -0.06 | -0.81 | 0.68 | * |
+| H | RMSE | RFR3 vs MDS | -10.55 | -15.3 | -5.8 | |
+| H | RMSE | RFR10 vs RFR3 | -13.05 | -16.49 | -9.62 | |
+| LE | R2 | RFR3 vs MDS | 0.11 | 0.0705 | 0.141 | |
+| LE | R2 | RFR10 vs RFR3 | 0.10 | 0.07 | 0.13 | |
+| LE | slope | RFR3 vs MDS | 0.05 | 0.0 | 0.1 | |
+| LE | slope | RFR10 vs RFR3 | 0.09 | 0.06 | 0.12 | |
+| LE | bias | RFR3 vs MDS | 2.99 | 1.6 | 4.4 | |
+| LE | bias | RFR10 vs RFR3 | -0.85 | -1.48 | -0.22 | |
+| LE | RMSE | RFR3 vs MDS | -7.89 | -12.7 | -3.0 | |
+| LE | RMSE | RFR10 vs RFR3 | -8.19 | -11.60 | -4.78 | |
 
 Gains are strongest and most consistent for H and LE. Some NEE differences —
 notably bias and RMSE — are **not** statistically significant per Table S10, and
 must not be reported as improvements.
 
-Welch-test reproduction across sites is optional and belongs in a separate
-statistical module, not in ordinary single-site gap filling.
+**Carried and reproduced.** The table is `rfrgapfill.sites.TABLE_S10_COMPARISONS`,
+and `tests/test_sites.py` re-reads this section to check it, and - where a local
+copy of the supplement exists - checks it against `mmc9.docx` itself.
+`rfrgapfill.sites.welch_comparison()` applied to the per-site values of Table S4
+reproduces every mean difference above to within 0.05 (both sides are printed to
+two decimals), and `compare_to_table_s10()` lays the two side by side. Table S10
+treats the per-site values of the two methods as independent samples, although
+they are paired by site; the reproduction does the same, and reports the paired
+view - how many sites improved or worsened - beside it rather than instead of it.
+
+One cell disagrees with itself: the NEE RMSE gain of RFR3 over MDS carries no
+asterisk, but its printed interval, (-0.9, 0.1), crosses zero. The reproduction
+agrees with the interval (p ≈ 0.07). The asterisk is transcribed as printed.
+
+Welch-test reproduction across sites belongs in `rfrgapfill.sites`, separate from
+ordinary single-site gap filling.
 
 ---
 
@@ -255,6 +303,37 @@ instrument system, instrument-to-canopy height ratio,
 included_in_94_site_subset
 ```
 
+**Implementation.** `rfrgapfill.sites` (`method_spec.md` §6.6): `site_metadata()`
+normalises Table S2's headers, check/cross marks and IGBP spellings;
+`site_report()` puts every site's own scores beside its metadata;
+`stratified_summary()` gives across-site quartiles per IGBP class (or any other
+metadata field); `method_differences()` and `welch_comparison()` report per-site
+changes and the Table S10 statistic; `site_level_evidence()` records that RFR3 NEE
+has site-level results at 194 sites and RFR10 at 94. None of them fits a model or
+applies a threshold.
+
+**What reading the tables showed.** The supplement-marked tests in
+`tests/test_sites.py` read the publisher's files and pin each of these:
+
+- Table S2 lists 194 sites, 94 of them marked as in the complete-analysis
+  subset; Tables S4-S6 score exactly those 94. One wetland is spelled `Wet`.
+- Table S1's continent counts match the rows of Table S2; its IGBP counts do
+  not quite: S1 gives 23 DBF and 12 EBF sites where the rows of S2 give 22 and 13.
+- At the 94 shared sites, Tables S4 and S9 print **identical** NEE R2, slope and
+  RMSE for MDS and RFR3, but different biases at nearly every site, so they are
+  not the same experiment printed twice. S9's caption gives those RMSE values in
+  `umol m-2 s-1`; S3 and S10 give the same numbers in `g C m-2 d-1`. This is new
+  evidence on ambiguity A10, recorded there; the package default is unchanged.
+- Table S3's medians are the medians of Tables S4-S6 for R2 and slope, to
+  rounding. RMSE and bias mostly agree to a few tenths, but not everywhere: S3
+  prints LE MDS nighttime RMSE as 21.93 against a median of 21.39 in S6 (the
+  digits look transposed), and H RFR3 diel RMSE as 39.37 against 39.68.
+- Table S3 prints nighttime bias medians for H and LE (H: MDS -5.82, RFR3 -0.31,
+  RFR10 -0.25; LE: -6.03, -0.27, -0.29). Section 4 above, and
+  `PUBLISHED_BENCHMARKS`, do not carry them yet.
+- In Table S9, RFR3 loses NEE R2 to MDS at some sites. Improvement is a
+  tendency across sites, not a property of each one.
+
 ---
 
 ## 9. Benchmark-to-test map
@@ -264,7 +343,7 @@ included_in_94_site_subset
 | Diel medians, 94 sites | Table S3 (`mmc4.docx`) | 38 |
 | Very-long-gap medians | Table S3 (`mmc4.docx`) | 38, gap-class reporting |
 | Nighttime medians | Table S3 (`mmc4.docx`) | 32 (day/night split) |
-| Welch mean differences | Table S10 (`mmc9.docx`) | optional statistical module |
+| Welch mean differences | Table S10 (`mmc9.docx`) | `rfrgapfill.sites`, reproduced from Table S4 |
 | RFR3 vs ORF | Figure S1 (`mmc1.docx`) | 7, 8, 9, 10 |
 | Bias IQR / normalized uncertainty | Table S8 (`mmc6.docx`) | 40 |
 | Site metadata, 94-site membership | Tables S1–S2 (`mmc3.docx`) | 39 |

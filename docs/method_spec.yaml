@@ -446,6 +446,48 @@ reporting:
       status: experimental            # fixed, not a per-record setting (A8)
       computed_by_package: false
       in_published_benchmarks: false  # never reaches compare_to_benchmarks
+  sites:
+    module: rfrgapfill.sites
+    fits_models: false                # per-site results only; sites are never pooled
+    computes_metrics: false
+    metadata:
+      implementation: rfrgapfill.sites.site_metadata
+      source_table: "Supplementary Table S2 (mmc3.docx)"
+      columns: [site_id, latitude, longitude, continent, country, igbp, koppen, start_date,
+                end_date, elevation, instrument_system, height_ratio, included_in_94_site_subset]
+      igbp_vocabulary: rfrgapfill.sites.IGBP_CLASSES
+      instrument_systems: {O: open-path, C: closed-path, M: mixed}
+    site_report:
+      implementation: rfrgapfill.sites.site_report
+      default_metadata: [latitude, longitude, igbp, koppen, instrument_system,
+                         included_in_94_site_subset]
+      site_without_metadata: "rows kept; SiteReportWarning"
+    stratified_summary:
+      implementation: rfrgapfill.sites.stratified_summary
+      grouped_by: [target, method, mode, gap_class, subset, stratum, units]
+      default_stratifier: igbp
+      pooled_label: all
+      statistics: [q1, median, q3, iqr]
+      quantile_interpolation: linear  # A11
+    method_differences:
+      implementation: rfrgapfill.sites.method_differences
+      sign: "method - baseline"       # the Table S10 convention
+      improvement_direction: {r2: higher, slope: closer to 1, rmse: lower, bias: closer to 0}
+      improvement_required: false
+    welch:
+      implementation: rfrgapfill.sites.welch_comparison
+      test: "Welch unequal-variance t-test; per-site values as independent samples"
+      default_confidence: 0.95
+      published: rfrgapfill.sites.TABLE_S10_COMPARISONS
+      comparison: rfrgapfill.sites.compare_to_table_s10
+      asserts_significance: false
+    published_site_tables:
+      readers: [read_table_s2, read_tables_s4_to_s6, read_table_s9]
+      shipped_with_package: false     # publisher material; parsed from a local copy
+      evidence: rfrgapfill.sites.site_level_evidence
+      rfr3_nee_sites: 194             # Table S9
+      rfr10_sites: 94                 # Tables S4-S6
+    thresholds: none
   provenance: default
 
 data_assumptions:

@@ -23,9 +23,11 @@ implemented and usable, as are the validation metrics, the run manifest, the
 synthetic site the tests run against and the artificial-gap validation workflow
 that ties them together into one call. The reporting layer above it is in too:
 gap-length sensitivity tables across arms and sites, the published Table S3
-medians as data with an explicit comparison against them, and figures drawn from
-those tables. What remains is the FLUXNET2015 adapter, the supplementary
-uncertainty diagnostics and the CLI.
+medians as data with an explicit comparison against them, figures drawn from
+those tables, bias-IQR uncertainty diagnostics, and site- and
+ecosystem-stratified reports across a multi-site study, with the Table S10 Welch
+comparison reproduced from the published per-site results. What remains is the
+FLUXNET2015 adapter and the CLI.
 
 | Component | State |
 |---|---|
@@ -44,7 +46,9 @@ uncertainty diagnostics and the CLI.
 | Paper-validation workflow (`validate_rfr`) | done |
 | Gap-length sensitivity tables, published benchmarks, plots | done |
 | Legacy `fluxlib` compatibility audit and mode (optional Step 20) | done |
-| FLUXNET2015 adapter, supplementary uncertainty diagnostics, CLI | not started |
+| Supplementary uncertainty diagnostics (bias IQR, Table S8 as data) | done |
+| Multi-site and ecosystem-stratified reports, Table S10 (Step 20A) | done |
+| FLUXNET2015 adapter, CLI | not started |
 
 ## Specification first
 

@@ -587,6 +587,47 @@ Plotting is `rfrgapfill.plotting`, after the tables and derived only from them.
 `matplotlib` is an optional dependency, imported when a figure is drawn and
 reported by name when it is missing.
 
+### 6.6 Multi-site and ecosystem-stratified reporting
+
+Models are fitted per site (section 1), and a reproduction study describes its
+sites together afterwards. `rfrgapfill.sites` is that description, and like
+`rfrgapfill.sensitivity` it fits nothing and computes no metric: every score is a
+per-site result, so stratifying by ecosystem groups *scores*, never training
+data.
+
+- `site_metadata()` is Supplementary Table S2 in canonical form - `site_id`,
+  latitude, longitude, continent, country, IGBP, Koppen, record dates, elevation,
+  instrument system, height ratio and `included_in_94_site_subset` - accepting
+  S2's own headers and marks or FLUXNET's. IGBP codes must be FLUXNET classes and
+  instrument systems S2's `O`/`C`/`M`;
+- `site_report()` is acceptance test 39: every row of `gap_length_table()` with
+  its site's metadata attached. A site without metadata keeps its rows and is
+  named in a `SiteReportWarning`;
+- `stratified_summary()` reports the across-site quartiles of each metric per
+  target, method, gap class, day/night subset and stratum - IGBP by default,
+  any metadata field on request - with the pooled `stratum="all"` rows always
+  present, as in `bias_iqr()`;
+- `method_differences()` gives each site's `method - baseline` difference and
+  whether it improved, by a documented per-metric direction. A site that
+  worsened is a row, and a site one method could not be run at keeps its one
+  value;
+- `welch_comparison()` is the Supplementary Table S10 statistic: Welch's test on
+  the per-site values of two methods as independent samples, reported with the
+  paired counts of improved and worsened sites beside it. `compare_to_table_s10()`
+  puts a reproduction beside the published table, carried as
+  `TABLE_S10_COMPARISONS`;
+- `read_table_s2()`, `read_tables_s4_to_s6()` and `read_table_s9()` parse a
+  local copy of the supplement into the same tables, so published and reproduced
+  sites go through the same functions.
+
+Three constraints hold by construction. **No site is required to improve**, and
+no function asserts a direction. **No threshold is universal**: nothing turns a
+metric into a pass or fail, because performance differs by ecosystem.
+**The evidence is not equally broad**: RFR3 NEE has site-level results at all 194
+sites (Table S9) and RFR10 only at the 94-site subset (Tables S4-S6), which
+`site_level_evidence()` records and every published row carries in its
+`site_population`.
+
 ---
 
 ## 7. Data and provenance requirements
@@ -695,6 +736,6 @@ described as reproducing the paper exactly.
 | A7 | The achieved artificial-missing fraction cannot always hit exactly 25% given real gaps and series boundaries. | Report achieved fraction and class allocation against a documented tolerance. | `missing_fraction`, tolerance |
 | A8 | The denominator of the supplement's normalized joint-uncertainty ratio is not reconstructed, and whether its bias IQR is taken across sites or across gaps is not stated. | Bias IQR reported over both populations (section 6.3), the across-site one as the Table S8 analogue. The published ratios are carried as data fixed at status `experimental`; no ratio is computed. | `rfrgapfill.uncertainty` |
 | A9 | Hemisphere inference for sites at or very near the equator. | `latitude >= 0 -> north`; an explicit `hemisphere` always overrides. | `hemisphere`, `latitude` |
-| A10 | Units of Table S3 NEE RMSE/bias (`g C m-2 d-1`) differ from the half-hourly model units (`umol m-2 s-1`); the aggregation from half-hourly residuals to daily carbon units is not spelled out. | Report metrics in model units by default; `compare_to_benchmarks` refuses a cell whose units differ, and `convert_nee_to_carbon_units` applies the rate conversion explicitly (section 6.5). | `rfrgapfill.benchmarks`, `units=` on `gap_length_table` |
+| A10 | Units of Table S3 NEE RMSE/bias (`g C m-2 d-1`) differ from the half-hourly model units (`umol m-2 s-1`); the aggregation from half-hourly residuals to daily carbon units is not spelled out. | Report metrics in model units by default; `compare_to_benchmarks` refuses a cell whose units differ, and `convert_nee_to_carbon_units` applies the rate conversion explicitly (section 6.5). Conflicting evidence from the supplement itself: Table S9 prints the same per-site NEE RMSE values as Table S4 - whose medians are Table S3 - but labels them `umol m-2 s-1` ([benchmarks](supplement_benchmarks.md) section 8). The default is unchanged; `read_tables_s4_to_s6(nee_units=...)` states the reading used (section 6.6). | `rfrgapfill.benchmarks`, `units=` on `gap_length_table` |
 | A11 | The paper names the daily standard deviation but not its degrees-of-freedom convention, nor the quantile interpolation behind Q1/Q2/Q3. | Sample standard deviation (`ddof=1`, the pandas default) and linear quantile interpolation (the numpy/pandas default). | `daily_std_ddof` |
 | A12 | `R2` is reported beside a regression slope without saying whether it is `1 - SS_res/SS_tot` or the squared Pearson correlation of that regression. | `residual` (`1 - SS_res/SS_tot`), the only one of the two a systematic offset can lower. Both are implemented; the two coincide in the regime Table S3 sits in, so neither is paper exact (section 6.1). `fluxlib` computes the squared correlation (`linregress(...).rvalue ** 2`, [audit](fluxlib_audit.md) F21), so `squared_correlation` is the setting for a historical comparison; the default is kept for its bias sensitivity. | `r2_definition` |
