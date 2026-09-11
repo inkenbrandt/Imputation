@@ -9,7 +9,9 @@ explains are exactly the ones the specification defines.
 
 from __future__ import annotations
 
+import json
 import re
+import sys
 import warnings
 from pathlib import Path
 
@@ -20,15 +22,26 @@ import rfrgapfill
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
 DOCS = ROOT / "docs"
+EXAMPLES = ROOT / "examples"
+NOTEBOOK_DIR = EXAMPLES / "notebooks"
+NOTEBOOKS = sorted(NOTEBOOK_DIR.glob("*.ipynb"))
 
-#: The user documentation Step 21 asks for.
+#: The user documentation Step 21 asks for, and the index of the example notebooks.
 USER_DOCS = (
     "method.md",
     "validation.md",
     "assumptions.md",
     "fluxnet.md",
     "supplement_benchmarks.md",
+    "examples.md",
 )
+
+#: What a notebook may import besides the standard library: the package and the
+#: `notebooks` extra's plotting stack, nothing a reader would have to go and find.
+NOTEBOOK_IMPORTS = {"rfrgapfill", "pandas", "numpy", "matplotlib"}
+
+#: A saved output carrying one of these was run on somebody's machine and says so.
+MACHINE_PATHS = re.compile(r"[A-Za-z]:\\\\?Users|/home/|/Users/|AppData|site-packages")
 
 QUICKSTART = re.compile(
     r"<!-- quickstart:begin -->\s*```python\n(?P<code>.*?)```\s*<!-- quickstart:end -->",
@@ -129,3 +142,102 @@ class TestTheQuickStart:
         assert (filled == site.frame["LE"].to_numpy()[observed]).all()
         assert frame["LE_is_filled"].any()
         assert "LE: filled" in printed
+
+
+def notebook_cells(path: Path, kind: str) -> list[dict]:
+    return [cell for cell in json.loads(read(path))["cells"] if cell["cell_type"] == kind]
+
+
+def joined(value: str | list[str]) -> str:
+    return value if isinstance(value, str) else "".join(value)
+
+
+def printed_text(output: dict) -> str:
+    """Return what an output shows as text; images are left out."""
+    if output["output_type"] == "stream":
+        return joined(output["text"])
+    data = output.get("data", {})
+    return "".join(joined(data[kind]) for kind in ("text/plain", "text/html") if kind in data)
+
+
+class TestTheNotebooks:
+    """The example notebooks are documentation, so they are held to the same standard."""
+
+    def test_there_are_notebooks_to_check(self):
+        assert len(NOTEBOOKS) >= 4
+
+    @pytest.mark.parametrize("path", NOTEBOOKS, ids=lambda path: path.name)
+    def test_the_index_and_the_examples_readme_link_it(self, path):
+        assert f"](../examples/notebooks/{path.name})" in read(DOCS / "examples.md")
+        assert f"](notebooks/{path.name})" in read(EXAMPLES / "README.md")
+
+    @pytest.mark.parametrize("path", NOTEBOOKS, ids=lambda path: path.name)
+    def test_it_is_a_python_notebook_in_format_4(self, path):
+        document = json.loads(read(path))
+        assert document["nbformat"] == 4
+        assert document["metadata"]["kernelspec"]["language"] == "python"
+
+    @pytest.mark.parametrize("path", NOTEBOOKS, ids=lambda path: path.name)
+    def test_its_code_is_valid_python(self, path):
+        for number, cell in enumerate(notebook_cells(path, "code")):
+            compile(joined(cell["source"]), f"{path.name}, code cell {number}", "exec")
+
+    @pytest.mark.parametrize("path", NOTEBOOKS, ids=lambda path: path.name)
+    def test_it_needs_only_the_package_and_the_notebooks_extra(self, path):
+        source = "\n".join(joined(cell["source"]) for cell in notebook_cells(path, "code"))
+        modules = re.findall(r"^(?:from|import) (\S+)", source, re.MULTILINE)
+        imported = {module.split(".")[0] for module in modules}
+        assert "rfrgapfill" in imported
+        assert not imported - NOTEBOOK_IMPORTS - set(sys.stdlib_module_names)
+
+    @pytest.mark.parametrize("path", NOTEBOOKS, ids=lambda path: path.name)
+    def test_its_saved_outputs_come_from_one_clean_run(self, path):
+        cells = notebook_cells(path, "code")
+        counts = [cell["execution_count"] for cell in cells]
+        assert counts == list(range(1, len(cells) + 1)), (
+            f"{path.name} was not run top to bottom in one kernel; rerun it before committing"
+        )
+        errors = [
+            output
+            for cell in cells
+            for output in cell["outputs"]
+            if output["output_type"] == "error"
+        ]
+        assert not errors
+
+    @pytest.mark.parametrize("path", NOTEBOOKS, ids=lambda path: path.name)
+    def test_its_outputs_name_no_local_paths(self, path):
+        shown = [
+            printed_text(output)
+            for cell in notebook_cells(path, "code")
+            for output in cell["outputs"]
+        ]
+        leaks = [text for text in shown if MACHINE_PATHS.search(text)]
+        assert not leaks, f"{path.name} outputs show a local path: {leaks[0][:200]}"
+
+    @pytest.mark.parametrize("path", NOTEBOOKS, ids=lambda path: path.name)
+    def test_every_relative_link_points_at_a_file_that_exists(self, path):
+        broken = []
+        for cell in notebook_cells(path, "markdown"):
+            for match in LINK.finditer(joined(cell["source"])):
+                target = match.group("target")
+                if target.startswith(("http://", "https://", "mailto:", "#")):
+                    continue
+                if not (path.parent / target.split("#", 1)[0]).exists():
+                    broken.append(target)
+        assert not broken, f"{path.name} links to missing files: {broken}"
+
+    @pytest.mark.slow
+    @pytest.mark.notebooks
+    @pytest.mark.parametrize("path", NOTEBOOKS, ids=lambda path: path.name)
+    def test_it_runs_from_top_to_bottom(self, path):
+        nbformat = pytest.importorskip("nbformat")
+        nbclient = pytest.importorskip("nbclient")
+        pytest.importorskip("ipykernel")
+        document = nbformat.read(path, as_version=4)
+        nbclient.NotebookClient(
+            document,
+            timeout=1800,
+            kernel_name="python3",
+            resources={"metadata": {"path": str(NOTEBOOK_DIR)}},
+        ).execute()

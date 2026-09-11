@@ -10,6 +10,10 @@ are FLUXNET2015's. The core never requires them: any data works through a
 > will wrap the same steps. Nothing in this package downloads data or holds
 > credentials: obtain FLUXNET2015 files under their own licence.
 
+[`04_bring_your_own_data.ipynb`](../examples/notebooks/04_bring_your_own_data.ipynb)
+runs every step on this page, including the command line, on a stand-in file
+written in the FLUXNET2015 layout.
+
 ---
 
 ## Which files and columns
@@ -85,7 +89,11 @@ import pandas as pd
 
 from rfrgapfill import ColumnMap, FeatureConfig, RFRConfig, RFRGapFiller, validate_rfr
 
-raw = pd.read_csv("FLX_XX-Xxx_FLUXNET2015_FULLSET_HH_2005-2014_1-4.csv")
+# round_trip reads each number exactly as written; pandas' default parser can be
+# one unit in the last place off, and the command line reads files this way.
+raw = pd.read_csv(
+    "FLX_XX-Xxx_FLUXNET2015_FULLSET_HH_2005-2014_1-4.csv", float_precision="round_trip"
+)
 
 # 1. FLUXNET writes missing values as -9999. The package would read that as a
 #    number, train on it and put it in the daily statistics.

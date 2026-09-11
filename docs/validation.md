@@ -5,6 +5,13 @@ honest, and how to read and compare the results. The method itself is
 [`method.md`](method.md); the contract is sections 4 and 6 of
 [`method_spec.md`](method_spec.md).
 
+Two [example notebooks](examples.md) run everything on this page on a synthetic
+site:
+[`02_artificial_gap_validation.ipynb`](../examples/notebooks/02_artificial_gap_validation.ipynb)
+covers the scenario, long gaps, leakage and reading the results, and
+[`03_comparing_configurations.ipynb`](../examples/notebooks/03_comparing_configurations.ipynb)
+compares the arms and puts a run beside the published medians.
+
 ---
 
 ## What validation answers

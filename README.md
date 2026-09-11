@@ -62,6 +62,7 @@ lines of pandas ([`docs/fluxnet.md`](docs/fluxnet.md)), or through the command l
 
 | Page | Read it for |
 |---|---|
+| [`docs/examples.md`](docs/examples.md) | four runnable Jupyter notebooks, from a first fill to the published medians |
 | [`docs/method.md`](docs/method.md) | what the method does and why: drivers, receptive limiter, model, ORF |
 | [`docs/validation.md`](docs/validation.md) | the artificial-gap experiment, leakage safety, reading and comparing results |
 | [`docs/assumptions.md`](docs/assumptions.md) | every point the paper leaves open, the package's conventions, known differences |
@@ -169,7 +170,9 @@ What each piece is doing:
 
 `python examples/synthetic_example.py` goes further: both configurations, per
 gap class and day/night subset, the energy balance, and the published medians
-printed for reference.
+printed for reference. The [example notebooks](docs/examples.md) cover the same
+ground step by step, with figures, and go on to a FLUXNET-format file and the
+command line.
 
 ## Expected input
 
@@ -906,6 +909,7 @@ with itself in a few places the package records rather than corrects
 pytest              # tests
 pytest -m "not slow and not supplement"   # the fast subset
 pytest --cov        # tests with branch coverage; fails below 90%
+pytest -m notebooks # execute the example notebooks (needs the notebooks extra)
 ruff check .        # lint
 ruff format .       # format
 mypy                # type check (strict, src/rfrgapfill)
@@ -922,6 +926,7 @@ Every pull request and every push to `main` runs
 | Lint and types | `ruff check`, `ruff format --check`, strict `mypy` |
 | Tests | the full suite with branch coverage, on Python 3.10 to 3.14 and on Windows; the `yaml` extra and matplotlib are installed so their tests run |
 | Dependency floors | the full suite on Python 3.10 at the lowest version of every dependency `pyproject.toml` allows, so a declared minimum cannot quietly become false |
+| Example notebooks | executes every notebook in `examples/notebooks/` with the `notebooks` extra installed |
 | Package | builds the sdist and the wheel from it, runs `twine check`, installs the wheel into a clean environment and runs the README quick start and the console script against it |
 
 The `supplement` and `fluxnet` tests skip in CI because their data is not in the

@@ -9,6 +9,9 @@ Companion pages: [`validation.md`](validation.md) (the artificial-gap experiment
 and how to read it), [`assumptions.md`](assumptions.md) (every choice the paper
 leaves open), [`fluxnet.md`](fluxnet.md) (FLUXNET2015 input), and
 [`supplement_benchmarks.md`](supplement_benchmarks.md) (the published numbers).
+To see the method run before reading about it, open
+[`01_getting_started.ipynb`](../examples/notebooks/01_getting_started.ipynb), one
+of the [example notebooks](examples.md).
 
 ---
 

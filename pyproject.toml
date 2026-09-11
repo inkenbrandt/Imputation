@@ -74,6 +74,7 @@ markers = [
     "slow: long-running tests (model fitting, end-to-end scenarios)",
     "fluxnet: requires real FLUXNET2015 input data not shipped with the package",
     "supplement: requires the journal supplementary files (mmc*.docx / mmc7.xlsx)",
+    "notebooks: executes the example notebooks (needs the `notebooks` extra)",
 ]
 filterwarnings = ["error::DeprecationWarning:rfrgapfill.*"]
 
