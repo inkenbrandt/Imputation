@@ -5,13 +5,13 @@ that distinguishes RFR from the ORF benchmark (``docs/method_spec.md`` section 3
 Supplementary Figure S1). It is implemented here as four independent, pure
 transformers plus one assembler:
 
-============================  ===========================================
-:func:`radiation_tag`         shortwave radiation -> weak/medium/strong
-:func:`time_distance_hours`   elapsed hours since the series origin
-:func:`season_tag`            calendar month + hemisphere -> season
-:func:`daily_flux_statistics` per-day target Q1/Q2/Q3/std, joined back
-:func:`build_feature_matrix`  drivers + the above, in a deterministic order
-============================  ===========================================
+=============================  ===========================================
+:func:`radiation_tag`          shortwave radiation -> weak/medium/strong
+:func:`time_distance_hours`    elapsed hours since the series origin
+:func:`season_tag`             calendar month + hemisphere -> season
+:func:`daily_flux_statistics`  per-day target Q1/Q2/Q3/std, joined back
+:func:`build_feature_matrix`   drivers + the above, in a deterministic order
+=============================  ===========================================
 
 Every transformer is a function of its inputs alone: no fitted state, no global
 configuration, no hidden imputation. Missing input yields missing output rather

@@ -1,6 +1,7 @@
 # rfr-gapfill
 
 [![CI](https://github.com/inkenbrandt/Imputation/actions/workflows/ci.yml/badge.svg)](https://github.com/inkenbrandt/Imputation/actions/workflows/ci.yml)
+[![Documentation](https://readthedocs.org/projects/rfr-gapfill/badge/?version=latest)](https://rfr-gapfill.readthedocs.io/en/latest/)
 
 Leakage-safe **Random Forest Robust (RFR)** gap filling for eddy-covariance flux
 data, reproducing the method of:
@@ -60,6 +61,10 @@ carries and builds the column map from them
 | FLUXNET2015 adapter (`rfrgapfill.fluxnet`) | done |
 
 ## Documentation
+
+The full documentation, with the API and command-line references and the
+notebooks rendered, is at <https://rfr-gapfill.readthedocs.io>. The same pages
+read as Markdown here:
 
 | Page | Read it for |
 |---|---|
@@ -915,6 +920,9 @@ pytest -m notebooks # execute the example notebooks (needs the notebooks extra)
 ruff check .        # lint
 ruff format .       # format
 mypy                # type check (strict, src/rfrgapfill)
+
+pip install -e ".[docs]"
+sphinx-build -W docs docs/_build/html   # the documentation site, warnings as errors
 ```
 
 Test markers: `slow`, `fluxnet` (needs real FLUXNET2015 input), `supplement`
@@ -929,6 +937,7 @@ Every pull request and every push to `main` runs
 | Tests | the full suite with branch coverage, on Python 3.10 to 3.14 and on Windows; the `yaml` extra and matplotlib are installed so their tests run |
 | Dependency floors | the full suite on Python 3.10 at the lowest version of every dependency `pyproject.toml` allows, so a declared minimum cannot quietly become false |
 | Example notebooks | executes every notebook in `examples/notebooks/` with the `notebooks` extra installed |
+| Documentation | builds the Read the Docs site with warnings as errors, so a broken link or docstring fails the pull request |
 | Package | builds the sdist and the wheel from it, runs `twine check`, installs the wheel into a clean environment and runs the README quick start and the console script against it |
 
 The `supplement` and `fluxnet` tests skip in CI because their data is not in the

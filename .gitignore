@@ -19,6 +19,11 @@ venv/
 .coverage
 htmlcov/
 
+# Sphinx output, and the files docs/conf.py generates on every build
+docs/_build/
+docs/api/generated/
+docs/notebooks/
+
 # Data never belongs in the repository
 data/
 *.csv

@@ -52,10 +52,19 @@ dev = [
 notebooks = ["jupyter", "matplotlib"]
 # YAML configuration files for load_config and the CLI. JSON needs nothing extra.
 yaml = ["pyyaml>=6.0"]
+# Sphinx and the extensions docs/conf.py loads; Read the Docs installs this extra.
+docs = [
+    "sphinx>=8.0",
+    "myst-nb>=1.1",
+    "furo>=2024.8",
+    "sphinx-copybutton>=0.5",
+    "sphinx-argparse>=0.5",
+]
 
 [project.urls]
 Homepage = "https://github.com/inkenbrandt/Imputation"
-Documentation = "https://github.com/inkenbrandt/Imputation/tree/main/docs"
+Documentation = "https://rfr-gapfill.readthedocs.io/"
+Source = "https://github.com/inkenbrandt/Imputation"
 
 [project.scripts]
 rfr-gapfill = "rfrgapfill.cli:main"
